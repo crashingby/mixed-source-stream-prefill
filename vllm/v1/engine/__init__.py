@@ -18,7 +18,7 @@ from vllm.sampling_params import SamplingParams
 from vllm.v1.metrics.stats import PrefillStats, SchedulerStats
 from vllm.v1.outputs import LogprobsLists, LogprobsTensors
 from vllm.v1.serial_utils import UtilityResult
-
+from vllm.v1.engine.prompt_stream import PromptStreamEvent,PromptSourceType,PromptStreamEventType
 # Type for pause_generation mode parameter.
 # - "abort": Abort all in-flight requests immediately (default).
 # - "wait": Wait for in-flight requests to complete before pausing.
@@ -133,6 +133,9 @@ class EngineCoreRequest(
     # request_finished hook. Used to free P-side prefill blocks when a
     # KV-transfer request is rejected on the D node before engine admission.
     abort_immediately: bool = False
+
+    # 流式 prefill 的单次事件。普通请求保持为 None。
+    prompt_stream_event: PromptStreamEvent | None = None
 
     @property
     def params(self) -> SamplingParams | PoolingParams:

@@ -19,6 +19,9 @@ from vllm.v1.engine import (
     EngineCoreEventType,
     EngineCoreRequest,
     FinishReason,
+    PromptSourceType,
+    PromptStreamEvent,
+    PromptStreamEventType,
 )
 from vllm.v1.metrics.stats import PrefillStats
 from vllm.v1.structured_output.request import StructuredOutputRequest
@@ -55,6 +58,55 @@ class StreamingUpdate:
             sampling_params=request.sampling_params,
         )
 
+@dataclass
+class PromptStreamMutation:
+    """描述一次流式 prompt 事件对 Request prompt 的影响。"""
+    #重复 chunk、旧版本 update、乱序 pending 等，没有实际改 prompt。
+    applied: bool
+    old_num_prompt_tokens: int
+    new_num_prompt_tokens: int
+    #新旧 prompt 的最长公共前缀。
+    common_prefix_len: int
+    #已经 prefill 过但现在失效的 token 数。
+    num_tokens_to_invalidate: int
+    #每次 prompt 真实变化都递增，后面防止 scheduler 用旧状态 decode。
+    prompt_revision: int
+
+@dataclass
+class PromptSourceState:
+    """保存单个 prompt source 的流式状态。"""
+    #来源 ID。
+    source_id: str
+    #来源语义，创建后不应该被更改
+    source_type: PromptSourceType
+    #该来源当前有效 token。
+    token_ids: list[int]
+    #该来源当前有效版本。
+    version: int
+    #下一条期望收到的序号。
+    next_sequence_no: int
+    #已经应用过的 chunk，用于去重。
+    seen_chunk_ids: set[str]
+    #该来源是否结束。
+    finished: bool
+    #该来源最近一次事件到达时间。
+    last_arrival_time: float
+
+@dataclass
+class PromptStreamState:
+    """保存一个 Request 内部的多源流式 prompt 状态。"""
+    #从 source_id 到 PromptSourceState 的映射。
+    sources: dict[str, PromptSourceState]
+    #最终交给decode节点的排布顺序；TODO:这个有待思考
+    source_order: list[str]
+    #请求级流式 prompt 是否结束。
+    finished: bool
+    #prompt 每次真实变化后递增，用于防止 scheduler 或 model runner 使用旧状态 decode。
+    revision: int
+    #累计失效 token 数。
+    total_tokens_invalidated: int
+    #累计重算 token 数。
+    total_tokens_recomputed: int
 
 class Request:
     def __init__(
@@ -77,6 +129,7 @@ class Request:
         reasoning_ended: bool | None = None,
         reasoning_parser_kwargs: dict[str, Any] | None = None,
         abort_immediately: bool = False,
+        prompt_stream_event: PromptStreamEvent | None = None,
     ) -> None:
         self.request_id = request_id
         self.client_index = client_index
@@ -194,6 +247,13 @@ class Request:
         # the scheduler so the connector's request_finished hook runs.
         self.abort_immediately = abort_immediately
 
+        # 流式 prefill 的入站事件。对于普通请求为 None。
+        # 对于 duplicate request id 的流式事件，这个字段用于传给 scheduler。
+        self.prompt_stream_event = prompt_stream_event
+
+        # 流式 prefill 的长期状态。只有真正的流式 prefill 请求才会初始化。
+        self.prompt_stream: PromptStreamState | None = None
+
     @classmethod
     def from_engine_core_request(
         cls,
@@ -219,6 +279,7 @@ class Request:
             reasoning_ended=request.reasoning_ended,
             reasoning_parser_kwargs=request.reasoning_parser_kwargs,
             abort_immediately=request.abort_immediately,
+            prompt_stream_event=request.prompt_stream_event,
         )
 
     def append_output_token_ids(
@@ -318,6 +379,17 @@ class Request:
         if self.request_id != other.request_id:
             return self.request_id < other.request_id
         return id(self) < id(other)
+    
+
+    def is_prompt_streaming(self) -> bool:
+        return self.prompt_stream is not None
+
+
+    def apply_prompt_stream_event(
+        self,
+        event: PromptStreamEvent,
+    ) -> PromptStreamMutation:
+        ...
 
 
 class RequestStatus(enum.IntEnum):
