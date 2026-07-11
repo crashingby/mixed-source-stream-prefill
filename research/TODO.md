@@ -47,9 +47,9 @@ Stream2LLM 没有独立的 chunk 数据类，而是复用 `EngineCoreRequest`：
 这套接口适合“一个请求只有一种流式输入模式”的实验，但不适合混合多源：后端
 无法区分事件来自哪个来源，也无法判断重复、过期和乱序事件。
 
-#### 建议新增的事件结构
+#### 当前采用的事件结构
 
-建议新增独立的 `PromptStreamEvent`，不要继续给 `EngineCoreRequest` 堆叠布尔值。
+当前已经新增独立的 `PromptStreamEvent`，不继续给 `EngineCoreRequest` 堆叠布尔值。
 初始请求仍携带采样参数和固定 prompt；后续只传轻量事件。
 
 ```python
@@ -59,9 +59,10 @@ class PromptSourceType(str, enum.Enum):
 
 
 class PromptStreamEventType(str, enum.Enum):
-    DATA = "data"
+    APPEND = "append"
+    UPDATE = "update"
     SOURCE_FINISHED = "source_finished"
-    REQUEST_FINISHED = "request_finished"
+    PROMPT_FINISHED = "prompt_finished"
 
 
 class PromptStreamEvent(msgspec.Struct):
@@ -219,17 +220,115 @@ def apply_update_snapshot(self, event: PromptStreamEvent) -> PromptMutation:
 
 1. 校验请求仍处于 prompt streaming 阶段，来源类型为 Update。
 2. 校验 `chunk_id`、`sequence_no` 和 `version`。
-3. 用新快照替换该来源的 `token_ids`。
-4. 按 `prompt_source_order` 重建全局 prompt。
-5. 计算旧全局 prompt 与新全局 prompt 的 token 级 LCP。
-6. 将 `num_computed_tokens` 回退到安全复用边界。
-7. 重建受影响的 `block_hashes`，返回需要失效的 KV 范围。
-8. scheduler 调用新版多 KV group 失效接口并安排后续 re-prefill。
+3. 在替换前保存上一版 update source 的 `token_ids`。
+4. 计算旧 update 快照和新 update 快照的 token 级 LCP。
+5. 将 update 源内 LCP 加上 `prefix_len + append_len`，得到全局 KV 复用边界。
+6. 用新快照替换该来源的 `token_ids`，并重建全局 prompt。
+7. 将 `num_computed_tokens` 回退到安全复用边界。
+8. 重建受影响的 `block_hashes`，返回需要失效的 KV 范围。
+9. scheduler 调用新版多 KV group 失效接口并安排后续 re-prefill。
 
-注意：LCP 必须针对**最终全局 prompt**计算，不能只比较 Update 来源自己的局部
-快照。来源在全局 prompt 中的起始位置和前面的 Append 长度都会改变实际 KV
-复用边界。
+注意：LCP 必须针对**Update 来源自己的局部快照**计算。来源在全局 prompt 中的
+起始位置和前面的 Append 长度不参与 LCP 比较，而是在得到 `update_lcp` 后作为
+全局偏移显式加回来。
 
+
+
+
+### P/D 分离下的 Prompt Stream 完成语义
+
+后续先不考虑多个 Update source，MVP 只支持：
+
+```text
+一个或多个 Append source + 一个 Update source + 最终用户问题
+```
+
+#### 已采用的请求级封口事件
+
+当前代码已经采用 `PromptStreamEventType.PROMPT_FINISHED` 表达请求级封口语义。它不是“某个检索源结束”，而是：**最终用户问题已经到达，整个 prompt stream 可以被封口并完成最后一段 prefill**。
+
+事件类型现在应保持为：
+
+```python
+class PromptStreamEventType(str, enum.Enum):
+    APPEND = "append"
+    UPDATE = "update"
+    SOURCE_FINISHED = "source_finished"
+    PROMPT_FINISHED = "prompt_finished"
+```
+
+其中 `PROMPT_FINISHED` 表示：
+
+- Append 和 Update 的流式上下文已经确定到当前可用版本。
+- 事件中的 `token_ids` 携带最终用户问题 / 固定 suffix。
+- `Request` 将这段 token 放入 `suffix_token_ids`。
+- P 节点需要 prefill 完最后的用户问题。
+- 完成后进入 P/D 分离的 KV transfer 阶段。
+
+这里不再继续引入 `FINALIZE`，避免同一语义出现两个名字。
+
+#### P 节点上的调度边界
+
+所有流式 prefill 的 scheduler 逻辑都发生在 P/D 分离中的 **P 节点**：
+
+```text
+P 节点：接收 Append / Update / PROMPT_FINISHED 事件，执行 prefill，产生 KV
+D 节点：接收 P 节点传来的 KV cache 和首 token 相关信息，继续 decode
+```
+
+因此 scheduler 的 decode barrier 需要改成：
+
+```text
+只有收到 PROMPT_FINISHED，并且最终用户问题也 prefill 完成后，P 节点才允许完成 prefill 阶段。
+```
+
+这里的“完成”不是普通单机 decode 开始，而是：
+
+- P 节点已经 prefill 了通用模板。
+- P 节点已经 prefill 了 Append 部分。
+- P 节点已经 prefill 了 Update 部分。
+- P 节点已经 prefill 了最终用户问题。
+- P 节点拿到 decode 的第一个输出以及 `kv_transfer_params`。
+- P 节点把 KV cache 按固定布局交给 D 节点。
+
+#### 传给 D 节点的 KV 排布
+
+传给 D 节点的 KV cache 排布顺序必须明确为：
+
+```text
+通用模板 KV
++ Append 部分 KV
++ Update 部分 KV
++ 用户问题 KV
+```
+
+对应 token 布局是：
+
+```text
+prefix_token_ids
++ append segment token_ids
++ update segment token_ids
++ final_user_question_token_ids
+```
+
+其中 `final_user_question_token_ids` 可以先落在 `PromptStreamState.suffix_token_ids`。
+
+需要特别标注：这个 KV 排布看起来像完整 prompt 的顺序，但由于 Update suffix 的 prefill 使用的是近似上下文：
+
+```text
+[已有所有 append KV] + [update 前缀 KV]
+```
+
+所以它不保证等价于从完整 prompt 一次性 prefill 得到的 KV。这个近似是论文设计的一部分，不是实现 bug。
+
+#### 后续仍需要确认的影响
+
+当前 Request / Scheduler 侧已经完成 `PROMPT_FINISHED` 的基本逻辑。后续剩余工作主要是：
+
+- 前端如何把最终用户问题组装成 `PROMPT_FINISHED` 事件。
+- P/D connector 是否需要显式携带 `prefix + append + update + suffix` 四段长度。
+- `kv_transfer_params` 里是否要增加 prompt stream layout 的 debug / 校验信息。
+- 多个 Update source 是否需要支持；MVP 暂时不做。
 
 ### Append / Update 分域 KV 语义
 
@@ -311,7 +410,7 @@ Update 事件到达时：
 - 固定 suffix（例如问题、结束模板）已经加入全局 prompt。
 - 没有等待 debounce 提交的 Update 版本。
 
-`REQUEST_FINISHED` 可以作为前端显式屏障，但不能绕过上述检查。若仍有未结束来源，
+`PROMPT_FINISHED` 可以作为前端显式屏障，但不能绕过上述检查。若仍有未结束来源，
 应返回错误或按预先定义的超时策略关闭，不能静默丢事件。
 
 #### 允许开始 decode
@@ -345,7 +444,7 @@ model execute 期间收到新事件后，旧版本 sampled token 被误认为有
 | 传输协议 | `PromptStreamEvent`、事件枚举、client 发送与 core 解码入口 | Stream2LLM 的 `STREAM_ADD`；新版 vLLM 的 `ADD` 序列化链路 |
 | `Request` 状态 | `prompt_sources`、revision、完成状态、Append/Update 纯状态方法 | Stream2LLM 的两个 token 更新方法；新版 `StreamingUpdate` |
 | scheduler 入口 | 根据稳定 `request_id` 串行处理事件并维护 per-request event queue | 新版 `Scheduler.add_request()` 的重复请求和 `streaming_queue` 处理 |
-| KV 失效 | 根据全局 LCP 截断所有 KV group，并同步 block hashes | Stream2LLM 的 `invalidate_cache_from_position()`，但需按新版 coordinator 重写 |
+| KV 失效 | Update 使用源内 LCP 加全局偏移截断所有 KV group，并同步 block hashes | Stream2LLM 的 `invalidate_cache_from_position()`，但需按新版 coordinator 重写 |
 | 调度输出 | 传递 `scheduled_prompt_revision` 和 prompt finished 快照 | Stream2LLM 的 `req_prompt_stream_finished` |
 | 输出处理 | revision 匹配且 prompt 完成后才接受 sampled token | Stream2LLM `update_from_output()` 的 partial prompt 抑制逻辑 |
 | 取消清理 | 清空事件队列、来源状态和 KV，复用当前 finished/abort 生命周期 | 当前 vLLM 的 `finish_requests()` 与 `_free_request()` |
@@ -393,8 +492,8 @@ Stream2LLM 的控制流可以概括为：
 
 1. 初始请求、Append 和 Update 都复用同一个 `request_id`。
 2. Append 只发送新增 token，保留 `num_computed_tokens` 和已有 KV blocks。
-3. Update 发送新的完整 prompt，在 token 级计算最长公共前缀 LCP。
-4. `num_computed_tokens` 回退到 LCP，KV manager 释放其后的 blocks。
+3. Update 发送新的来源快照，在 update 源内部计算最长公共前缀 LCP。
+4. `num_computed_tokens` 回退到 `prefix_len + append_len + update_lcp`，KV manager 释放其后的 blocks。
 5. scheduler 继续调度欠缺的 token；worker 使用已有 block table 读取历史 KV。
 6. prompt 未 finished 时，本轮采样结果被丢弃；finished 后才返回 decode token。
 
@@ -429,8 +528,8 @@ Stream2LLM 的控制流可以概括为：
 
 - [ ] **复用实验事件语义**：保留“同一请求 id + 初始/Append/Update/Finish
   事件”的建模方式，但补充 `source_id`、`version` 和 `sequence_no`。
-- [ ] **复用 LCP 算法作为精确基线**：Update 收到完整 prompt 后计算 token 级
-  LCP，并将已计算位置回退到 LCP。算法本身简单稳定，但状态更新需要适配新版。
+- [ ] **复用 LCP 算法作为精确基线**：Update 收到来源快照后计算源内 token 级
+  LCP，并将已计算位置回退到 `prefix_len + append_len + update_lcp`。算法本身简单稳定，但状态更新需要适配新版。
 - [ ] **复用 Append 状态不变量**：Append 只能发生在 decode 前，只增加 prompt
   token，不修改已计算前缀，也不能在 finished 后继续追加。
 - [ ] **复用实验 trace 驱动思路**：Crawler 和 ANNS replay driver 可以作为单源

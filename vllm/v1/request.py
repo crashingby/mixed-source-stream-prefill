@@ -67,7 +67,7 @@ class PromptStreamMutation:
     applied: bool
     old_num_prompt_tokens: int
     new_num_prompt_tokens: int
-    #新旧 prompt 的最长公共前缀。
+    # scheduler 可安全保留的全局 KV 前缀长度。
     common_prefix_len: int
     #已经 prefill 过但现在失效的 token 数。
     num_tokens_to_invalidate: int
@@ -115,22 +115,47 @@ class PromptSourceState:
 @dataclass
 class PromptStreamState:
     """保存一个 Request 内部的多源流式 prompt 状态。"""
-    #流式 source 之前的固定 prompt 前缀，例如 system prompt 或用户原始问题。
+    # 流式 source 之前的固定 prompt 前缀，例如 system prompt。
     prefix_token_ids: list[int]
-    #从 source_id 到 PromptSourceState 的映射。
+    # 从 source_id 到 PromptSourceState 的映射。
     sources: dict[str, PromptSourceState]
-    #最终交给decode节点的排布顺序；TODO:这个有待思考
+    # source 的稳定到达顺序；最终布局会按 source_type 再分段。
     source_order: list[str]
-    #流式 source 之后的固定 prompt 后缀，后续可用于放 answer prefix。
+    # PROMPT_FINISHED 事件携带的最终用户问题 / prompt suffix。
     suffix_token_ids: list[int]
-    #请求级流式 prompt 是否结束。
+    # 请求级流式 prompt 是否结束。
     finished: bool
-    #prompt 每次真实变化后递增，用于防止 scheduler 或 model runner 使用旧状态 decode。
+    # prompt 每次真实变化后递增，用于防止使用旧状态 decode。
     revision: int
-    #累计失效 token 数。
+    # 累计失效 token 数。
     total_tokens_invalidated: int
-    #累计重算 token 数。
+    # 累计重算 token 数。
     total_tokens_recomputed: int
+
+
+@dataclass(frozen=True)
+class PromptStreamLayout:
+    """描述流式 prompt 在全局 KV 序列中的分段布局。
+
+    该布局对应 P 节点最终要传给 D 节点的 KV 顺序：
+    prefix/template + append segment + update segment + suffix/user question。
+    """
+
+    prefix_len: int
+    append_len: int
+    update_len: int
+    suffix_len: int
+
+    @property
+    def total_len(self) -> int:
+        """返回完整 prompt 的 token 数。"""
+        return (
+            self.prefix_len
+            + self.append_len
+            + self.update_len
+            + self.suffix_len
+        )
+
 
 class Request:
     def __init__(
@@ -485,7 +510,7 @@ class Request:
         if event.event_type == PromptStreamEventType.SOURCE_FINISHED:
             return self._mark_prompt_source_finished(event)
 
-        if event.event_type == PromptStreamEventType.REQUEST_FINISHED:
+        if event.event_type == PromptStreamEventType.PROMPT_FINISHED:
             return self._mark_prompt_stream_finished(event)
 
         raise ValueError(f"Unsupported prompt stream event type: {event.event_type}")
@@ -521,6 +546,7 @@ class Request:
         if event.event_type in (
             PromptStreamEventType.APPEND,
             PromptStreamEventType.UPDATE,
+            PromptStreamEventType.PROMPT_FINISHED,
         ) and event.token_ids is None:
             raise ValueError(
                 f"Prompt stream {event.event_type} event for "
@@ -548,6 +574,16 @@ class Request:
                 f"Prompt stream event source_type={event.source_type} does not "
                 f"match event_type={event.event_type}."
             )
+
+        if expected_source_type == PromptSourceType.UPDATE:
+            for existing_source_id in prompt_stream.source_order:
+                existing_source = prompt_stream.sources[existing_source_id]
+                if existing_source.source_type == PromptSourceType.UPDATE:
+                    raise ValueError(
+                        "Streaming prompt currently supports at most one "
+                        f"update source, but request_id={self.request_id} "
+                        f"already has source_id={existing_source_id}."
+                    )
 
         source = PromptSourceState(
             source_id=event.source_id,
@@ -644,15 +680,31 @@ class Request:
                 f"content for version={event.version}."
             )
 
+        old_update_token_ids = list(source.token_ids)
+        new_update_token_ids = list(event.token_ids or [])
+        update_common_prefix_len = self._get_common_prefix_len(
+            old_update_token_ids,
+            new_update_token_ids,
+        )
+        layout_before_update = self.get_prompt_stream_layout()
+        kv_cache_keep_token_len = (
+            layout_before_update.prefix_len
+            + layout_before_update.append_len
+            + update_common_prefix_len
+        )
+
         old_prompt_token_ids = self._current_prompt_token_ids()
-        source.token_ids = list(event.token_ids or [])
+        source.token_ids = new_update_token_ids
         source.version = event.version
         source.next_sequence_no += 1
         source.last_arrival_time = event.arrival_time
         if event.chunk_id is not None:
             source.seen_chunk_ids.add(event.chunk_id)
 
-        return self._sync_prompt_from_stream_state(old_prompt_token_ids)
+        return self._sync_prompt_from_stream_state(
+            old_prompt_token_ids,
+            kv_cache_keep_token_len=kv_cache_keep_token_len,
+        )
 
     def _mark_prompt_source_finished(
         self,
@@ -680,19 +732,77 @@ class Request:
         self,
         event: PromptStreamEvent,
     ) -> PromptStreamMutation:
-        """标记请求级流式 prompt 输入已经结束。"""
+        """封口流式 prompt，并写入最终用户问题。
+
+        `PROMPT_FINISHED` 是请求级 barrier。它携带的 `token_ids` 被视为
+        suffix，也就是 RAG 场景中最后到达的用户问题。只有这段 suffix 也
+        prefill 完成后，scheduler 才允许该请求进入 decode。
+        """
+        self._validate_prompt_stream_can_mutate(event)
         prompt_stream = self._ensure_prompt_stream_state()
+        new_suffix_token_ids = list(event.token_ids or [])
+
+        if prompt_stream.finished:
+            if prompt_stream.suffix_token_ids != new_suffix_token_ids:
+                raise ValueError(
+                    "Finished streaming prompt received conflicting suffix "
+                    f"for request_id={self.request_id}."
+                )
+            return PromptStreamMutation.noop(
+                self.num_prompt_tokens,
+                prompt_stream.revision,
+            )
+
+        old_prompt_token_ids = self._current_prompt_token_ids()
+        prompt_stream.suffix_token_ids = new_suffix_token_ids
         prompt_stream.finished = True
-        return PromptStreamMutation.noop(
-            self.num_prompt_tokens,
-            prompt_stream.revision,
-        )
+        return self._sync_prompt_from_stream_state(old_prompt_token_ids)
 
     def _current_prompt_token_ids(self) -> list[int]:
         """返回当前 prompt token 的可变副本。"""
         if self.prompt_token_ids is None:
             return []
         return list(self.prompt_token_ids)
+
+    def _get_prompt_stream_segment_token_ids(
+        self,
+        source_type: PromptSourceType,
+    ) -> list[int]:
+        """按 source 到达顺序收集某个分段的 token。"""
+        assert self.prompt_stream is not None
+        token_ids: list[int] = []
+        for source_id in self.prompt_stream.source_order:
+            source = self.prompt_stream.sources[source_id]
+            if source.source_type == source_type:
+                token_ids.extend(source.token_ids)
+        return token_ids
+
+    def get_prompt_stream_layout(self) -> PromptStreamLayout:
+        """返回当前 prompt 在 KV cache 中应呈现的逻辑布局。
+
+        非流式请求被视为只有 prefix/template 段。流式请求固定采用：
+        prefix/template + append segment + update segment + suffix/user question。
+        """
+        if self.prompt_stream is None:
+            return PromptStreamLayout(
+                prefix_len=self.num_prompt_tokens,
+                append_len=0,
+                update_len=0,
+                suffix_len=0,
+            )
+
+        append_token_ids = self._get_prompt_stream_segment_token_ids(
+            PromptSourceType.APPEND
+        )
+        update_token_ids = self._get_prompt_stream_segment_token_ids(
+            PromptSourceType.UPDATE
+        )
+        return PromptStreamLayout(
+            prefix_len=len(self.prompt_stream.prefix_token_ids),
+            append_len=len(append_token_ids),
+            update_len=len(update_token_ids),
+            suffix_len=len(self.prompt_stream.suffix_token_ids),
+        )
 
     def _rebuild_prompt_from_stream_state(self) -> list[int]:
         """按近似注意力布局重建全局 prompt token 序列。
@@ -701,21 +811,20 @@ class Request:
 
         - Append 源稳定累积，先放在全局 prompt 中。
         - Update 源按版本快照更新，放在 Append 源之后。
+        - PROMPT_FINISHED 携带最终用户问题，作为 suffix 放在最后。
 
         因此 update 事件只会影响 update segment 的 KV；append 事件会扩展
-        append segment，并使后面的 update segment 需要基于新的 append KV
-        重新计算。
+        append segment，并使后面的 update segment / suffix 需要基于新的
+        append KV 重新计算。
         """
         assert self.prompt_stream is not None
         prompt_token_ids = list(self.prompt_stream.prefix_token_ids)
-        for source_id in self.prompt_stream.source_order:
-            source = self.prompt_stream.sources[source_id]
-            if source.source_type == PromptSourceType.APPEND:
-                prompt_token_ids.extend(source.token_ids)
-        for source_id in self.prompt_stream.source_order:
-            source = self.prompt_stream.sources[source_id]
-            if source.source_type == PromptSourceType.UPDATE:
-                prompt_token_ids.extend(source.token_ids)
+        prompt_token_ids.extend(
+            self._get_prompt_stream_segment_token_ids(PromptSourceType.APPEND)
+        )
+        prompt_token_ids.extend(
+            self._get_prompt_stream_segment_token_ids(PromptSourceType.UPDATE)
+        )
         prompt_token_ids.extend(self.prompt_stream.suffix_token_ids)
         return prompt_token_ids
 
@@ -735,11 +844,19 @@ class Request:
     def _sync_prompt_from_stream_state(
         self,
         old_prompt_token_ids: list[int],
+        kv_cache_keep_token_len: int | None = None,
     ) -> PromptStreamMutation:
-        """把 PromptStreamState 同步回 Request 的调度字段。"""
+        """把 PromptStreamState 同步回 Request 的调度字段。
+
+        Args:
+            old_prompt_token_ids: 修改流式状态前的全局 prompt token。
+            kv_cache_keep_token_len: scheduler 可安全保留的全局 KV 前缀长度。
+                Append 和 PROMPT_FINISHED 可以直接使用全局 prompt LCP；Update
+                需要先计算 update source 内部 LCP，再加上 prefix/append 偏移。
+        """
         assert self.prompt_stream is not None
         new_prompt_token_ids = self._rebuild_prompt_from_stream_state()
-        common_prefix_len = self._get_common_prefix_len(
+        global_common_prefix_len = self._get_common_prefix_len(
             old_prompt_token_ids,
             new_prompt_token_ids,
         )
@@ -748,6 +865,18 @@ class Request:
                 self.num_prompt_tokens,
                 self.prompt_stream.revision,
             )
+
+        if kv_cache_keep_token_len is None:
+            common_prefix_len = global_common_prefix_len
+        else:
+            if kv_cache_keep_token_len > global_common_prefix_len:
+                raise ValueError(
+                    "Prompt stream KV keep boundary exceeds global prompt LCP "
+                    f"for request_id={self.request_id}: "
+                    f"keep={kv_cache_keep_token_len}, "
+                    f"global_lcp={global_common_prefix_len}."
+                )
+            common_prefix_len = kv_cache_keep_token_len
 
         old_num_prompt_tokens = len(old_prompt_token_ids)
         old_num_computed_tokens = self.num_computed_tokens

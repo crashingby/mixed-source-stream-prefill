@@ -391,7 +391,7 @@ class Scheduler(SchedulerInterface):
     ) -> int:
         """限制流式 prompt 请求在输入结束前只能执行 prefill。
 
-        流式 prompt 请求在 `REQUEST_FINISHED` 前不能跨入 decode 阶段。
+        流式 prompt 请求在 `PROMPT_FINISHED` 前不能跨入 decode 阶段。
         scheduler 仍然使用 vLLM 原有的 token catch-up 模型，但这里会把
         本轮 token 数裁剪到剩余 prompt token 范围内。
         """
@@ -422,9 +422,9 @@ class Scheduler(SchedulerInterface):
         if mutation.num_tokens_to_invalidate <= 0:
             return
 
-        # Append 与 Update 的 KV 按布局分域管理：
-        # prefix + append segment 可以保留，update segment 只释放与上一版本
-        # 最长公共前缀之后的 blocks。
+        # Append 与 Update 的 KV 按布局分域管理：Update 事件先在
+        # update source 内部计算 LCP，再转换为全局 KV 保留边界。
+        # scheduler 只需要释放该边界之后的 blocks。
         blocks_were_freed = self.kv_cache_manager.truncate_blocks_from_position(
             existing,
             mutation.common_prefix_len,

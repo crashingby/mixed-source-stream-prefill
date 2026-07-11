@@ -1,606 +1,251 @@
-# 流式 Prefill 已完成设计记录
+# 流式 Prompt Prefill 当前实现说明
 
-## 当前已经新增的结构
+这份文档记录当前分支已经实现的内容。重点不是历史讨论过程，而是说明现在代码里已经形成的边界、状态模型和调度路径。
 
-目前我们已经把流式 prefill 的信息从普通请求字段里拆出来，形成了一个比较清楚的两层结构：
+当前实现已经把流式 prompt 的核心逻辑基本隔离到 `EngineCoreRequest -> Request` 之后：
 
-- `EngineCoreRequest.prompt_stream_event`：负责把一次流式 prefill 事件从前端传进 engine core。
-- `Request.prompt_stream_event`：负责把这次入站事件继续转交给 scheduler。
-- `Request.prompt_stream`：负责保存一个请求在 scheduler 生命周期里的长期流式 prompt 状态。
+- `EngineCoreRequest` 只负责携带一次入站事件。
+- `Request` 保存长期状态，并把多次事件合成为当前有效 prompt。
+- `Scheduler` 负责把事件应用到长期 `Request`，并根据变化释放失效 KV、刷新 worker 侧状态。
+- 前端如何构造事件、如何把 chunk 传进 engine，后续再设计。
 
-这一步的核心意图是：**不要把 append、update、source finish、request finish 这些语义散落成多个布尔字段**，而是统一封装成事件和状态。
+## 核心设计目标
 
-## 新增类的职责
+这个实现面向混合来源的流式 prefill，主要支持两类来源：
+
+- **Append source**：来源内容只追加，不修改过去已经提交的 token。
+- **Update source**：来源内容以快照方式更新，新版本可以替换上一版本的部分或全部 token。
+
+整体 prompt 的逻辑布局固定为：
+
+```text
+prefix/template + append segment + update segment + suffix/user question
+```
+
+在 P/D 分离语境下，P 节点最终传给 D 节点的 KV cache 也应该按照同样顺序理解：
+
+```text
+通用模板 KV + Append 部分 KV + Update 部分 KV + 用户问题 KV
+```
+
+这里需要特别注意：Update 部分的 prefill 是论文设计中的近似计算，不要求等价于完整 prompt 一次性 prefill。当前目标是先把状态管理、调度边界和 KV 释放路径搭起来。
+
+## 事件模型
+
+流式 prompt 的传输层事件定义在 `vllm/v1/engine/prompt_stream.py`。
 
 ### `PromptStreamEventType`
 
-`PromptStreamEventType` 表示这次事件到底是什么操作。
+当前事件类型包括：
 
-目前设计了四类：
+- `APPEND`：某个来源追加一段 token。
+- `UPDATE`：某个来源提交一个新版本的完整 token 快照。
+- `SOURCE_FINISHED`：某个来源结束，不再发送新内容。
+- `PROMPT_FINISHED`：整个 prompt stream 封口，并携带最终用户问题。
 
-- `APPEND`：某个来源追加了一段 token。
-- `UPDATE`：某个来源给出了一个新版本的完整 token 快照。
-- `SOURCE_FINISHED`：某个来源已经结束，不会再发送新内容。
-- `REQUEST_FINISHED`：整个请求的流式 prompt 输入已经结束。
-
-这个枚举后面会在 `Request.apply_prompt_stream_event()` 里真正用到，用来分发到 append、update、source finish 和 request finish 的处理逻辑。
+其中 `PROMPT_FINISHED = "prompt_finished"` 是请求级 barrier。它不是某个 source 的结束事件，而是表示最终用户问题已经到达，P 节点可以完成最后一段 prefill。
 
 ### `PromptSourceType`
 
-`PromptSourceType` 表示某个来源采用哪种语义。
+当前来源语义只有两种：
 
-- `APPEND`：只允许尾部追加，不允许改写已有 token。
-- `UPDATE`：允许用新版本快照替换该来源当前内容。
+- `APPEND`：该 source 的 token 只能追加。
+- `UPDATE`：该 source 的 token 表示当前版本快照。
 
-这个类型描述的是 **source 的长期语义**，不是单次事件本身。比如一个检索来源如果是 update 类型，那么它可能连续发送多个 `UPDATE` 事件，每个事件带一个更高版本的完整快照。
+source 创建后不能改变类型。如果同一个 `source_id` 先作为 Append 出现、后面又作为 Update 出现，`Request` 会报错。
 
 ### `PromptStreamEvent`
 
-`PromptStreamEvent` 是传输层事件，回答的是：**这一次来了什么？**
+`PromptStreamEvent` 是一次入站事件，主要字段语义如下：
 
-它包含：
+| 字段 | 含义 |
+| --- | --- |
+| `request_id` | 事件所属请求。必须和长期 `Request.request_id` 一致。 |
+| `source_id` | 同一个请求内的来源实例，例如检索器、网页源、ANN source。 |
+| `event_type` | 本次事件是 append、update、source finished 还是 prompt finished。 |
+| `source_type` | source 采用 Append 还是 Update 语义；`PROMPT_FINISHED` 可以不依赖它。 |
+| `chunk_id` | 幂等键，用于避免重复应用同一个 chunk。 |
+| `version` | 来源内容版本；Update 用它过滤旧版本。 |
+| `sequence_no` | 来源内部的到达顺序，用于检测乱序或缺口。 |
+| `token_ids` | Append 的新增 token、Update 的完整快照，或 `PROMPT_FINISHED` 的最终用户问题。 |
+| `arrival_time` | 前端观察到内容可用的时间，用于后续调度和延迟分析。 |
 
-- `request_id`：同一个流式 prompt 请求的所有事件必须属于同一个 engine 内部请求 ID。
-- `source_id`：区分不同来源，例如 `web_search_0`、`dense_retriever_0`。
-- `event_type`：说明这次事件是 append、update、source finished 还是 request finished。
-- `source_type`：说明这个来源采用 append 语义还是 update 语义。
-- `chunk_id`：用于去重和幂等，避免重试导致同一段内容重复应用。
-- `version`：用于 update 语义下判断新旧版本。
-- `sequence_no`：用于检查同一来源内部是否乱序或缺失。
-- `token_ids`：append 时表示新增 token，update 时表示该来源当前版本的完整 token 快照。
-- `arrival_time`：记录内容到达时间，后面可以用于 debounce、延迟统计和调度策略。
+## EngineCoreRequest 的边界
 
-注意：`PromptStreamEvent` 不保存累计 prompt，它只描述一次输入事件。
+`EngineCoreRequest` 现在只增加了一个字段：
 
-### `PromptSourceState`
+```python
+prompt_stream_event: PromptStreamEvent | None = None
+```
 
-`PromptSourceState` 是 `Request` 内部的单来源状态，回答的是：**这个 source 目前累积成什么样？**
+这个字段的定位很轻：
 
-它保存：
+- 普通请求保持为 `None`。
+- 流式 prompt 的后续事件通过这个字段进入 engine core。
+- `EngineCoreRequest` 不保存长期流式状态。
+- `EngineCoreRequest` 不负责判断 Append / Update 怎么改 prompt。
 
-- `source_id`：来源 ID。
-- `source_type`：来源语义，创建后应保持稳定。
-- `token_ids`：该来源当前有效 token。
-- `version`：该来源当前有效版本。
-- `next_sequence_no`：下一条期望收到的序号。
-- `seen_chunk_ids`：已经应用过的 chunk，用于去重。
-- `finished`：该来源是否结束。
-- `last_arrival_time`：该来源最近一次事件到达时间。
+真正的状态管理从 `Request.from_engine_core_request()` 之后开始。
+
+## Request 的长期状态
+
+`Request` 现在是流式 prompt 的长期状态持有者。它不是单次事件，而是 scheduler 里持续存在的请求对象。
+
+新增的关键字段包括：
+
+- `prompt_stream_event`：本次从 `EngineCoreRequest` 转来的入站事件。对于长期 Request，事件被应用后会清空。
+- `prompt_stream`：长期流式 prompt 状态，类型是 `PromptStreamState | None`。
+- `prompt_stream_needs_worker_refresh`：当 prompt token 或 block 状态发生变化时，要求 scheduler 刷新 worker 侧 cached request 数据。
 
 ### `PromptStreamState`
 
-`PromptStreamState` 是 `Request` 内部的完整流式 prompt 状态，回答的是：**这个请求当前的多源 prompt 状态是什么？**
+`PromptStreamState` 保存一个请求内所有流式 source 的当前状态：
 
-它保存：
+| 字段 | 含义 |
+| --- | --- |
+| `prefix_token_ids` | 流式 source 之前的固定 prompt，例如 system prompt 或通用模板。 |
+| `sources` | `source_id -> PromptSourceState` 的映射。 |
+| `source_order` | source 首次出现顺序；重建 prompt 时按类型分段后仍保持各段内部稳定顺序。 |
+| `suffix_token_ids` | `PROMPT_FINISHED` 携带的最终用户问题。 |
+| `finished` | 请求级 prompt stream 是否已经封口。 |
+| `revision` | prompt 每次真实变化后递增。 |
+| `total_tokens_invalidated` | 累计失效 token 数。 |
+| `total_tokens_recomputed` | 预留统计字段，目前还没有完整维护。 |
 
-- `sources`：从 `source_id` 到 `PromptSourceState` 的映射。
-- `source_order`：多来源拼接 prompt 的稳定顺序。
-- `finished`：请求级流式 prompt 是否结束。
-- `revision`：prompt 每次真实变化后递增，用于防止 scheduler 或 model runner 使用旧状态 decode。
-- `total_tokens_invalidated`：累计失效 token 数。
-- `total_tokens_recomputed`：累计重算 token 数。
+### `PromptSourceState`
 
-这个状态是 scheduler 后面真正会依赖的对象。
+每个 source 的状态保存在 `PromptSourceState` 中：
 
-### `PromptStreamMutation`
+- `source_id`：来源 ID。
+- `source_type`：Append 或 Update。
+- `token_ids`：该来源当前有效 token。
+- `version`：当前有效版本。
+- `next_sequence_no`：下一条期望到达的序号。
+- `seen_chunk_ids`：已经应用过的 chunk，用于去重。
+- `pending_events`：乱序到达但暂时不能应用的事件。
+- `finished`：该 source 是否结束。
+- `last_arrival_time`：最近一次事件到达时间。
 
-`PromptStreamMutation` 是 `Request.apply_prompt_stream_event()` 返回给 scheduler 的结果，回答的是：**这次事件对 prompt 和 KV cache 有什么影响？**
+当前 `pending_events` 只是暂存乱序事件，尚未实现自动补洞消费。
 
-它保存：
+### `PromptStreamLayout`
 
-- `applied`：事件是否真的改变了 prompt。
-- `old_num_prompt_tokens`：应用事件前的 prompt 长度。
-- `new_num_prompt_tokens`：应用事件后的 prompt 长度。
-- `common_prefix_len`：新旧 prompt 的最长公共前缀。
-- `num_tokens_to_invalidate`：已经 prefill 过但现在需要失效的 token 数。
-- `prompt_revision`：应用事件后的 prompt 版本。
-
-这个类的重点是把 `Request` 和 `Scheduler` 的职责隔开：
-
-- `Request` 负责判断 prompt 怎么变。
-- `Scheduler` 负责根据 mutation 去处理 KV cache、重新调度和 decode barrier。
-
-## 数据流
-
-当前设计的数据流是：
-
-```text
-前端 / client
-  -> EngineCoreRequest(prompt_stream_event=event)
-  -> EngineCore.preprocess_add_request()
-  -> Request.from_engine_core_request()
-  -> Request(prompt_stream_event=event)
-  -> Scheduler.add_request()
-  -> existing_request.apply_prompt_stream_event(event)
-  -> PromptStreamMutation
-  -> Scheduler / KVCacheManager 处理 KV 失效和重新调度
-```
-
-这里最关键的是：`EngineCoreRequest` 不保存长期状态，`Request` 才保存长期状态。
-
-## 和 Stream2LLM 的区别
-
-Stream2LLM 的实现更直接：
-
-- 在 `Request` 上加 `is_streaming_prompt`。
-- 在 `Request` 上加 `is_streaming_prompt_finished`。
-- append 时直接扩展 `prompt_token_ids` 和 `_all_token_ids`。
-- update 时计算最长公共前缀，然后回退 `num_computed_tokens`。
-- 用 `cache_invalidated_this_step` 通知 scheduler 这一轮需要重置 worker 侧 block table。
-
-我们现在的设计更偏向多源场景，因此没有直接照搬它的字段，而是拆成：
-
-- `PromptStreamEvent`：单次事件。
-- `PromptSourceState`：单个来源的长期状态。
-- `PromptStreamState`：整个请求的多源长期状态。
-- `PromptStreamMutation`：给 scheduler 的变更摘要。
-
-这样后续才能支持 append source 和 update source 混合存在。
-
-
-
-### `PromptStreamState` 不能只靠 `prompt_stream_event` 推断
-
-`prompt_stream_event` 是一次性事件，`prompt_stream` 是长期状态。
-
-后面第一次收到流式事件时，需要显式初始化：
+`PromptStreamLayout` 用于显式描述当前 prompt 在 KV cache 中的逻辑分段：
 
 ```python
-self.prompt_stream = PromptStreamState(
-    sources={},
-    source_order=[],
-    finished=False,
-    revision=0,
-    total_tokens_invalidated=0,
-    total_tokens_recomputed=0,
-)
+@dataclass(frozen=True)
+class PromptStreamLayout:
+    prefix_len: int
+    append_len: int
+    update_len: int
+    suffix_len: int
 ```
 
-否则 `is_prompt_streaming()` 只看 `self.prompt_stream is not None` 时，会认为这个请求还不是流式 prefill 请求。
+`Request.get_prompt_stream_layout()` 返回四段长度。后续接 P/D transfer 时，可以用它把 KV cache 的逻辑边界传给 connector 或 debug 工具。
 
-## 下一步实现计划
+## Request 如何应用事件
 
-- 实现 `Request.apply_prompt_stream_event()`，先只做事件类型分发。
-- 实现 `_ensure_prompt_stream_state()`，第一次收到流式事件时初始化 `PromptStreamState`。
-- 先实现 append 语义：只允许尾部追加、重复 chunk 跳过、source finished 后拒绝追加。
-- 再实现 update 语义：把 `token_ids` 当作该 source 的完整快照，计算全局 prompt 的最长公共前缀。
-- Scheduler 最小接入已完成：遇到 duplicate request id 且带 `prompt_stream_event` 时，不走现有 `StreamingUpdate`，而是调用 `existing_request.apply_prompt_stream_event()`。
-
-## Request 侧接口框架更新
-
-这一轮主要补的是 `vllm/v1/request.py` 里的流式 prompt 语义层接口。目标不是让 scheduler 现在就完整跑通，而是先让 `Request` 能独立维护流式 prompt 状态，并给 scheduler 暴露少量稳定接口。
-
-### 当前可以认为已经准备好的 scheduler-facing 接口
-
-`Request` 目前给 scheduler 看的接口主要有四个：
+Scheduler 面向流式 prompt 的统一入口是：
 
 ```python
-request.prompt_stream_event
-request.apply_prompt_stream_event(event)
-request.is_prompt_stream_finished()
-request.can_decode_from_prompt_stream()
-request.get_prompt_stream_revision()
+Request.apply_prompt_stream_event(event)
 ```
 
-它们的职责分别是：
+它根据 `event.event_type` 分发到不同处理函数：
 
-- `prompt_stream_event`：保存这一次从 `EngineCoreRequest` 转过来的流式 prompt 事件。scheduler 后续在 duplicate `request_id` 分支里会读取这个字段。
-- `apply_prompt_stream_event(event)`：scheduler 的主入口。scheduler 不需要知道 append、update、source finish 的细节，只把事件交给 `Request`，然后拿到 `PromptStreamMutation`。
-- `is_prompt_stream_finished()`：判断请求级流式 prompt 是否已经结束。普通非流式请求返回 `True`。
-- `can_decode_from_prompt_stream()`：判断当前请求是否越过 decode barrier。普通请求返回 `True`；流式 prompt 请求必须同时满足 prompt 已结束和 prompt 已 prefill 完。
-- `get_prompt_stream_revision()`：返回当前 prompt 版本。后续 scheduler 可以把它放进调度快照，避免旧版本 prompt 的执行结果被误用于新版本 prompt。
+| 事件 | 处理函数 | 主要行为 |
+| --- | --- | --- |
+| `APPEND` | `_apply_prompt_stream_append()` | 追加该 source 的 token。 |
+| `UPDATE` | `_apply_prompt_stream_update()` | 用新快照替换该 update source 的 token。 |
+| `SOURCE_FINISHED` | `_mark_prompt_source_finished()` | 标记单个 source 结束。 |
+| `PROMPT_FINISHED` | `_mark_prompt_stream_finished()` | 写入最终用户问题，并封口整个 prompt stream。 |
 
-所以现在可以说：**Request 侧给 scheduler 的接口骨架已经有了，并且 scheduler 已经做了最小调用**。但这还不是端到端完成，因为部分 KV 失效、revision 快照过滤和测试还没有补齐。
+所有会修改 prompt 的事件都会先经过 `_validate_prompt_stream_can_mutate()` 校验。
 
-### `PromptStreamMutation.noop()`
+当前校验规则是：
 
-新增了：
+- 已经生成 output token 后，不能再修改 prompt。
+- 当前只支持 token-id prompt，不支持 prompt embeds 或 mixed token/embed 输入。
+- `APPEND`、`UPDATE`、`PROMPT_FINISHED` 必须携带 `token_ids`。
+
+## Append 语义
+
+Append 事件表示某个 source 新增了一段 token。
+
+当前行为是：
+
+- 如果 prompt stream 已经 `finished`，拒绝追加。
+- 如果 source 已经 `finished`，拒绝追加。
+- 如果 `chunk_id` 已经出现过，返回 no-op，避免重复应用。
+- 如果 `sequence_no` 不是期望值，把事件放入 `pending_events`，暂不应用。
+- 否则把 `event.token_ids` 追加到该 source 的 `token_ids` 后面。
+
+Append 应用后会调用 `_sync_prompt_from_stream_state()`，把新的流式状态同步回 `Request.prompt_token_ids` 和 `_all_token_ids`。
+
+## Update 语义
+
+Update 事件表示某个 source 当前版本的完整快照。
+
+当前行为是：
+
+- MVP 阶段最多只允许一个 Update source。
+- 如果 prompt stream 已经 `finished`，拒绝更新。
+- 如果 source 已经 `finished`，拒绝更新。
+- 如果 `chunk_id` 已经出现过，返回 no-op。
+- 如果 `sequence_no` 不是期望值，把事件放入 `pending_events`，暂不应用。
+- 如果 `version` 小于当前版本，认为是旧事件，返回 no-op。
+- 如果 `version` 相同但 token 内容不同，认为是冲突事件，直接报错。
+- 否则用 `event.token_ids` 替换该 update source 的 `token_ids`。
+
+Update 应用前会先比较旧 update 快照和新 update 快照，得到 **update 源内 LCP**。
+然后把这个局部 LCP 加上 `prefix_len + append_len`，转换成 scheduler 可以使用的全局 KV 保留边界。
+最后再触发 `_sync_prompt_from_stream_state()`。
+
+## PROMPT_FINISHED 语义
+
+`PROMPT_FINISHED` 是整个 prompt stream 的封口事件。
+
+它的 `token_ids` 被解释为最终用户问题，写入：
 
 ```python
-PromptStreamMutation.noop(num_prompt_tokens, prompt_revision)
+PromptStreamState.suffix_token_ids
 ```
 
-这个方法用于构造“没有真实改变 prompt”的返回值，例如：
+当前行为是：
 
-- 重复 `chunk_id`。
-- 旧版本 update。
-- 乱序事件暂存到 `pending_events`。
-- 单个 source finished。
-- request finished。
+- 如果还没有 `PromptStreamState`，先初始化。
+- 如果 prompt stream 尚未 finished，写入 suffix，设置 `finished=True`，然后同步 prompt。
+- 如果 prompt stream 已经 finished 且 suffix 完全一致，返回 no-op。
+- 如果 prompt stream 已经 finished 但 suffix 不一致，报错，避免同一个请求被两个不同最终问题封口。
 
-它的意义是让 scheduler 不需要特殊判断这些情况，只看：
+这个事件到达后，scheduler 不会立刻跳过最终用户问题。它只是解除“不能 decode”的 barrier；最终用户问题仍然需要被 prefill 完，之后才会自然进入首 token decode。
+
+## Prompt 重建和 revision
+
+每次 Append、Update 或 PROMPT_FINISHED 改变有效 token 后，Request 会调用：
 
 ```python
-mutation.applied
-mutation.num_tokens_to_invalidate
-mutation.prompt_revision
+_sync_prompt_from_stream_state(old_prompt_token_ids)
 ```
 
-如果 `applied=False` 且 `num_tokens_to_invalidate=0`，scheduler 通常不需要做 KV invalidation。
-
-### `PromptStreamState` 的前缀和后缀
-
-这一轮给 `PromptStreamState` 补了两个字段：
-
-```python
-prefix_token_ids: list[int]
-suffix_token_ids: list[int]
-```
-
-原因是流式 source 往往不是完整 prompt 的全部内容。真实请求通常像这样：
-
-```text
-固定前缀 + 多个流式 source 内容 + 固定后缀
-```
-
-例如：
-
-```text
-system prompt / 用户问题
-+ 检索结果 source 0
-+ 检索结果 source 1
-+ answer prefix
-```
-
-因此 `_ensure_prompt_stream_state()` 第一次初始化时会把当前已有的 `prompt_token_ids` 保存进 `prefix_token_ids`。后面重建全局 prompt 时使用：
-
-```text
-prefix_token_ids + 按 source_order 拼接的 source token_ids + suffix_token_ids
-```
-
-这个设计避免第一次收到 stream event 时把原始 prompt 覆盖掉。
-
-### `PromptSourceState.pending_events`
-
-`PromptSourceState` 新增了：
-
-```python
-pending_events: dict[int, PromptStreamEvent]
-```
-
-这个字段用于暂存乱序到达的事件。当前 MVP 逻辑是：
-
-- 如果 `event.sequence_no != source.next_sequence_no`，先把事件放进 `pending_events`。
-- 本次返回 `PromptStreamMutation.noop()`。
-- 暂时不自动消费 pending 队列。
-
-也就是说，现在只是把乱序事件保护起来，避免错误应用；后续如果要支持乱序恢复，需要补“缺口补齐后连续消费 pending events”的逻辑。
-
-### `apply_prompt_stream_event()` 的分发逻辑
-
-当前 `apply_prompt_stream_event()` 做了两层事情。
-
-第一层是校验：
-
-```python
-if event.request_id != self.request_id:
-    raise ValueError(...)
-```
-
-第二层是按事件类型分发：
-
-```python
-APPEND -> _apply_prompt_stream_append(event)
-UPDATE -> _apply_prompt_stream_update(event)
-SOURCE_FINISHED -> _mark_prompt_source_finished(event)
-REQUEST_FINISHED -> _mark_prompt_stream_finished(event)
-```
-
-这意味着 scheduler 后续只需要调用一个统一入口，不需要自己区分不同事件内部怎么改 prompt。
-
-### Append 事件的当前语义
-
-`_apply_prompt_stream_append()` 当前实现的是最小 append 语义：
-
-- 不允许在请求级 prompt stream finished 后继续 append。
-- 不允许对已经 finished 的 source append。
-- 如果 `chunk_id` 已经出现过，返回 `noop()`。
-- 如果 `sequence_no` 不是期望值，把事件放进 `pending_events`，返回 `noop()`。
-- 如果事件合法，则把 `event.token_ids` 追加到该 source 的 `token_ids`。
-- 然后调用 `_sync_prompt_from_stream_state()` 重建全局 prompt，并生成 `PromptStreamMutation`。
-
-Append 对 scheduler 的效果是：
-
-```text
-如果只是尾部追加，common_prefix_len 通常等于旧 prompt 长度。
-num_computed_tokens 不会被回退。
-scheduler 后续只需要继续 prefill 新增部分。
-```
-
-### Update 事件的当前语义
-
-`_apply_prompt_stream_update()` 当前实现的是 source 级完整快照 update：
-
-- 不允许在请求级 prompt stream finished 后继续 update。
-- 不允许对已经 finished 的 source update。
-- 如果 `chunk_id` 已经出现过，返回 `noop()`。
-- 如果 `sequence_no` 不是期望值，把事件放进 `pending_events`，返回 `noop()`。
-- 如果 `event.version < source.version`，视为旧版本，返回 `noop()`。
-- 如果同一个版本出现不同内容，抛出 `ValueError`。
-- 如果事件合法，则用 `event.token_ids` 替换该 source 当前 token 快照。
-- 然后调用 `_sync_prompt_from_stream_state()` 重建全局 prompt。
-
-Update 对 scheduler 的效果是：
-
-```text
-Request 会计算新旧全局 prompt 的最长公共前缀。
-Request 会把 num_computed_tokens 回退到公共前缀以内。
-Request 会返回 num_tokens_to_invalidate。
-scheduler 后续根据 mutation 释放失效 KV，并重新 prefill 后缀。
-```
-
-### Source finished 和 request finished
-
-当前有两个 finished 级别：
-
-- `_mark_prompt_source_finished()`：只标记某个 source 结束，不改变全局 prompt。
-- `_mark_prompt_stream_finished()`：标记整个请求级流式 prompt 结束。
-
-这两个函数目前都返回 `PromptStreamMutation.noop()`，因为它们不改变 token 内容。
-
-对 scheduler 来说，真正影响 decode barrier 的是请求级：
-
-```python
-request.is_prompt_stream_finished()
-request.can_decode_from_prompt_stream()
-```
-
-单个 source finished 只是 `Request` 内部状态，scheduler 不应该直接关心。
-
-### `_sync_prompt_from_stream_state()` 做了什么
-
-`_sync_prompt_from_stream_state()` 是当前最关键的内部函数。它把 `PromptStreamState` 同步回 vLLM 原有调度字段。
-
-当前流程是：
-
-1. 用 `_rebuild_prompt_from_stream_state()` 重建新的全局 prompt。
-2. 计算旧 prompt 和新 prompt 的最长公共前缀 `common_prefix_len`。
-3. 如果 prompt 没变，返回 `noop()`。
-4. 计算 `num_tokens_to_invalidate = max(0, old_num_computed_tokens - common_prefix_len)`。
-5. 更新：
-   - `self.prompt_token_ids`
-   - `self._all_token_ids`
-   - `self.num_prompt_tokens`
-   - `self.num_computed_tokens`
-   - `self.prompt_stream.revision`
-   - `self.prompt_stream.total_tokens_invalidated`
-6. 如果公共前缀小于旧 prompt 长度，清空 `block_hashes` 和 `_prompt_embeds_per_block_hashes`。
-7. 调用 `update_block_hashes()` 重新生成 prefix cache 相关哈希。
-8. 返回 `PromptStreamMutation`。
-
-这个函数是 Request 和 scheduler 的分界线：
-
-- Request 负责把 prompt 状态改正确。
-- Scheduler 负责根据 mutation 去处理真实 KV block 释放和重新调度。
-
-### 当前实现的限制
-
-这部分很重要，后续 review 代码时需要特别看：
-
-- 当前只支持 token-id prompt，不支持 `prompt_embeds` 或 mixed token/embed 输入。`_validate_prompt_stream_can_mutate()` 里已经显式拒绝。
-- 当前没有自动消费 `pending_events`，乱序事件只会暂存。
-- 当前没有实现 debounce，update 事件会立即应用。
-- 当前 `source_order` 是按 source 首次出现顺序确定的；多源排序策略后续还需要设计。
-- 当前 `suffix_token_ids` 只是预留字段，还没有入口设置。
-- 当前 `total_tokens_recomputed` 还没有更新逻辑，因为 recompute 发生在 scheduler/model runner 侧。
-- Scheduler 已经有了最小接入：duplicate `request_id` 的 `prompt_stream_event` 会应用到 existing `Request`；但 `SchedulerOutput` revision 快照、部分 KV 失效和测试还没完成。
-
-### 后续 scheduler 接入状态
-
-这一项现在已经有了最小实现：
-
-- `Scheduler.add_request()` 已经识别 duplicate `request_id` 且 `prompt_stream_event is not None` 的情况。
-- 事件会被应用到 scheduler 中的 existing `Request`。
-- `schedule()` 已经加入流式 prompt decode barrier。
-- `_make_cached_request_data()` 已经能在 prompt 改变后刷新 worker cached state。
-
-仍未完成的是：部分 KV 失效、revision 快照过滤、pending events 自动消费和测试。
-
-## Scheduler 接入后的真实长期状态边界
-
-这一轮把前面讨论的关键边界落到了代码里：**incoming Request 只是事件载体，scheduler 里已有的 existing Request 才保存长期流式 prompt 状态**。
-
-### 新的对象关系
-
-当前数据流应该这样理解：
-
-```text
-EngineCoreRequest(prompt_stream_event=event)
-  -> Request.from_engine_core_request()
-  -> incoming Request
-      - prompt_stream_event != None
-      - prompt_stream 通常为 None
-  -> Scheduler.add_request(incoming)
-  -> existing = scheduler.requests[request_id]
-  -> existing.apply_prompt_stream_event(event)
-  -> existing.prompt_stream 保存长期状态
-```
-
-也就是说：
-
-- `incoming.prompt_stream_event` 是这一次 append/update/finish 事件。
-- `incoming.prompt_stream` 不应该保存长期状态。
-- `existing.prompt_stream` 才是长期状态账本。
-- `scheduler.requests[request_id]` 是长期请求对象的唯一入口。
-
-这和 Stream2LLM 的设计一致：Stream2LLM 也是用新来的 `EngineCoreRequest` 携带 chunk/update，然后修改 `scheduler.requests[request_id]` 里的 existing `Request`。
-
-### `Scheduler.add_request()` 的新逻辑
-
-现在 `Scheduler.add_request()` 在发现 duplicate `request_id` 时会优先检查：
-
-```python
-if request.prompt_stream_event is not None:
-    self._apply_prompt_stream_request(existing, request)
-    return
-```
-
-这条分支排在原有 `resumable` / `StreamingUpdate` 逻辑之前，原因是流式 prefill 和 vLLM 现有 streaming session 语义不同：
-
-- 流式 prefill 是同一个 prompt 在 decode 前持续变化。
-- `resumable` 是一次 generation session 结束后继续输入下一段。
-
-所以流式 prefill 事件不应该走 `StreamingUpdate.from_request()`。
-
-### `_apply_prompt_stream_request()` 做了什么
-
-新增的 `_apply_prompt_stream_request(existing, incoming)` 做三件事：
-
-1. 从 incoming Request 取出 `prompt_stream_event`。
-2. 调用长期 Request：
-
-   ```python
-   mutation = existing.apply_prompt_stream_event(event)
-   ```
-
-3. 如果 `mutation.num_tokens_to_invalidate > 0`，说明已有 KV 后缀不能继续复用，于是采用保守策略释放 KV。
-
-当前代码里明确区分：
-
-```text
-incoming Request：只负责携带事件
-existing Request：负责保存和更新长期 PromptStreamState
-```
-
-这是本轮最重要的逻辑修正。
-
-### 当前 KV 失效策略已改为分域截断版
-
-Stream2LLM 里有：
-
-```python
-invalidate_cache_from_position(existing_request, common_prefix_len)
-```
-
-它能按 common prefix 保留一部分 KV，只释放后缀。
-
-新版 vLLM 原本没有 Stream2LLM 那种公开的按 token 位置失效接口，所以这一轮新增了 `truncate_blocks_from_position()` 链路：
-
-```python
-KVCacheManager.truncate_blocks_from_position(request, keep_tokens)
-KVCacheCoordinator.truncate_blocks_from_position(request_id, keep_tokens)
-SingleTypeKVCacheManager.truncate_blocks_from_position(request_id, keep_tokens)
-```
-
-含义是：
-
-- `keep_tokens` 是安全复用边界。
-- KV manager 会按 block size 向上取整，保留覆盖该边界的 blocks。
-- 边界之后的尾部 blocks 会被释放。
-- scheduler 不再把 `num_computed_tokens` 强行置 0，而是保留 `Request.apply_prompt_stream_event()` 已经回退后的进度。
-
-这个版本比全释放更符合分域语义：Append segment 的 KV 可以保留，Update segment 只释放与上一版本最长公共前缀之后的 KV。
-
-### worker cached state 刷新标记
-
-`Request` 新增了：
-
-```python
-self.prompt_stream_needs_worker_refresh = False
-```
-
-当 `Request._sync_prompt_from_stream_state()` 发现 prompt 真实改变后，会设置：
-
-```python
-self.prompt_stream_needs_worker_refresh = True
-```
-
-原因是 scheduler 自己的 `Request` 变了还不够，worker 侧也缓存了 request 的 token/block 状态。如果 prompt 变了但 worker 没刷新，就可能出现：
-
-```text
-scheduler 认为 prompt 已 append/update
-worker 仍然使用旧 token 序列或旧 block table
-```
-
-所以 `_make_cached_request_data()` 现在会检查这个标记：
-
-```python
-force_worker_refresh = req.prompt_stream_needs_worker_refresh
-```
-
-如果为 True：
-
-- 把该 request 加入 `resumed_req_ids`。
-- 把完整 `all_token_ids` 重新发给 worker。
-- 用 `kv_cache_manager.get_blocks(req_id)` 发送当前完整 block table。
-- 然后清掉 `prompt_stream_needs_worker_refresh`。
-
-这个逻辑的意图是让 worker 把这个 request 当作类似 resumed/preempted request 重新装载，而不是继续 append 到旧 cached state 上。
-
-### decode barrier 的 scheduler 侧实现
-
-新增了：
-
-```python
-Scheduler._cap_prompt_stream_num_new_tokens(request, num_new_tokens)
-```
-
-它的语义是：
-
-- 普通请求或者已经 `REQUEST_FINISHED` 的流式 prompt 请求，不裁剪。
-- 如果流式 prompt 还没结束，只允许调度剩余 prompt token。
-- 如果 prompt token 已经 prefill 完，但 request 级流式输入还没结束，本轮调度 token 数变成 0。
-
-也就是说，流式 prompt 未结束时：
-
-```text
-可以继续 prefill 已经到达的 prompt token
-不能跨入 decode
-```
-
-这个函数已经接入两个地方：
-
-- running request 的调度路径。
-- waiting request 的调度路径。
-
-waiting request 如果因为 decode barrier 得到 `num_new_tokens == 0`，会被移到本轮 skipped waiting，等待后续 stream event 让 prompt 继续增长或结束。
-
-### 当前已经形成的调度模型
-
-现在 scheduler 看流式 prompt 的方式变成：
-
-```text
-1. 新事件到达：Scheduler.add_request(incoming)
-2. 找到长期请求：existing = self.requests[request_id]
-3. 修改长期状态：existing.apply_prompt_stream_event(event)
-4. 如有 KV 失效：释放 blocks，并把 existing.num_computed_tokens 置 0
-5. 如 prompt 改变：标记 worker refresh
-6. schedule() 使用原有 catch-up 逻辑计算 num_new_tokens
-7. decode barrier 把 num_new_tokens 限制在 prompt 范围内
-8. worker 收到 refreshed cached data 后使用新 token/block 状态
-```
-
-### 现在仍然没有完成的部分
-
-这一步只是把长期状态和 scheduler 接口接起来了，还没有完全完成论文系统需要的全部内容：
-
-- 还没有实现新版 vLLM 的部分 KV 失效；现在是保守全释放。
-- 还没有实现 `pending_events` 的自动消费。
-- 还没有实现 debounce。
-- 还没有实现显式的初始流式请求标记。如果一个请求一开始没有 `prompt_stream_event`，scheduler 仍然会把它当普通请求；后续可能需要 `is_prompt_streaming_request` 或类似字段。
-- `source_order` 仍然是 source 首次出现顺序，后续需要根据论文设定确定稳定排序策略。
-- `suffix_token_ids` 仍然只是预留。
-- `prompt_stream_revision` 已经能从 Request 获取，但还没有真正写入 `SchedulerOutput` 快照，也没有在 `update_from_output()` 里做旧版本结果过滤。
-- 还没有针对流式 prompt 写单元测试。
-
-### 目前可以先 review 的重点
-
-你现在 review 代码时，建议优先看这几件事是否符合你的本意：
-
-- `PromptStreamState` 是否应该挂在 existing `Request` 上，而不是 incoming `Request` 上。
-- 初始 prompt 是否应该作为 `prefix_token_ids` 保存。
-- 多 source 拼接顺序是否可以先用首次出现顺序。
-- update 事件是否应该被解释为 source 级完整快照。
-- 当前保守全释放 KV 是否可以作为 MVP，还是必须尽早做部分失效。
-- decode barrier 是否应该以 `REQUEST_FINISHED` 为准，而不是所有 source finished 自动推断。
-
-## Append / Update 分域 KV 逻辑修正
-
-这一轮根据新的论文语义修正了整体逻辑：Append 和 Update 的 KV cache 不再被当作一个全局 prompt 的统一 LCP 来理解，而是按来源类型分域。
-
-### 固定计算布局
-
-`Request._rebuild_prompt_from_stream_state()` 现在按固定布局重建 token：
+同步流程是：
+
+1. 用 `_rebuild_prompt_from_stream_state()` 重建全局 prompt。
+2. 计算或接收 scheduler 可安全保留的全局 KV 前缀长度 `common_prefix_len`。
+   - Append 和 `PROMPT_FINISHED` 使用旧全局 prompt 与新全局 prompt 的 LCP。
+   - Update 使用 update 源内 LCP，再加上 `prefix_len + append_len` 偏移。
+3. 如果 token 序列没有变化，返回 `PromptStreamMutation.noop()`。
+4. 如果发生变化，更新：
+   - `prompt_token_ids`
+   - `_all_token_ids`
+   - `num_prompt_tokens`
+   - `num_computed_tokens`
+   - `prompt_stream.revision`
+   - `prompt_stream.total_tokens_invalidated`
+   - `prompt_stream_needs_worker_refresh`
+5. 如果公共前缀短于旧 prompt，清空 `block_hashes` 和 `_prompt_embeds_per_block_hashes`，然后重新计算 block hashes。
+
+重建 prompt 的固定顺序是：
 
 ```text
 prefix_token_ids
@@ -609,71 +254,89 @@ prefix_token_ids
 + suffix_token_ids
 ```
 
-这替代了之前的“按 source 首次出现顺序拼接”。原因是你的语义要求：
+这就是当前 Request 侧和后续 D 节点 KV 排布需要对齐的逻辑顺序。
 
-- Append KV 是稳定累积的基础。
-- Update 的新版本 prefill 要基于已有 append KV 和 update 前缀 KV。
-- Update 快照变化不应该影响 Append 对应的 KV cache。
+## PromptStreamMutation
 
-### Append 事件现在如何影响 KV
+`PromptStreamMutation` 是 Request 返回给 scheduler 的变化摘要。
 
-Append 事件会扩展 append segment。由于 update segment 位于 append segment 之后，如果之前已经计算过 update token，那么 append 增长后 update token 的上下文发生变化，需要从新的 append 边界后重新计算。
+它包含：
 
-因此 append 事件的效果是：
+| 字段 | 含义 |
+| --- | --- |
+| `applied` | 事件是否真实改变了 prompt。 |
+| `old_num_prompt_tokens` | 修改前 prompt 长度。 |
+| `new_num_prompt_tokens` | 修改后 prompt 长度。 |
+| `common_prefix_len` | scheduler 可安全保留的全局 KV 前缀长度。Update 场景下它等于 `prefix_len + append_len + update_source_lcp`。 |
+| `num_tokens_to_invalidate` | 已经 prefill 过但现在失效的 token 数。 |
+| `prompt_revision` | 修改后的 prompt revision。 |
 
-```text
-保留：prefix + 旧 append segment
-新增计算：new append chunk
-后续 update segment：如果已算过，需要在调度中重新计算
-```
+Scheduler 不需要理解 Append / Update 的内部细节，只需要根据这个 mutation 判断是否释放 KV、是否刷新 worker 侧缓存。
 
-当前代码通过重建布局和计算 `common_prefix_len` 得到这个安全边界。
+## Scheduler 如何接收流式事件
 
-### Update 事件现在如何影响 KV
+`Scheduler.add_request()` 现在区分两种情况。
 
-Update 事件被解释为 update source 的新版本完整快照。处理时：
+### 已存在长期 Request
 
-1. 更新该 source 的 `token_ids`。
-2. 重建全局布局：`prefix + append + update + suffix`。
-3. 计算旧布局和新布局的 LCP。
-4. 由于 append segment 位于 update segment 之前，LCP 会自然包含：
-   - fixed prefix。
-   - 所有 append token。
-   - update snapshot 的最长公共前缀。
-5. scheduler 使用该 LCP 作为 `keep_tokens` 截断 KV blocks。
-
-这对应你指定的近似计算：
-
-```text
-update suffix prefill context = [已有所有 append KV] + [update 前缀 KV]
-```
-
-### 新增 KV 截断接口
-
-为了不再保守释放全部 KV，这一轮新增了按位置截断接口：
+如果同一个 `request_id` 已经在 `self.requests` 里，并且新来的临时 `Request` 带有 `prompt_stream_event`：
 
 ```python
-KVCacheManager.truncate_blocks_from_position(request, keep_tokens)
+self._apply_prompt_stream_request(existing, request)
+return
 ```
 
-底层会继续调用 coordinator 和 single-type manager：
+这里的关键点是：
+
+- `incoming Request` 只是事件载体。
+- `existing Request` 才保存长期状态。
+- 事件应用完成后，`incoming.prompt_stream_event` 会被清空。
+
+这就是当前实现中 “EngineCoreRequest 之后隔离” 的主要边界。
+
+### 第一次进入 scheduler 的 Request
+
+如果 `request_id` 还不存在，但这个 Request 自带 `prompt_stream_event`：
+
+- scheduler 会先在这个 Request 上应用该事件。
+- 然后清空 `request.prompt_stream_event`。
+- 再把这个 Request 放入 waiting queue，并登记到 `self.requests`。
+
+这使得第一条事件也能初始化长期 `PromptStreamState`。
+
+## Scheduler 的 decode barrier
+
+流式 prompt 请求在 `PROMPT_FINISHED` 前不能进入 decode。
+
+对应逻辑在：
 
 ```python
-KVCacheCoordinator.truncate_blocks_from_position(request_id, keep_tokens)
-SingleTypeKVCacheManager.truncate_blocks_from_position(request_id, keep_tokens)
+Scheduler._cap_prompt_stream_num_new_tokens(request, num_new_tokens)
 ```
 
-当前是 block 粒度截断：
+行为是：
+
+- 普通请求不受影响。
+- 已经 `PROMPT_FINISHED` 且 prompt token 已经 prefill 完的请求不裁剪。
+- 未封口的流式 prompt 请求，只允许调度剩余 prompt token。
+- 如果 prompt token 已经 prefill 到当前末尾，但还没收到 `PROMPT_FINISHED`，本轮调度 token 数会变成 0，从而等待最终用户问题。
+
+对应的 Request 判断函数是：
 
 ```python
-num_blocks_to_keep = cdiv(keep_tokens, block_size)
+Request.is_prompt_stream_finished()
 ```
 
-所以如果 `keep_tokens` 落在某个 block 中间，会保留整个 block。这个选择符合 vLLM 现有 KV block 管理粒度，但后续需要验证是否会过度保留 update 不匹配 token 的 KV。
+它要求同时满足：
 
-### Scheduler 的变化
+- `prompt_stream.finished == True`
+- `num_computed_tokens >= num_prompt_tokens`
 
-`Scheduler._apply_prompt_stream_request()` 现在不再做全释放：
+因此 `PROMPT_FINISHED` 到达后，suffix 仍然会被正常 prefill；只有 suffix 也完成后，才允许进入 decode。
+
+## KV cache 失效路径
+
+当 Request 应用事件后返回的 `PromptStreamMutation.num_tokens_to_invalidate > 0`，scheduler 会调用：
 
 ```python
 self.kv_cache_manager.truncate_blocks_from_position(
@@ -682,18 +345,97 @@ self.kv_cache_manager.truncate_blocks_from_position(
 )
 ```
 
-并且不再强制：
+当前新增了三层接口：
 
-```python
-existing.num_computed_tokens = 0
+```text
+KVCacheManager.truncate_blocks_from_position(request, keep_tokens)
+KVCacheCoordinator.truncate_blocks_from_position(request_id, keep_tokens)
+SingleTypeKVCacheManager.truncate_blocks_from_position(request_id, keep_tokens)
 ```
 
-因为 `Request.apply_prompt_stream_event()` 已经将 `num_computed_tokens` 回退到了安全 LCP 内。scheduler 只负责释放 LCP 之后的 KV blocks，并通知 worker 刷新 cached request state。
+含义是：保留 `keep_tokens` 对应的安全前缀，释放之后的 KV blocks。
 
-### 当前仍需确认的问题
+需要注意：KV cache 是 block 粒度管理的，所以 `SingleTypeKVCacheManager` 会根据 block size 向上取整保留 block。这意味着当前是 block 级截断，不是精确 token 级截断。
 
-- 多个 Update source 同时存在时，现在的 LCP 是对聚合后的 update segment 计算；是否需要每个 update source 独立 KV 域，还需要进一步确定。
-- Append 新 chunk 到达后，当前布局会让后续 update segment 失效并重新计算；这符合“update 基于已有所有 append KV”的语义，但会带来额外 update recompute。
-- block 粒度截断可能保留超出 token 级 LCP 的 partial block，后续需要测试注意力输出是否会受影响。
-- 当前还没有专门的 attention mask 或 block table 分段表达 `[append KV] + [update prefix KV]`，仍然借助单序列布局近似实现。
+## Worker 侧 cached request 刷新
 
+Prompt 改变后，Request 会设置：
+
+```python
+prompt_stream_needs_worker_refresh = True
+```
+
+`Scheduler._make_cached_request_data()` 会检查这个标志：
+
+- 把该 request 加入 `resumed_req_ids`。
+- 重新发送完整 `all_token_ids`。
+- 如果需要，重新获取当前 block ids。
+- 发送完后清掉 `prompt_stream_needs_worker_refresh`。
+
+这样 worker 侧不会继续使用旧 prompt token 或旧 block table。
+
+## 当前实现的近似语义
+
+当前代码在 token 序列层面使用统一布局：
+
+```text
+prefix + append + update + suffix
+```
+
+Update 快照变化时，当前实现不再直接用全局 prompt LCP 推导失效边界，而是先计算：
+
+```text
+update_source_lcp = LCP(old_update_source_tokens, new_update_source_tokens)
+```
+
+然后转换成全局 KV 保留边界：
+
+```text
+common_prefix_len = prefix_len + append_len + update_source_lcp
+```
+
+这样 scheduler 仍然只需要处理一个全局 token 位置，但这个位置的来源语义是 **update 源内 LCP**。
+
+当前仍然没有专门的 attention mask、分段 block table 或显式 KV segment metadata 来表达 Append / Update 的物理分域。因此现在可以认为：**Update 的失效边界已经按源内 LCP 计算，但物理 KV 分域仍是 MVP 近似实现**。
+
+## 当前已经完成的边界
+
+已经完成的部分包括：
+
+- `EngineCoreRequest` 增加 `prompt_stream_event`，作为一次事件入口。
+- `Request.from_engine_core_request()` 把事件转入 Request。
+- `Request` 保存长期 `PromptStreamState`。
+- `Request` 支持 Append、Update、Source Finished 和 Prompt Finished 四类事件。
+- `PROMPT_FINISHED` 会把最终用户问题写入 suffix。
+- `Request` 会把流式状态重建为统一 prompt token 序列。
+- `PromptStreamMutation` 把 prompt 变化摘要返回给 scheduler；Update 场景下其 `common_prefix_len` 来自 update 源内 LCP 加全局偏移。
+- scheduler 会把重复 `request_id` 的流式事件应用到长期 Request。
+- scheduler 在 prompt stream 封口前阻止提前 decode。
+- scheduler 会根据公共前缀释放失效 KV blocks。
+- worker cached request 会在 prompt 改变后刷新。
+- `Request.get_prompt_stream_layout()` 已经提供四段逻辑长度，供后续 P/D transfer 接入。
+
+## 当前还没有完成的部分
+
+后续仍需要继续设计或实现：
+
+- **前端事件入口**：还没有定义外部 API 如何把 chunk、source、version 和最终用户问题转成 `PromptStreamEvent`。
+- **乱序事件消费**：`pending_events` 目前只暂存乱序事件，还不会在缺口补齐后自动应用。
+- **多 Update source**：当前明确限制最多一个 Update source。
+- **精确 KV 分域**：目前是 block 级 LCP 截断，还没有真正表达 Append KV 和 Update KV 的物理分区。
+- **P/D transfer 扩展**：还没有把 `PromptStreamLayout` 写入 `kv_transfer_params` 或 connector 协议。
+- **测试用例**：还需要补 Append、Update、PROMPT_FINISHED、KV 截断和 decode barrier 的单元测试 / 集成测试。
+- **统计字段**：`total_tokens_recomputed` 目前是预留字段，还没有系统维护。
+- **prompt embeds 支持**：当前流式 prompt mutation 只支持 token-id prompt。
+
+## 推荐的下一步
+
+比较自然的下一步是先补最小测试，而不是马上改前端：
+
+- 构造一个 Request，连续应用 Append 事件，确认 prompt 按 append segment 增长。
+- 构造一个 Update source，提交两个版本，确认 update 源内 LCP、全局 KV 保留边界和 `num_tokens_to_invalidate` 正确。
+- 发送 `PROMPT_FINISHED`，确认最终用户问题进入 suffix。
+- 在 scheduler 层模拟重复 `request_id` 的事件进入，确认长期 Request 被更新，临时 Request 不保留状态。
+- 检查 `PROMPT_FINISHED` 前不会进入 decode，`PROMPT_FINISHED` 后 suffix prefill 完才允许 decode。
+
+这些测试能先保护当前边界，然后再继续设计前端 chunk API 和 P/D transfer metadata。
