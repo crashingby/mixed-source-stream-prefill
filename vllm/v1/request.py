@@ -19,6 +19,8 @@ from vllm.v1.engine import (
     EngineCoreEventType,
     EngineCoreRequest,
     FinishReason,
+)
+from vllm.v1.engine.prompt_stream import (
     PromptSourceType,
     PromptStreamEvent,
     PromptStreamEventType,
@@ -72,6 +74,22 @@ class PromptStreamMutation:
     #每次 prompt 真实变化都递增，后面防止 scheduler 用旧状态 decode。
     prompt_revision: int
 
+    @classmethod
+    def noop(
+        cls,
+        num_prompt_tokens: int,
+        prompt_revision: int,
+    ) -> "PromptStreamMutation":
+        """构造一个没有改变 prompt 的 mutation。"""
+        return cls(
+            applied=False,
+            old_num_prompt_tokens=num_prompt_tokens,
+            new_num_prompt_tokens=num_prompt_tokens,
+            common_prefix_len=num_prompt_tokens,
+            num_tokens_to_invalidate=0,
+            prompt_revision=prompt_revision,
+        )
+
 @dataclass
 class PromptSourceState:
     """保存单个 prompt source 的流式状态。"""
@@ -87,6 +105,8 @@ class PromptSourceState:
     next_sequence_no: int
     #已经应用过的 chunk，用于去重。
     seen_chunk_ids: set[str]
+    #暂存乱序到达但还不能应用的事件；MVP 可以先不消费这个队列。
+    pending_events: dict[int, PromptStreamEvent]
     #该来源是否结束。
     finished: bool
     #该来源最近一次事件到达时间。
@@ -95,10 +115,14 @@ class PromptSourceState:
 @dataclass
 class PromptStreamState:
     """保存一个 Request 内部的多源流式 prompt 状态。"""
+    #流式 source 之前的固定 prompt 前缀，例如 system prompt 或用户原始问题。
+    prefix_token_ids: list[int]
     #从 source_id 到 PromptSourceState 的映射。
     sources: dict[str, PromptSourceState]
     #最终交给decode节点的排布顺序；TODO:这个有待思考
     source_order: list[str]
+    #流式 source 之后的固定 prompt 后缀，后续可用于放 answer prefix。
+    suffix_token_ids: list[int]
     #请求级流式 prompt 是否结束。
     finished: bool
     #prompt 每次真实变化后递增，用于防止 scheduler 或 model runner 使用旧状态 decode。
@@ -251,8 +275,11 @@ class Request:
         # 对于 duplicate request id 的流式事件，这个字段用于传给 scheduler。
         self.prompt_stream_event = prompt_stream_event
 
-        # 流式 prefill 的长期状态。只有真正的流式 prefill 请求才会初始化。
+        # 流式 prefill 的长期状态。只有 scheduler 中的长期 Request 才应初始化。
         self.prompt_stream: PromptStreamState | None = None
+
+        # prompt 发生真实变化后，worker 侧 cached request 需要刷新 token/block 状态。
+        self.prompt_stream_needs_worker_refresh = False
 
     @classmethod
     def from_engine_core_request(
@@ -382,14 +409,377 @@ class Request:
     
 
     def is_prompt_streaming(self) -> bool:
+        """
+        判断是不是流式 prompt
+        """
         return self.prompt_stream is not None
 
+    def is_prompt_stream_finished(self) -> bool:
+        """判断 prompt 输入是否结束。
+
+        普通非流式请求视为 finished，因为它的 prompt 在入队时就是完整的。
+        """
+        return self.prompt_stream is None or self.prompt_stream.finished
+
+    def can_decode_from_prompt_stream(self) -> bool:
+        """判断当前请求是否已经越过流式 prompt 的 decode barrier。
+
+        普通请求没有流式 prompt barrier，可以直接返回 True。流式 prompt
+        请求必须同时满足两个条件：
+
+        - 请求级 prompt 输入已经结束。
+        - 当前 prompt token 已经全部 prefill 完成。
+
+        Returns:
+            如果 scheduler 可以进入 decode 阶段，返回 True。
+        """
+        return (
+            self.prompt_stream is None
+            or (
+                self.prompt_stream.finished
+                and self.num_computed_tokens >= self.num_prompt_tokens
+            )
+        )
+
+    def get_prompt_stream_revision(self) -> int:
+        """返回当前流式 prompt 的版本号。
+
+        普通请求没有流式 prompt 状态，统一视为 revision 0。
+        scheduler 后续可以把这个值写入调度快照，避免旧 prompt 版本的
+        执行结果被误用于新 prompt。
+        """
+        if self.prompt_stream is None:
+            return 0
+        return self.prompt_stream.revision
 
     def apply_prompt_stream_event(
         self,
         event: PromptStreamEvent,
     ) -> PromptStreamMutation:
-        ...
+        """应用一次流式 prompt 事件，并返回对调度层有用的变化摘要。
+
+        这个方法是 scheduler 面向流式 prompt 的主入口。scheduler 不需要
+        理解 append、update、source finished 的内部语义，只需要根据返回的
+        `PromptStreamMutation` 决定是否释放失效 KV、是否继续 prefill，以及
+        什么时候允许 decode。
+
+        Args:
+            event: 本次入站的流式 prompt 事件。
+
+        Returns:
+            描述本次事件是否改变 prompt、公共前缀长度、失效 token 数和
+            prompt revision 的 mutation。
+        """
+        if event.request_id != self.request_id:
+            raise ValueError(
+                f"Prompt stream event request_id={event.request_id} does not "
+                f"match request_id={self.request_id}."
+            )
+
+        if event.event_type == PromptStreamEventType.APPEND:
+            return self._apply_prompt_stream_append(event)
+
+        if event.event_type == PromptStreamEventType.UPDATE:
+            return self._apply_prompt_stream_update(event)
+
+        if event.event_type == PromptStreamEventType.SOURCE_FINISHED:
+            return self._mark_prompt_source_finished(event)
+
+        if event.event_type == PromptStreamEventType.REQUEST_FINISHED:
+            return self._mark_prompt_stream_finished(event)
+
+        raise ValueError(f"Unsupported prompt stream event type: {event.event_type}")
+
+    def _ensure_prompt_stream_state(self) -> PromptStreamState:
+        """确保当前请求已经初始化流式 prompt 状态。"""
+        if self.prompt_stream is None:
+            self.prompt_stream = PromptStreamState(
+                prefix_token_ids=self._current_prompt_token_ids(),
+                sources={},
+                source_order=[],
+                suffix_token_ids=[],
+                finished=False,
+                revision=0,
+                total_tokens_invalidated=0,
+                total_tokens_recomputed=0,
+            )
+        return self.prompt_stream
+
+    def _validate_prompt_stream_can_mutate(self, event: PromptStreamEvent) -> None:
+        """校验当前请求是否仍然允许修改 prompt。"""
+        if self._output_token_ids:
+            raise ValueError(
+                "Cannot mutate streaming prompt after output tokens have been "
+                f"generated for request_id={self.request_id}."
+            )
+        if self.prompt_embeds is not None or self.prompt_is_token_ids is not None:
+            raise ValueError(
+                "Streaming prompt mutation currently supports token-id prompts "
+                f"only, but request_id={self.request_id} uses prompt embeds or "
+                "mixed token/embed inputs."
+            )
+        if event.event_type in (
+            PromptStreamEventType.APPEND,
+            PromptStreamEventType.UPDATE,
+        ) and event.token_ids is None:
+            raise ValueError(
+                f"Prompt stream {event.event_type} event for "
+                f"request_id={self.request_id} must carry token_ids."
+            )
+
+    def _get_or_create_prompt_source(
+        self,
+        event: PromptStreamEvent,
+        expected_source_type: PromptSourceType,
+    ) -> PromptSourceState:
+        """获取或创建某个 source 的长期状态。"""
+        prompt_stream = self._ensure_prompt_stream_state()
+        source = prompt_stream.sources.get(event.source_id)
+        if source is not None:
+            if source.source_type != expected_source_type:
+                raise ValueError(
+                    f"Prompt stream source_id={event.source_id} changed type "
+                    f"from {source.source_type} to {expected_source_type}."
+                )
+            return source
+
+        if event.source_type is not None and event.source_type != expected_source_type:
+            raise ValueError(
+                f"Prompt stream event source_type={event.source_type} does not "
+                f"match event_type={event.event_type}."
+            )
+
+        source = PromptSourceState(
+            source_id=event.source_id,
+            source_type=expected_source_type,
+            token_ids=[],
+            version=-1,
+            next_sequence_no=event.sequence_no,
+            seen_chunk_ids=set(),
+            pending_events={},
+            finished=False,
+            last_arrival_time=event.arrival_time,
+        )
+        prompt_stream.sources[event.source_id] = source
+        prompt_stream.source_order.append(event.source_id)
+        return source
+
+    def _apply_prompt_stream_append(
+        self,
+        event: PromptStreamEvent,
+    ) -> PromptStreamMutation:
+        """应用 append 语义的流式 prompt 事件。"""
+        self._validate_prompt_stream_can_mutate(event)
+        prompt_stream = self._ensure_prompt_stream_state()
+        if prompt_stream.finished:
+            raise ValueError(
+                f"Cannot append to finished prompt stream request_id={self.request_id}."
+            )
+
+        source = self._get_or_create_prompt_source(event, PromptSourceType.APPEND)
+        if source.finished:
+            raise ValueError(
+                f"Cannot append to finished prompt source_id={event.source_id}."
+            )
+        if event.chunk_id is not None and event.chunk_id in source.seen_chunk_ids:
+            return PromptStreamMutation.noop(
+                self.num_prompt_tokens,
+                prompt_stream.revision,
+            )
+        if event.sequence_no != source.next_sequence_no:
+            # TODO: 后续可以把乱序事件放进 pending_events，再在缺口补齐后消费。
+            source.pending_events[event.sequence_no] = event
+            return PromptStreamMutation.noop(
+                self.num_prompt_tokens,
+                prompt_stream.revision,
+            )
+
+        old_prompt_token_ids = self._current_prompt_token_ids()
+        source.token_ids.extend(event.token_ids or [])
+        source.version = max(source.version, event.version)
+        source.next_sequence_no += 1
+        source.last_arrival_time = event.arrival_time
+        if event.chunk_id is not None:
+            source.seen_chunk_ids.add(event.chunk_id)
+
+        return self._sync_prompt_from_stream_state(old_prompt_token_ids)
+
+    def _apply_prompt_stream_update(
+        self,
+        event: PromptStreamEvent,
+    ) -> PromptStreamMutation:
+        """应用 update 语义的流式 prompt 快照事件。"""
+        self._validate_prompt_stream_can_mutate(event)
+        prompt_stream = self._ensure_prompt_stream_state()
+        if prompt_stream.finished:
+            raise ValueError(
+                f"Cannot update finished prompt stream request_id={self.request_id}."
+            )
+
+        source = self._get_or_create_prompt_source(event, PromptSourceType.UPDATE)
+        if source.finished:
+            raise ValueError(
+                f"Cannot update finished prompt source_id={event.source_id}."
+            )
+        if event.chunk_id is not None and event.chunk_id in source.seen_chunk_ids:
+            return PromptStreamMutation.noop(
+                self.num_prompt_tokens,
+                prompt_stream.revision,
+            )
+        if event.sequence_no != source.next_sequence_no:
+            # TODO: 后续可以为 update source 增加 debounce 和乱序合并策略。
+            source.pending_events[event.sequence_no] = event
+            return PromptStreamMutation.noop(
+                self.num_prompt_tokens,
+                prompt_stream.revision,
+            )
+        if event.version < source.version:
+            return PromptStreamMutation.noop(
+                self.num_prompt_tokens,
+                prompt_stream.revision,
+            )
+        if event.version == source.version and source.token_ids != event.token_ids:
+            raise ValueError(
+                f"Prompt stream source_id={event.source_id} received conflicting "
+                f"content for version={event.version}."
+            )
+
+        old_prompt_token_ids = self._current_prompt_token_ids()
+        source.token_ids = list(event.token_ids or [])
+        source.version = event.version
+        source.next_sequence_no += 1
+        source.last_arrival_time = event.arrival_time
+        if event.chunk_id is not None:
+            source.seen_chunk_ids.add(event.chunk_id)
+
+        return self._sync_prompt_from_stream_state(old_prompt_token_ids)
+
+    def _mark_prompt_source_finished(
+        self,
+        event: PromptStreamEvent,
+    ) -> PromptStreamMutation:
+        """标记单个 prompt source 已结束。"""
+        prompt_stream = self._ensure_prompt_stream_state()
+        source = prompt_stream.sources.get(event.source_id)
+        if source is None:
+            if event.source_type is None:
+                return PromptStreamMutation.noop(
+                    self.num_prompt_tokens,
+                    prompt_stream.revision,
+                )
+            source = self._get_or_create_prompt_source(event, event.source_type)
+
+        source.finished = True
+        source.last_arrival_time = event.arrival_time
+        return PromptStreamMutation.noop(
+            self.num_prompt_tokens,
+            prompt_stream.revision,
+        )
+
+    def _mark_prompt_stream_finished(
+        self,
+        event: PromptStreamEvent,
+    ) -> PromptStreamMutation:
+        """标记请求级流式 prompt 输入已经结束。"""
+        prompt_stream = self._ensure_prompt_stream_state()
+        prompt_stream.finished = True
+        return PromptStreamMutation.noop(
+            self.num_prompt_tokens,
+            prompt_stream.revision,
+        )
+
+    def _current_prompt_token_ids(self) -> list[int]:
+        """返回当前 prompt token 的可变副本。"""
+        if self.prompt_token_ids is None:
+            return []
+        return list(self.prompt_token_ids)
+
+    def _rebuild_prompt_from_stream_state(self) -> list[int]:
+        """按近似注意力布局重建全局 prompt token 序列。
+
+        当前研究语义把 Append 和 Update 的 KV 分域理解为：
+
+        - Append 源稳定累积，先放在全局 prompt 中。
+        - Update 源按版本快照更新，放在 Append 源之后。
+
+        因此 update 事件只会影响 update segment 的 KV；append 事件会扩展
+        append segment，并使后面的 update segment 需要基于新的 append KV
+        重新计算。
+        """
+        assert self.prompt_stream is not None
+        prompt_token_ids = list(self.prompt_stream.prefix_token_ids)
+        for source_id in self.prompt_stream.source_order:
+            source = self.prompt_stream.sources[source_id]
+            if source.source_type == PromptSourceType.APPEND:
+                prompt_token_ids.extend(source.token_ids)
+        for source_id in self.prompt_stream.source_order:
+            source = self.prompt_stream.sources[source_id]
+            if source.source_type == PromptSourceType.UPDATE:
+                prompt_token_ids.extend(source.token_ids)
+        prompt_token_ids.extend(self.prompt_stream.suffix_token_ids)
+        return prompt_token_ids
+
+    @staticmethod
+    def _get_common_prefix_len(
+        old_token_ids: list[int],
+        new_token_ids: list[int],
+    ) -> int:
+        """计算两个 token 序列的最长公共前缀长度。"""
+        common_prefix_len = 0
+        for old_token_id, new_token_id in zip(old_token_ids, new_token_ids):
+            if old_token_id != new_token_id:
+                break
+            common_prefix_len += 1
+        return common_prefix_len
+
+    def _sync_prompt_from_stream_state(
+        self,
+        old_prompt_token_ids: list[int],
+    ) -> PromptStreamMutation:
+        """把 PromptStreamState 同步回 Request 的调度字段。"""
+        assert self.prompt_stream is not None
+        new_prompt_token_ids = self._rebuild_prompt_from_stream_state()
+        common_prefix_len = self._get_common_prefix_len(
+            old_prompt_token_ids,
+            new_prompt_token_ids,
+        )
+        if old_prompt_token_ids == new_prompt_token_ids:
+            return PromptStreamMutation.noop(
+                self.num_prompt_tokens,
+                self.prompt_stream.revision,
+            )
+
+        old_num_prompt_tokens = len(old_prompt_token_ids)
+        old_num_computed_tokens = self.num_computed_tokens
+        num_tokens_to_invalidate = max(
+            0,
+            old_num_computed_tokens - common_prefix_len,
+        )
+
+        self.prompt_token_ids = new_prompt_token_ids
+        self._all_token_ids = new_prompt_token_ids.copy()
+        self.num_prompt_tokens = len(new_prompt_token_ids)
+        self.num_computed_tokens = min(
+            self.num_computed_tokens,
+            common_prefix_len,
+        )
+        self.prompt_stream.revision += 1
+        self.prompt_stream.total_tokens_invalidated += num_tokens_to_invalidate
+        self.prompt_stream_needs_worker_refresh = True
+
+        if common_prefix_len < old_num_prompt_tokens:
+            self.block_hashes.clear()
+            self._prompt_embeds_per_block_hashes.clear()
+        self.update_block_hashes()
+
+        return PromptStreamMutation(
+            applied=True,
+            old_num_prompt_tokens=old_num_prompt_tokens,
+            new_num_prompt_tokens=self.num_prompt_tokens,
+            common_prefix_len=common_prefix_len,
+            num_tokens_to_invalidate=num_tokens_to_invalidate,
+            prompt_revision=self.prompt_stream.revision,
+        )
 
 
 class RequestStatus(enum.IntEnum):

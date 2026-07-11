@@ -493,6 +493,21 @@ class KVCacheManager:
         """
         return self.coordinator.pop_blocks_for_free(request.request_id)
 
+    def truncate_blocks_from_position(
+        self,
+        request: Request,
+        keep_tokens: int,
+    ) -> bool:
+        """释放请求在指定 token 位置之后的 KV blocks。
+
+        该接口用于流式 prompt update：Append segment 的 KV 可以保留，Update
+        segment 只释放与上一版本最长公共前缀之后的 blocks。
+        """
+        return self.coordinator.truncate_blocks_from_position(
+            request.request_id,
+            keep_tokens,
+        )
+
     def evict_blocks(self, block_ids: set[int]) -> None:
         """evict blocks from the prefix cache by their block IDs.
 

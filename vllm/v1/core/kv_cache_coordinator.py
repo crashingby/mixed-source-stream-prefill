@@ -310,6 +310,20 @@ class KVCacheCoordinator(ABC):
             blocks.extend(manager.pop_blocks_for_free(request_id))
         return blocks
 
+    def truncate_blocks_from_position(
+        self,
+        request_id: str,
+        keep_tokens: int,
+    ) -> bool:
+        """释放指定 token 位置之后的所有 KV cache group blocks。"""
+        blocks_were_freed = False
+        for manager in self.single_type_managers:
+            blocks_were_freed |= manager.truncate_blocks_from_position(
+                request_id,
+                keep_tokens,
+            )
+        return blocks_were_freed
+
     def get_num_common_prefix_blocks(self, running_request_id: str) -> list[int]:
         """
         Get the number of common prefix blocks for all requests with allocated

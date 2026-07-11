@@ -18,7 +18,7 @@ from vllm.sampling_params import SamplingParams
 from vllm.v1.metrics.stats import PrefillStats, SchedulerStats
 from vllm.v1.outputs import LogprobsLists, LogprobsTensors
 from vllm.v1.serial_utils import UtilityResult
-from vllm.v1.engine.prompt_stream import PromptStreamEvent,PromptSourceType,PromptStreamEventType
+from vllm.v1.engine.prompt_stream import PromptStreamEvent
 # Type for pause_generation mode parameter.
 # - "abort": Abort all in-flight requests immediately (default).
 # - "wait": Wait for in-flight requests to complete before pausing.

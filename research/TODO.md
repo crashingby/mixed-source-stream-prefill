@@ -230,6 +230,68 @@ def apply_update_snapshot(self, event: PromptStreamEvent) -> PromptMutation:
 快照。来源在全局 prompt 中的起始位置和前面的 Append 长度都会改变实际 KV
 复用边界。
 
+
+### Append / Update 分域 KV 语义
+
+这一步重新明确了论文项目的核心近似：**Append 和 Update 的 KV cache 不按一个全局 prompt 的严格注意力等价性管理，而是按来源类型分域管理**。
+
+#### 分域布局
+
+当前实现和后续设计都应按如下逻辑布局 prompt：
+
+```text
+fixed prefix
++ append segment
++ update segment
++ fixed suffix
+```
+
+其中：
+
+- `append segment` 由所有 Append 来源已经到达的 chunk 稳定拼接得到。
+- `update segment` 由 Update 来源当前版本快照得到。
+- Update 来源的新版本不会影响 Append segment 已经计算好的 KV。
+- Append 新 chunk 到达后，会扩展 Append segment；后续 Update segment 的计算应基于新的 Append KV。
+
+#### Append 事件的 KV 语义
+
+Append 事件到达时：
+
+- 新 chunk 与该 Append 来源之前的 chunk 拼在一起。
+- 新 append chunk 的 prefill 基于已有 append KV 继续计算。
+- 如果系统中已经有 update KV，append segment 增长后，后面的 update segment 需要重新基于新的 append KV 计算。
+- 因此 append 的安全复用边界是 append 事件前的 append segment 末尾。
+
+#### Update 事件的 KV 语义
+
+Update 事件到达时：
+
+1. 将事件视为该 Update 来源的新版本完整快照。
+2. 与上一版本 update snapshot 计算最长公共前缀。
+3. 保留：
+   - 已有所有 Append KV。
+   - Update snapshot 与上一版本匹配的前缀 KV。
+4. 释放：
+   - Update 最长公共前缀之后的 KV。
+5. 新 update suffix 的 prefill 使用近似上下文：
+
+```text
+[已有所有 append KV] + [update 前缀 KV]
+```
+
+这是一个有意引入的近似注意力计算，不要求等价于完整全局 prompt 从头 prefill。
+
+#### 对当前 vLLM 实现的影响
+
+当前 vLLM 仍然以单个 `Request.num_computed_tokens` 和单个 block table 表示请求进度，因此 MVP 采用以下折中：
+
+- `Request` 用固定布局 `prefix + append sources + update sources + suffix` 重建 token 序列。
+- update 的 `common_prefix_len` 表示全局布局中的安全复用边界：`prefix_len + append_len + update_lcp`。
+- scheduler 使用 `KVCacheManager.truncate_blocks_from_position(request, common_prefix_len)` 释放安全边界之后的 blocks。
+- 这是 block 粒度截断；如果 LCP 落在 block 中间，会向上取整保留包含 LCP 的 block。
+
+后续需要继续验证：block 粒度保留 partial block 是否会在注意力语义上过度保留无效 token；如果需要 token 级严格失效，需要更细粒度的 block table / attention mask 支持。
+
 ### 完成与取消语义
 
 #### 单来源结束

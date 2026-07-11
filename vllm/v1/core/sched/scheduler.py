@@ -384,6 +384,54 @@ class Scheduler(SchedulerInterface):
                 num_new_tokens = num_new_tokens // block_size * block_size
         return num_new_tokens
 
+    def _cap_prompt_stream_num_new_tokens(
+        self,
+        request: Request,
+        num_new_tokens: int,
+    ) -> int:
+        """限制流式 prompt 请求在输入结束前只能执行 prefill。
+
+        流式 prompt 请求在 `REQUEST_FINISHED` 前不能跨入 decode 阶段。
+        scheduler 仍然使用 vLLM 原有的 token catch-up 模型，但这里会把
+        本轮 token 数裁剪到剩余 prompt token 范围内。
+        """
+        if request.is_prompt_stream_finished():
+            return num_new_tokens
+        num_remaining_prompt_tokens = max(
+            0,
+            request.num_prompt_tokens - request.num_computed_tokens,
+        )
+        return min(num_new_tokens, num_remaining_prompt_tokens)
+
+    def _apply_prompt_stream_request(
+        self,
+        existing: Request,
+        incoming: Request,
+    ) -> None:
+        """把入站流式 prompt 事件应用到 scheduler 持有的长期 Request。
+
+        `incoming` 是本次 `EngineCoreRequest` 转换出的临时 Request，只负责
+        携带 `prompt_stream_event`。真正保存长期状态的是 `existing`。
+        """
+        event = incoming.prompt_stream_event
+        assert event is not None
+
+        mutation = existing.apply_prompt_stream_event(event)
+        incoming.prompt_stream_event = None
+
+        if mutation.num_tokens_to_invalidate <= 0:
+            return
+
+        # Append 与 Update 的 KV 按布局分域管理：
+        # prefix + append segment 可以保留，update segment 只释放与上一版本
+        # 最长公共前缀之后的 blocks。
+        blocks_were_freed = self.kv_cache_manager.truncate_blocks_from_position(
+            existing,
+            mutation.common_prefix_len,
+        )
+        if blocks_were_freed:
+            existing.prompt_stream_needs_worker_refresh = True
+
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
         self.current_step += 1
         # NOTE(woosuk) on the scheduling algorithm:
@@ -475,6 +523,10 @@ class Scheduler(SchedulerInterface):
                 self.max_model_len
                 - request.num_computed_tokens
                 - self.num_sampled_tokens_per_step,
+            )
+            num_new_tokens = self._cap_prompt_stream_num_new_tokens(
+                request,
+                num_new_tokens,
             )
 
             # Schedule encoder inputs.
@@ -808,6 +860,14 @@ class Scheduler(SchedulerInterface):
                         break
 
                     num_new_tokens = min(num_new_tokens, token_budget)
+                    num_new_tokens = self._cap_prompt_stream_num_new_tokens(
+                        request,
+                        num_new_tokens,
+                    )
+                    if num_new_tokens == 0:
+                        request_queue.pop_request()
+                        step_skipped_waiting.prepend_request(request)
+                        continue
                     assert num_new_tokens > 0
 
                     # Schedule encoder inputs.
@@ -1253,14 +1313,20 @@ class Scheduler(SchedulerInterface):
                 ]
                 new_token_ids.append(token_ids)
             scheduled_in_prev_step = req_id in self.prev_step_scheduled_req_ids
+            force_worker_refresh = req.prompt_stream_needs_worker_refresh
             if idx >= num_running_reqs:
                 assert not scheduled_in_prev_step
                 resumed_req_ids.add(req_id)
-            if not scheduled_in_prev_step:
+            if force_worker_refresh:
+                resumed_req_ids.add(req_id)
+            if not scheduled_in_prev_step or force_worker_refresh:
                 all_token_ids[req_id] = req.all_token_ids.copy()
-            new_block_ids.append(
-                req_to_new_blocks[req_id].get_block_ids(allow_none=True)
-            )
+
+            blocks = req_to_new_blocks[req_id]
+            if force_worker_refresh:
+                blocks = self.kv_cache_manager.get_blocks(req_id)
+                req.prompt_stream_needs_worker_refresh = False
+            new_block_ids.append(blocks.get_block_ids(allow_none=True))
             num_computed_tokens.append(req.num_computed_tokens)
             num_output_tokens.append(
                 req.num_output_tokens + req.num_output_placeholders
@@ -1959,6 +2025,10 @@ class Scheduler(SchedulerInterface):
     def add_request(self, request: Request) -> None:
         existing = self.requests.get(request.request_id)
         if existing is not None:
+            if request.prompt_stream_event is not None:
+                self._apply_prompt_stream_request(existing, request)
+                return
+
             update = StreamingUpdate.from_request(request)
             if existing.status != RequestStatus.WAITING_FOR_STREAMING_REQ:
                 assert existing.streaming_queue is not None, "duplicate request id"
@@ -1971,6 +2041,9 @@ class Scheduler(SchedulerInterface):
                 # Streaming-input session finished.
                 self.finish_requests(request.request_id, RequestStatus.FINISHED_ABORTED)
         else:
+            if request.prompt_stream_event is not None:
+                request.apply_prompt_stream_event(request.prompt_stream_event)
+                request.prompt_stream_event = None
             if request.resumable:
                 request.streaming_queue = deque()
             self._enqueue_waiting_request(request)

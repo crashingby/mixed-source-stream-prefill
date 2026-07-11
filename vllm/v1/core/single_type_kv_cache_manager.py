@@ -408,6 +408,30 @@ class SingleTypeKVCacheManager(ABC):
         # Free blocks in reverse order so that the tail blocks are freed first.
         self.block_pool.free_blocks(reversed(self.pop_blocks_for_free(request_id)))
 
+    def truncate_blocks_from_position(
+        self,
+        request_id: str,
+        keep_tokens: int,
+    ) -> bool:
+        """释放指定 token 位置之后的 KV blocks。
+
+        `keep_tokens` 是 token 级安全前缀长度。KV cache 以 block 为单位管理，
+        因此这里会向上取整保留包含该前缀的 blocks。
+        """
+        num_blocks_to_keep = 0 if keep_tokens == 0 else cdiv(keep_tokens, self.block_size)
+        req_blocks = self.req_to_blocks.get(request_id)
+        if not req_blocks or len(req_blocks) <= num_blocks_to_keep:
+            return False
+
+        blocks_to_free = req_blocks[num_blocks_to_keep:]
+        del req_blocks[num_blocks_to_keep:]
+        self.num_cached_block[request_id] = min(
+            self.num_cached_block.get(request_id, 0),
+            len(req_blocks),
+        )
+        self.block_pool.free_blocks(reversed(blocks_to_free))
+        return True
+
     @abstractmethod
     def get_num_common_prefix_blocks(self, running_request_id: str) -> int:
         """
