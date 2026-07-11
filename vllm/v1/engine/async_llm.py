@@ -38,6 +38,11 @@ from vllm.usage.usage_lib import UsageContext
 from vllm.utils.async_utils import cancel_task_threadsafe
 from vllm.utils.collection_utils import as_list
 from vllm.v1.engine import EngineCoreRequest, PauseMode
+from vllm.v1.engine.prompt_stream import (
+    PromptSourceType,
+    PromptStreamEvent,
+    PromptStreamEventType,
+)
 from vllm.v1.engine.core_client import EngineCoreClient
 from vllm.v1.engine.exceptions import EngineDeadError, EngineGenerateError
 from vllm.v1.engine.input_processor import InputProcessor
@@ -413,6 +418,84 @@ class AsyncLLM(EngineClient):
 
         if self.log_requests:
             logger.info("Added request %s.", request.request_id)
+
+    async def add_prompt_stream_request(
+        self,
+        request_id: str,
+        prompt: EngineCoreRequest | PromptType | EngineInput,
+        sampling_params: SamplingParams,
+        *,
+        arrival_time: float | None = None,
+        tokenization_kwargs: dict[str, Any] | None = None,
+        trace_headers: Mapping[str, str] | None = None,
+        priority: int = 0,
+    ) -> RequestOutputCollector:
+        """添加流式 prompt 初始请求，并保留输出收集器。
+
+        start 阶段必须初始化 `PromptStreamState`，否则 scheduler 会把请求当作
+        普通请求并直接进入 decode。这里在普通输入处理之后附加一个空的
+        APPEND 事件，让 Request 保存 prefix token，并保持 prompt stream 未封口。
+        """
+        if self.errored:
+            raise EngineDeadError()
+        if sampling_params.n != 1:
+            raise ValueError("Prompt stream start currently supports n=1 only.")
+
+        if isinstance(prompt, EngineCoreRequest):
+            request = prompt
+            prompt_text = None
+        else:
+            request = self.input_processor.process_inputs(
+                request_id,
+                prompt,
+                sampling_params,
+                supported_tasks=await self.get_supported_tasks(),
+                arrival_time=arrival_time,
+                tokenization_kwargs=tokenization_kwargs,
+                trace_headers=trace_headers,
+                priority=priority,
+            )
+            prompt_text, _, _ = extract_prompt_components(self.model_config, prompt)
+
+        self.input_processor.assign_request_id(request)
+        request.prompt_stream_event = PromptStreamEvent(
+            request_id=request.request_id,
+            source_id="__prompt_stream_start__",
+            event_type=PromptStreamEventType.APPEND,
+            source_type=PromptSourceType.APPEND,
+            chunk_id="__prompt_stream_start__",
+            version=0,
+            sequence_no=0,
+            token_ids=[],
+            arrival_time=request.arrival_time,
+        )
+
+        self._run_output_handler()
+        queue = RequestOutputCollector(request.params.output_kind, request.request_id)
+        await self._add_request(request, prompt_text, None, 0, queue)
+        return queue
+
+    async def add_prompt_stream_event(
+        self,
+        request: EngineCoreRequest,
+    ) -> None:
+        """把流式 prompt 后续事件直接送入 EngineCore。
+
+        Append、Update 和 PROMPT_FINISHED 事件不应该注册新的 output
+        collector，否则同一个 request id 会出现多个前端输出队列。start 阶段
+        已经注册了 collector；这里仅做 core-only 入队。
+        """
+        if self.errored:
+            raise EngineDeadError()
+
+        # start 阶段已经启动 output handler；这里再次调用是幂等保护。
+        self._run_output_handler()
+
+        # 事件请求必须保留 start 阶段的内部 request_id，不能重新随机化。
+        await self.engine_core.add_request_async(request)
+
+        if self.log_requests:
+            logger.info("Added prompt stream event for request %s.", request.request_id)
 
     async def _add_streaming_input_request(
         self,

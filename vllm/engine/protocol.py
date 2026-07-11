@@ -99,6 +99,39 @@ class EngineClient(ABC):
         ...
 
     @abstractmethod
+    async def add_prompt_stream_request(
+        self,
+        request_id: str,
+        prompt: EngineCoreRequest | PromptType | EngineInput,
+        sampling_params: SamplingParams,
+        *,
+        arrival_time: float | None = None,
+        tokenization_kwargs: dict[str, Any] | None = None,
+        trace_headers: Mapping[str, str] | None = None,
+        priority: int = 0,
+    ) -> Any:
+        """添加流式 prompt 的初始请求，并返回输出收集器。
+
+        该接口用于实验性 prompt stream RESTFUL API。start 阶段需要把
+        初始 prefix/template 加入 EngineCore，同时保留一个 collector，供
+        finish 阶段等待首个 output 和 `kv_transfer_params`。
+        """
+        ...
+
+    @abstractmethod
+    async def add_prompt_stream_event(
+        self,
+        request: EngineCoreRequest,
+    ) -> None:
+        """添加流式 prompt 的后续事件，不注册新的输出收集器。
+
+        该接口用于 Append、Update 和 PROMPT_FINISHED 事件。事件请求只应
+        进入 EngineCore/Scheduler，由 scheduler 根据 duplicate request id 更新
+        已存在的长期 Request。
+        """
+        ...
+
+    @abstractmethod
     async def abort(self, request_id: str | Iterable[str]) -> None:
         """Abort a request.
 

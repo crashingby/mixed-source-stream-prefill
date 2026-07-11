@@ -212,6 +212,12 @@ def build_app(
 
         attach_disagg_router(app)
 
+        from vllm.entrypoints.serve.prompt_stream.api_router import (
+            attach_router as attach_prompt_stream_router,
+        )
+
+        attach_prompt_stream_router(app)
+
         from vllm.entrypoints.serve.elastic_ep.api_router import (
             attach_router as elastic_ep_attach_router,
         )
