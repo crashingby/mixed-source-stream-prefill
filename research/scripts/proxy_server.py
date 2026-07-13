@@ -26,6 +26,8 @@ class PromptStreamProxySession:
     decode_client_info: dict[str, Any]
     api_endpoint: str
     base_request: dict[str, Any]
+    decode_prompt_text: str | None
+    decode_prompt_finished: bool = False
 
 
 @asynccontextmanager
@@ -173,6 +175,89 @@ def _build_decode_base_request(req_data: dict[str, Any]) -> dict[str, Any]:
     return base_request
 
 
+def _get_initial_decode_prompt_text(req_data: dict[str, Any]) -> str | None:
+    """提取 proxy 侧用于 D 节点 decode 的初始 prompt 文本。
+
+    Args:
+        req_data: 用户发给 proxy `/start` 的原始请求体。
+
+    Returns:
+        如果 start 使用文本 prompt，则返回该文本；如果使用 token_ids/list[int]
+        形式，则返回 None，表示 proxy 不能在文本层可靠重建最终 prompt。
+    """
+    prompt = req_data.get("prompt")
+    if isinstance(prompt, str):
+        return prompt
+    return None
+
+
+def _append_decode_prompt_text(
+    session: PromptStreamProxySession,
+    event: dict[str, Any],
+) -> None:
+    """把 append 文本事件同步追加到 proxy 侧 decode prompt 镜像。
+
+    Args:
+        session: 当前 prompt stream 会话。
+        event: RESTFUL event envelope 里的 `event` 字段。
+    """
+    # 当前 research/scripts 的前端只覆盖 append-only 文本模式；update 的
+    # 最终 prompt 需要按 source 快照重建，不能简单尾部追加。
+    if event.get("event_type") != "append":
+        return
+
+    # 如果上游传 token_ids 而不是 text，proxy 暂时不能保证和 P/D tokenizer
+    # 结果完全一致，因此放弃文本镜像，避免构造错误 prompt。
+    event_text = event.get("text")
+    if not isinstance(event_text, str):
+        session.decode_prompt_text = None
+        return
+
+    if session.decode_prompt_text is not None:
+        session.decode_prompt_text += event_text
+
+
+def _finish_decode_prompt_text(
+    session: PromptStreamProxySession,
+    event: dict[str, Any],
+) -> None:
+    """把 prompt_finished 文本追加到 proxy 侧 decode prompt 镜像。
+
+    Args:
+        session: 当前 prompt stream 会话。
+        event: RESTFUL finish envelope 里的 `event` 字段。
+    """
+    # finish 可能因为 D 节点失败而被手动重试；避免把 final question 追加两次。
+    if session.decode_prompt_finished:
+        return
+    session.decode_prompt_finished = True
+
+    event_text = event.get("text")
+    if not isinstance(event_text, str):
+        session.decode_prompt_text = None
+        return
+
+    if session.decode_prompt_text is not None:
+        session.decode_prompt_text += event_text
+
+
+def _apply_decode_prompt_to_request(
+    session: PromptStreamProxySession,
+    decode_request: dict[str, Any],
+) -> None:
+    """把 proxy 侧重建出的完整 prompt 写入 D 节点请求体。
+
+    Args:
+        session: 当前 prompt stream 会话。
+        decode_request: 即将发送给 D 节点的 OpenAI 请求体。
+    """
+    if session.api_endpoint != "/completions":
+        return
+    if session.decode_prompt_text is None:
+        return
+    decode_request["prompt"] = session.decode_prompt_text
+
+
 def _build_prefill_start_request(req_data: dict[str, Any]) -> dict[str, Any]:
     """构造发给 P 节点的 start 请求。"""
     prefill_request = dict(req_data)
@@ -192,19 +277,51 @@ def _build_prefill_start_request(req_data: dict[str, Any]) -> dict[str, Any]:
     return prefill_request
 
 
+def _format_upstream_error(
+    service_name: str,
+    endpoint: str,
+    response: httpx.Response,
+) -> dict[str, Any]:
+    """把上游 P/D 节点错误整理成 proxy 可读的错误体。
+
+    Args:
+        service_name: 上游服务名称，例如 `prefill` 或 `decode`。
+        endpoint: proxy 调用的上游 endpoint。
+        response: 上游 HTTP 响应。
+
+    Returns:
+        可以直接放入 `HTTPException.detail` 的错误字典。
+    """
+    try:
+        upstream_body: Any = response.json()
+    except ValueError:
+        upstream_body = response.text
+    return {
+        "service": service_name,
+        "endpoint": endpoint,
+        "status_code": response.status_code,
+        "body": upstream_body,
+    }
+
+
 async def _post_json(
     client_info: dict[str, Any],
     endpoint: str,
     data: dict[str, Any],
     request_id: str,
+    service_name: str = "prefill",
 ) -> dict[str, Any]:
-    """向 P 节点发送 JSON 请求并返回 JSON 响应。"""
+    """向上游 P/D 节点发送 JSON 请求并返回 JSON 响应。"""
     response = await client_info["client"].post(
         endpoint,
         json=data,
         headers=_authorization_headers(request_id),
     )
-    response.raise_for_status()
+    if response.is_error:
+        raise HTTPException(
+            status_code=response.status_code,
+            detail=_format_upstream_error(service_name, endpoint, response),
+        )
     return response.json()
 
 
@@ -247,6 +364,7 @@ async def start_prompt_stream(request: Request):
         decode_client_info=decode_client_info,
         api_endpoint=api_endpoint,
         base_request=_build_decode_base_request(req_data),
+        decode_prompt_text=_get_initial_decode_prompt_text(req_data),
     )
     return JSONResponse(content=response_json)
 
@@ -270,6 +388,7 @@ async def add_prompt_stream_event(request: Request):
         req_data,
         session.request_id,
     )
+    _append_decode_prompt_text(session, req_data.get("event", {}))
     return JSONResponse(content=response_json)
 
 
@@ -292,8 +411,10 @@ async def finish_prompt_stream(request: Request):
         req_data,
         session.request_id,
     )
+    _finish_decode_prompt_text(session, req_data.get("event", {}))
 
     decode_request = dict(session.base_request)
+    _apply_decode_prompt_to_request(session, decode_request)
     decode_request["kv_transfer_params"] = prefill_response["kv_transfer_params"]
 
     if decode_request.get("stream", False):
@@ -307,7 +428,11 @@ async def finish_prompt_stream(request: Request):
         json=decode_request,
         headers=_authorization_headers(session.request_id),
     )
-    response.raise_for_status()
+    if response.is_error:
+        raise HTTPException(
+            status_code=response.status_code,
+            detail=_format_upstream_error("decode", session.api_endpoint, response),
+        )
     return JSONResponse(content=response.json())
 
 

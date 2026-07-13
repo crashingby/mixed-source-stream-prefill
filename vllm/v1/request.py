@@ -501,6 +501,8 @@ class Request:
                 f"match request_id={self.request_id}."
             )
 
+        self._discard_unfinished_prompt_stream_outputs()
+
         if event.event_type == PromptStreamEventType.APPEND:
             return self._apply_prompt_stream_append(event)
 
@@ -514,6 +516,33 @@ class Request:
             return self._mark_prompt_stream_finished(event)
 
         raise ValueError(f"Unsupported prompt stream event type: {event.event_type}")
+
+    def _discard_unfinished_prompt_stream_outputs(self) -> None:
+        """丢弃流式 prompt 结束前被 prefill 顺手采样出的 output token。
+
+        vLLM 的 generate 路径会在 prefill 当前 prompt 最后一个 token 时采样
+        第一个 output token。对于流式 prompt，请求级 `PROMPT_FINISHED` 到达
+        前这些 token 只是过早产生的临时结果，不能让它们阻止后续 append /
+        update / finish 继续修改 prompt。
+        """
+        if self.prompt_stream is None or self.prompt_stream.finished:
+            return
+        if not self._output_token_ids:
+            return
+
+        self._output_token_ids.clear()
+        self._all_token_ids = self._current_prompt_token_ids()
+        self.output_token_ids = ConstantList(self._output_token_ids)
+        self.all_token_ids = ConstantList(self._all_token_ids)
+        self.spec_token_ids.clear()
+        self.num_output_placeholders = 0
+        self.async_tokens_to_discard = 0
+        self.num_computed_tokens = min(
+            self.num_computed_tokens,
+            self.num_prompt_tokens,
+        )
+        self.block_hashes = []
+        self.update_block_hashes()
 
     def _ensure_prompt_stream_state(self) -> PromptStreamState:
         """确保当前请求已经初始化流式 prompt 状态。"""

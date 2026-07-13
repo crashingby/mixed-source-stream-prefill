@@ -51,8 +51,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--model",
         type=str,
-        default="local-completions",
-        help="Model name forwarded to the P and D vLLM servers.",
+        default="qwen2.5-3b",
+        help="Served model name forwarded to the P and D vLLM servers.",
     )
     parser.add_argument(
         "--api",
@@ -160,7 +160,10 @@ def _post_json(
         proxy 返回的 JSON 对象。
     """
     response = client.post(_endpoint(proxy_url, path), json=payload)
-    response.raise_for_status()
+    if response.is_error:
+        print(f"\n=== error response from {path} ===")
+        print(response.text)
+        response.raise_for_status()
     return response.json()
 
 

@@ -38,7 +38,8 @@ P 节点需要使用已经注册 prompt stream router 的 OpenAI server，并监
 .venv/bin/python -m vllm.entrypoints.openai.api_server \
   --host 127.0.0.1 \
   --port 8100 \
-  --model /path/to/model
+  --model ~/Models/Qwen2.5-3B/ \
+  --served-model-name qwen2.5-3b
 ```
 
 ### 2. 启动 D 节点
@@ -50,7 +51,8 @@ D 节点继续暴露普通 OpenAI decode 接口，例如 `/v1/completions` 或 `
 .venv/bin/python -m vllm.entrypoints.openai.api_server \
   --host 127.0.0.1 \
   --port 8200 \
-  --model /path/to/model
+  --model ~/Models/Qwen2.5-3B/ \
+  --served-model-name qwen2.5-3b
 ```
 
 ### 3. 启动 proxy
@@ -73,12 +75,17 @@ D 节点继续暴露普通 OpenAI decode 接口，例如 `/v1/completions` 或 `
 
 如果传入多个 P/D 节点，proxy 会用 round-robin 选择节点。
 
+注意：`append_frontend.py` 的 `--model` 参数是 OpenAI API 请求体里的
+`model` 字段，应该填写 P/D 节点启动时的 `--served-model-name`，例如
+`qwen2.5-3b`，而不是本地模型路径。`--model ~/Models/...` 只应该出现
+在启动 vLLM server 的命令里。
+
 ### 4. 运行 append-only 前端示例
 
 ```bash
 .venv/bin/python research/scripts/append_frontend.py \
   --proxy-url http://127.0.0.1:8000 \
-  --model /path/to/model \
+  --model qwen2.5-3b \
   --max-tokens 64 \
   --temperature 0
 ```
@@ -88,7 +95,7 @@ D 节点继续暴露普通 OpenAI decode 接口，例如 `/v1/completions` 或 `
 ```bash
 .venv/bin/python research/scripts/append_frontend.py \
   --proxy-url http://127.0.0.1:8000 \
-  --model /path/to/model \
+  --model qwen2.5-3b \
   --stream
 ```
 
@@ -97,7 +104,7 @@ D 节点继续暴露普通 OpenAI decode 接口，例如 `/v1/completions` 或 `
 ```bash
 .venv/bin/python research/scripts/append_frontend.py \
   --proxy-url http://127.0.0.1:8000 \
-  --model /path/to/model \
+  --model qwen2.5-3b \
   --chunk "检索片段 1：vLLM 的 EngineCore 保存请求状态。" \
   --chunk "检索片段 2：proxy 会先把事件发给 P 节点。" \
   --final-question "\n用户问题：proxy 在 decode 前做了什么？\n回答："
@@ -112,7 +119,7 @@ D 节点继续暴露普通 OpenAI decode 接口，例如 `/v1/completions` 或 `
 ```json
 {
   "api": "completions",
-  "model": "/path/to/model",
+  "model": "qwen2.5-3b",
   "prompt": "fixed prefix/template",
   "stream": false,
   "max_tokens": 64,
