@@ -19,6 +19,7 @@ from vllm.v1.engine.prompt_stream import (
 from vllm.entrypoints.serve.prompt_stream.protocol import (
     PromptStreamEventEnvelope,
     PromptStreamEventRequest,
+    PromptStreamEventResponse,
     PromptStreamFinishResponse,
     PromptStreamStartRequest,
     PromptStreamStartResponse,
@@ -34,6 +35,17 @@ class PromptStreamSession:
     sampling_params: SamplingParams
     created_time: float
     last_event_time: float
+
+
+@dataclass(frozen=True)
+class PromptStreamPrefillOutput:
+    """P 节点 finish 时交给 proxy 的首 token 和 transfer 元数据。"""
+
+    kv_transfer_params: dict[str, Any]
+    token_ids: list[int]
+    text: str
+    finish_reason: str | None
+    stop_reason: int | str | None
 
 
 class PromptStreamServing:
@@ -59,6 +71,7 @@ class PromptStreamServing:
 
         # start 阶段使用普通输入处理链路，确保 prefix/template 按模型 tokenizer
         # 和现有 vLLM prompt 规则处理。
+        prefix_token_ids = self._resolve_start_prompt_token_ids(request.prompt)
         collector = await self.engine_client.add_prompt_stream_request(
             request_id=request_id,
             prompt=request.prompt,
@@ -77,15 +90,22 @@ class PromptStreamServing:
             created_time=now,
             last_event_time=now,
         )
-        return PromptStreamStartResponse(request_id=internal_request_id)
+        return PromptStreamStartResponse(
+            request_id=internal_request_id,
+            token_ids=prefix_token_ids,
+        )
 
     async def add_event(
         self,
         envelope: PromptStreamEventEnvelope,
-    ) -> None:
+    ) -> PromptStreamEventResponse:
         """应用 Append / Update / Source Finished 事件并返回 ack。"""
         session = self._get_session(envelope.request_id)
         event_request = envelope.event
+        if event_request.event_type == PromptStreamEventType.PROMPT_FINISHED.value:
+            raise ValueError(
+                "prompt_finished must use /v1/prompt_stream/finish."
+            )
         prompt_stream_event = self._build_prompt_stream_event(
             request_id=session.request_id,
             event_request=event_request,
@@ -98,6 +118,11 @@ class PromptStreamServing:
         # event 只进入 EngineCore，不注册新的 output collector。
         await self.engine_client.add_prompt_stream_event(engine_core_request)
         session.last_event_time = time.time()
+        return PromptStreamEventResponse(
+            request_id=session.request_id,
+            event_type=event_request.event_type,
+            token_ids=prompt_stream_event.token_ids,
+        )
 
     async def finish(
         self,
@@ -116,6 +141,10 @@ class PromptStreamServing:
             request_id=session.request_id,
             event_request=event_request,
         )
+        if not prompt_stream_event.token_ids:
+            raise ValueError(
+                "prompt_stream finish requires a non-empty final question."
+            )
         engine_core_request = self._build_event_engine_core_request(
             session=session,
             prompt_stream_event=prompt_stream_event,
@@ -125,11 +154,23 @@ class PromptStreamServing:
         await self.engine_client.add_prompt_stream_event(engine_core_request)
         session.last_event_time = time.time()
 
-        kv_transfer_params = await self._wait_for_kv_transfer_params(session)
-        return PromptStreamFinishResponse(
-            request_id=session.request_id,
-            kv_transfer_params=kv_transfer_params,
+        prefill_output = await self._wait_for_finish_output(session)
+        physical_prompt_token_ids = prefill_output.kv_transfer_params.pop(
+            "prompt_stream_prompt_token_ids",
+            None,
         )
+        response = PromptStreamFinishResponse(
+            request_id=session.request_id,
+            kv_transfer_params=prefill_output.kv_transfer_params,
+            token_ids=prompt_stream_event.token_ids,
+            prompt_token_ids=physical_prompt_token_ids,
+            output_token_ids=prefill_output.token_ids,
+            output_text=prefill_output.text,
+            output_finish_reason=prefill_output.finish_reason,
+            output_stop_reason=prefill_output.stop_reason,
+        )
+        self.sessions.pop(session.request_id, None)
+        return response
 
     async def abort(self, request_id: str) -> None:
         """取消 prompt stream 会话并释放本地 session 状态。"""
@@ -177,6 +218,24 @@ class PromptStreamServing:
         if extra_args:
             sampling_kwargs["extra_args"] = extra_args
         return SamplingParams(**sampling_kwargs, skip_clone=True)
+
+    def _resolve_start_prompt_token_ids(self, prompt: str | list[int]) -> list[int]:
+        """把 start 阶段 prefix/template 归一化为 P 节点实际 token ids。
+
+        Args:
+            prompt: RESTFUL start 请求里的原始 prompt。
+
+        Returns:
+            P 节点用于初始化长期 Request 的 prefix token ids。
+        """
+        if isinstance(prompt, list):
+            return list(prompt)
+
+        tokenizer = self.engine_client.input_processor.get_tokenizer()
+        try:
+            return list(tokenizer.encode(prompt, add_special_tokens=True))
+        except TypeError:
+            return list(tokenizer.encode(prompt))
 
     def _resolve_token_ids(
         self,
@@ -243,11 +302,16 @@ class PromptStreamServing:
             prompt_stream_event=prompt_stream_event,
         )
 
-    async def _wait_for_kv_transfer_params(
+    async def _wait_for_finish_output(
         self,
         session: PromptStreamSession,
-    ) -> dict[str, Any]:
-        """等待 P 节点首个携带 kv_transfer_params 的输出。"""
+    ) -> PromptStreamPrefillOutput:
+        """等待 P 节点返回 kv_transfer_params 和首个输出 token。
+
+        Returns:
+            P 节点为了完成 PD prefill 采样出的首个 decode token、文本、停止
+            原因以及 connector 参数。
+        """
         while True:
             output = await session.collector.get()
             if not isinstance(output, RequestOutput):
@@ -256,7 +320,19 @@ class PromptStreamServing:
                     f"but got {type(output).__name__}."
                 )
             if output.kv_transfer_params:
-                return output.kv_transfer_params
+                if len(output.outputs) != 1:
+                    raise ValueError(
+                        "Prompt stream finish requires exactly one completion "
+                        f"branch, but got {len(output.outputs)}."
+                    )
+                completion_output = output.outputs[0]
+                return PromptStreamPrefillOutput(
+                    kv_transfer_params=output.kv_transfer_params,
+                    token_ids=list(completion_output.token_ids),
+                    text=completion_output.text,
+                    finish_reason=completion_output.finish_reason,
+                    stop_reason=completion_output.stop_reason,
+                )
             if output.finished:
                 raise ValueError(
                     "Prompt stream finished without kv_transfer_params for "

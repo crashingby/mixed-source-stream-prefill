@@ -55,13 +55,6 @@ def parse_args() -> argparse.Namespace:
         help="Served model name forwarded to the P and D vLLM servers.",
     )
     parser.add_argument(
-        "--api",
-        type=str,
-        choices=("completions", "chat/completions"),
-        default="completions",
-        help="Decode endpoint selected by the proxy.",
-    )
-    parser.add_argument(
         "--request-id",
         type=str,
         default=None,
@@ -103,11 +96,6 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=0.0,
         help="Decode temperature forwarded to the D node after finish.",
-    )
-    parser.add_argument(
-        "--stream",
-        action="store_true",
-        help="Ask the proxy to stream the final D-node response.",
     )
     parser.add_argument(
         "--event-delay",
@@ -177,10 +165,10 @@ def _build_start_payload(args: argparse.Namespace) -> dict[str, Any]:
         与 `research/scripts/proxy_server.py` 对齐的 start JSON。
     """
     payload: dict[str, Any] = {
-        "api": args.api,
+        "api": "completions",
         "model": args.model,
         "prompt": args.prefix,
-        "stream": args.stream,
+        "stream": False,
         "max_tokens": args.max_tokens,
         "temperature": args.temperature,
     }
@@ -251,19 +239,6 @@ def _build_finish_event(
     }
 
 
-def _print_streaming_response(response: httpx.Response) -> None:
-    """逐块打印 proxy 转发的流式 decode 响应。
-
-    Args:
-        response: httpx stream 上下文中的响应对象。
-    """
-    print("\n=== finish streaming response ===")
-    for chunk in response.iter_text():
-        if chunk:
-            print(chunk, end="", flush=True)
-    print()
-
-
 def run_append_demo(args: argparse.Namespace) -> None:
     """运行一次 append-only prompt stream 端到端示例。
 
@@ -312,17 +287,6 @@ def run_append_demo(args: argparse.Namespace) -> None:
 
         finish_payload = _build_finish_event(request_id, args.final_question)
         _print_json("finish request", finish_payload)
-
-        # stream=True 时，finish 会被 proxy 直接接到 D 节点流式输出。
-        if args.stream:
-            with client.stream(
-                "POST",
-                _endpoint(args.proxy_url, "/v1/prompt_stream/finish"),
-                json=finish_payload,
-            ) as response:
-                response.raise_for_status()
-                _print_streaming_response(response)
-            return
 
         finish_response = _post_json(
             client,

@@ -18,17 +18,33 @@ prefill 重叠：
 - [x] **定义 chunk 数据模型**：采用请求级事件和来源级状态分离的设计，事件
   携带来源、版本、顺序和 token，`Request` 负责维护各来源的当前状态。
 - [x] **定义 Append 语义**：MVP 只允许来源内部尾部追加，不允许撤回或重排；
-  重复事件幂等丢弃，乱序事件按 `sequence_no` 暂存后顺序应用。
+  重复事件幂等丢弃，乱序事件按 `sequence_no` 暂存。缺口补齐后的自动消费尚未
+  实现，因此当前不会悄悄越过乱序事件。
 - [x] **定义 Update 语义**：MVP 使用来源级完整快照，不实现增量 patch；插入、
   替换、删除和重排都表现为一个更高版本的新快照。
-- [x] **定义完成条件**：每个来源独立结束；所有来源结束后关闭 prompt，只有
-  prompt 已关闭且所有 prompt token 已计算完成时才允许 decode。
-- [ ] **定义一致性要求**：确定系统最终必须等价于完整上下文 prefill，还是允许
-  使用改变注意力关系的近似结果。
+- [x] **定义完成条件**：`SOURCE_FINISHED` 只关闭单个来源；请求级
+  `PROMPT_FINISHED` 是最终 barrier，并携带非空用户问题。只有 PA、Update 和
+  Question 三个执行阶段全部完成后才允许 decode。
+- [x] **定义一致性要求**：当前论文原型明确允许近似结果。Append-after-Update
+  不重算已经存在的 Update KV，`PREFIX_APPEND` 的 block 对齐 padding 也会参与
+  attention；这两点都不保证等价于完整上下文的一次性 prefill。
 - [ ] **写出注意力可见性矩阵**：明确 Append 和 Update token 在不同到达时刻
   可以关注哪些历史 token。
-- [ ] **构造最小事件序列**：覆盖 Append-only、Update-only、Append 后
-  Update、Update 后 Append、两类事件交错和高频 Update。
+- [x] **构造最小事件序列**：Request/KV 定向测试已覆盖 Append-only、
+  Update-only、Append 后 Update、Update 后 Append、交错 Append source、
+  source-local LCP、preemption 和 Finish；真实 RESTFUL Update 与双 GPU NIXL
+  仍需集成验证。
+- [x] **完成 segment-aware worker 写入路径**：KV manager 使用
+  `PREFIX_APPEND` 与 `UPDATE` 两个物理 key；scheduler 在 phase 切换时通过
+  `NewRequestData` 同时刷新 token view、计算位置和完整 block table。
+- [x] **处理 prefix+append 尾块未满的拼接规则**：当前 MVP 对
+  `PREFIX_APPEND` 做显式 token padding，使 Update 从新的 block 边界开始；
+  padding 会参与 attention，后续仍需研究 mask 或 KV compaction。
+- [x] **实现 P/D transfer block 顺序**：P 按 `PREFIX_APPEND + UPDATE` 导出，
+  Question 与后续 token 共用 Update 域；D 侧 NIXL load 只选择
+  `remote_num_tokens` 覆盖的 blocks。
+- [ ] **完成真实双 GPU P/D 验证**：复测 segment block ids、D local load ids、
+  `remote_num_tokens` 与最终输出质量，确认 NIXL descriptor 实际复制内容正确。
 
 ### Chunk 数据模型
 
@@ -180,9 +196,9 @@ def apply_append_event(self, event: PromptStreamEvent) -> PromptMutation:
 #### 与 Stream2LLM 的差异
 
 Stream2LLM 的 `append_streaming_prompt_tokens()` 直接扩展全局
-`prompt_token_ids`，适用于单 Append 源。多源版本需要先更新来源局部状态，再按
-确定性布局生成全局 prompt。否则一个来源的事件到达顺序会隐式改变其他来源在
-prompt 中的位置，导致无法解释的 KV 失效。
+`prompt_token_ids`，适用于单 Append 源。当前实现除了保存来源局部状态，还维护
+请求级 Append 提交日志；多个 Append source 交错到达时按事件实际提交顺序追加，
+不会先按 source 分组后重排旧 token。
 
 ### Update 语义
 
@@ -216,21 +232,21 @@ def apply_update_snapshot(self, event: PromptStreamEvent) -> PromptMutation:
     ...
 ```
 
-处理流程为：
+当前 segment 实现的处理流程为：
 
 1. 校验请求仍处于 prompt streaming 阶段，来源类型为 Update。
 2. 校验 `chunk_id`、`sequence_no` 和 `version`。
 3. 在替换前保存上一版 update source 的 `token_ids`。
 4. 计算旧 update 快照和新 update 快照的 token 级 LCP。
-5. 将 update 源内 LCP 加上 `prefix_len + append_len`，得到全局 KV 复用边界。
-6. 用新快照替换该来源的 `token_ids`，并重建全局 prompt。
-7. 将 `num_computed_tokens` 回退到安全复用边界。
-8. 重建受影响的 `block_hashes`，返回需要失效的 KV 范围。
-9. scheduler 调用新版多 KV group 失效接口并安排后续 re-prefill。
+5. 将 Update 已提交进度回退到 `min(old_computed, update_lcp)`。
+6. 用新快照替换该来源的 `token_ids`，并刷新逻辑 prompt revision。
+7. scheduler 只对 Update 派生 key 截断 `update_lcp` 之后的 blocks。
+8. worker 下一次执行时安装 `PREFIX_APPEND + UPDATE` block table，并从 Update
+   域实际已提交位置继续 prefill。
 
-注意：LCP 必须针对**Update 来源自己的局部快照**计算。来源在全局 prompt 中的
-起始位置和前面的 Append 长度不参与 LCP 比较，而是在得到 `update_lcp` 后作为
-全局偏移显式加回来。
+注意：LCP 必须针对 **Update 来源自己的局部快照**计算。来源在全局 prompt
+中的起始位置和前面的 Append 长度既不参与 LCP 比较，也不参与 KV 截断坐标；
+它们只在 worker 执行视图中作为读取前缀安装。
 
 
 
@@ -293,25 +309,30 @@ D 节点：接收 P 节点传来的 KV cache 和首 token 相关信息，继续 
 
 #### 传给 D 节点的 KV 排布
 
-传给 D 节点的 KV cache 排布顺序必须明确为：
+逻辑 token 顺序仍然是：
 
 ```text
-通用模板 KV
-+ Append 部分 KV
-+ Update 部分 KV
-+ 用户问题 KV
+通用模板
++ Append 部分
++ Update 部分
++ 用户问题
 ```
 
-对应 token 布局是：
+物理 KV 则只有两个域：
 
 ```text
-prefix_token_ids
-+ append segment token_ids
-+ update segment token_ids
-+ final_user_question_token_ids
+PREFIX_APPEND = prefix + append + block 对齐 padding
+UPDATE = update + final question + 后续 decode token
 ```
 
-其中 `final_user_question_token_ids` 可以先落在 `PromptStreamState.suffix_token_ids`。
+最终导出的 block ids 固定为：
+
+```text
+PREFIX_APPEND block ids + UPDATE block ids
+```
+
+`final_user_question_token_ids` 保存在 `PromptStreamState.suffix_token_ids`，但
+Question 只是独立执行 phase，不是第三个 KV key。
 
 需要特别标注：这个 KV 排布看起来像完整 prompt 的顺序，但由于 Update suffix 的 prefill 使用的是近似上下文：
 
@@ -325,9 +346,13 @@ prefix_token_ids
 
 当前 Request / Scheduler 侧已经完成 `PROMPT_FINISHED` 的基本逻辑。后续剩余工作主要是：
 
-- 前端如何把最终用户问题组装成 `PROMPT_FINISHED` 事件。
-- P/D connector 是否需要显式携带 `prefix + append + update + suffix` 四段长度。
-- `kv_transfer_params` 里是否要增加 prompt stream layout 的 debug / 校验信息。
+- 给 Update / Source Finished 增加 RESTFUL 端到端测试脚本；当前前端只演示
+  Append 和最终问题。
+- 在真实双 GPU 环境核对 P 侧合并 block ids、D 侧 local load block ids 与
+  NIXL descriptor。
+- 评估是否还需要在 `kv_transfer_params` 增加 segment 长度调试字段；正确性契约
+  只要求物理 prompt token ids、物理长度、远端覆盖长度和 block ids 一致，
+  D 节点不需要理解四个逻辑部分。
 - 多个 Update source 是否需要支持；MVP 暂时不做。
 
 ### Append / Update 分域 KV 语义
@@ -350,7 +375,8 @@ fixed prefix
 - `append segment` 由所有 Append 来源已经到达的 chunk 稳定拼接得到。
 - `update segment` 由 Update 来源当前版本快照得到。
 - Update 来源的新版本不会影响 Append segment 已经计算好的 KV。
-- Append 新 chunk 到达后，会扩展 Append segment；后续 Update segment 的计算应基于新的 Append KV。
+- Append 新 chunk 到达后，会扩展 Append segment；**以后真正发生的 Update
+  新版本计算**会看到最新 Append KV，但已经存在的 Update KV 不会因此回溯重算。
 
 #### Append 事件的 KV 语义
 
@@ -358,7 +384,9 @@ Append 事件到达时：
 
 - 新 chunk 与该 Append 来源之前的 chunk 拼在一起。
 - 新 append chunk 的 prefill 基于已有 append KV 继续计算。
-- 如果系统中已经有 update KV，append segment 增长后，后面的 update segment 需要重新基于新的 append KV 计算。
+- 如果系统中已经有 Update KV，Append segment 增长后仍原样保留这些 Update
+  blocks。它们编码的是计算当时的 PA 上下文和位置，这是论文原型主动选择的
+  近似语义。
 - 因此 append 的安全复用边界是 append 事件前的 append segment 末尾。
 
 #### Update 事件的 KV 语义
@@ -380,16 +408,23 @@ Update 事件到达时：
 
 这是一个有意引入的近似注意力计算，不要求等价于完整全局 prompt 从头 prefill。
 
-#### 对当前 vLLM 实现的影响
+#### 已废弃的连续 block table 折中
 
-当前 vLLM 仍然以单个 `Request.num_computed_tokens` 和单个 block table 表示请求进度，因此 MVP 采用以下折中：
+早期方案曾把全局安全边界写成
+`prefix_len + append_len + update_lcp`，再对原始 `request_id` 调用全局
+`truncate_blocks_from_position()`。这个方案会让 Append 和 Update 共用一个
+block 生命周期，已经被当前 segment 模式完全替换，不能再作为实现依据。
 
-- `Request` 用固定布局 `prefix + append sources + update sources + suffix` 重建 token 序列。
-- update 的 `common_prefix_len` 表示全局布局中的安全复用边界：`prefix_len + append_len + update_lcp`。
-- scheduler 使用 `KVCacheManager.truncate_blocks_from_position(request, common_prefix_len)` 释放安全边界之后的 blocks。
-- 这是 block 粒度截断；如果 LCP 落在 block 中间，会向上取整保留包含 LCP 的 block。
+当前实现使用两个独立 KV key：
 
-后续需要继续验证：block 粒度保留 partial block 是否会在注意力语义上过度保留无效 token；如果需要 token 级严格失效，需要更细粒度的 block table / attention mask 支持。
+- `PREFIX_APPEND` 使用原始 `request_id`，只在尾部增长。
+- `UPDATE` 使用派生 key，只按 Update source 内 LCP 截断。
+- Question 与 decode token 接在 `UPDATE` 域后面。
+- worker 根据当前 phase 安装 `PREFIX_APPEND` 或
+  `PREFIX_APPEND + UPDATE` 的合并 block table。
+
+如果 LCP 落在 Update partial block 中，保留该 block 并从 LCP 对应 slot 开始
+覆盖无效后缀；`PREFIX_APPEND` blocks 不参与这次截断。
 
 ### 完成与取消语义
 
@@ -401,31 +436,34 @@ Update 事件到达时：
 - 来源结束后，其 token 状态保持不变并继续参与全局 prompt，不释放 KV。
 - 重复结束事件可以幂等忽略；结束后再收到 DATA 属于协议错误。
 
-#### 所有来源结束
+#### 请求级结束
 
-满足以下条件时设置 `prompt_stream_finished=True`：
+当前实现不根据“所有已注册来源都结束”自动封口，因为前端还需要在 RAG 上下文
+之后提交最终用户问题。只有收到 `PROMPT_FINISHED` 才设置请求级 finished：
 
-- 所有注册来源都已经 `finished=True`。
-- 每个来源的 `pending_events` 为空，不存在尚未补齐的序号缺口。
-- 固定 suffix（例如问题、结束模板）已经加入全局 prompt。
-- 没有等待 debounce 提交的 Update 版本。
+- `PROMPT_FINISHED.token_ids` 必须是非空最终用户问题。
+- `SOURCE_FINISHED` 只禁止对应来源继续写入，不会触发 decode。
+- 当前尚未实现 pending 事件缺口补齐后的自动消费；前端必须先保证事件顺序，
+  再发送 `PROMPT_FINISHED`。
 
-`PROMPT_FINISHED` 可以作为前端显式屏障，但不能绕过上述检查。若仍有未结束来源，
-应返回错误或按预先定义的超时策略关闭，不能静默丢事件。
+“必须先收到所有 `SOURCE_FINISHED`”以及“必须等待 debounce 队列为空”可以作为
+以后更严格的前端协议，但当前 Request 没有强制这两个条件。
 
 #### 允许开始 decode
 
 只有同时满足以下条件，scheduler 才能接收 sampled token：
 
-```python
-request.prompt_stream_finished
-and request.num_computed_tokens >= request.num_prompt_tokens
-and scheduled_prompt_revision == request.prompt_revision
-```
+当前同步调度路径同时检查：
 
-其中 `scheduled_prompt_revision` 必须在 `schedule()` 时写入
-`SchedulerOutput`。这沿用 Stream2LLM 保存 finished 快照的思路，并进一步防止
-model execute 期间收到新事件后，旧版本 sampled token 被误认为有效输出。
+- 已收到 `PROMPT_FINISHED`。
+- `PREFIX_APPEND` 物理 token 已全部提交。
+- 当前 Update 快照已全部提交。
+- Question 已全部提交。
+- `num_computed_tokens >= num_prompt_tokens`。
+
+`scheduled_prompt_revision` fencing 尚未接入 `SchedulerOutput`。因此当前 P 节点
+直接拒绝 async scheduling 和 PP>1；将来若放开异步执行，再实现 revision
+fencing，不能把它描述成已经存在的保护。
 
 #### 请求取消与异常
 
@@ -437,16 +475,16 @@ model execute 期间收到新事件后，旧版本 sampled token 被误认为有
 - 序号缺口、来源超时和队列溢出不能无限等待；需要记录错误原因并终止或按配置
   降级。
 
-### 四项语义对应的最小源码改动
+### 四项语义对应的源码落点
 
 | 修改区域 | MVP 需要添加的内容 | 可参考的现有实现 |
 |---|---|---|
 | 传输协议 | `PromptStreamEvent`、事件枚举、client 发送与 core 解码入口 | Stream2LLM 的 `STREAM_ADD`；新版 vLLM 的 `ADD` 序列化链路 |
 | `Request` 状态 | `prompt_sources`、revision、完成状态、Append/Update 纯状态方法 | Stream2LLM 的两个 token 更新方法；新版 `StreamingUpdate` |
 | scheduler 入口 | 根据稳定 `request_id` 串行处理事件并维护 per-request event queue | 新版 `Scheduler.add_request()` 的重复请求和 `streaming_queue` 处理 |
-| KV 失效 | Update 使用源内 LCP 加全局偏移截断所有 KV group，并同步 block hashes | Stream2LLM 的 `invalidate_cache_from_position()`，但需按新版 coordinator 重写 |
-| 调度输出 | 传递 `scheduled_prompt_revision` 和 prompt finished 快照 | Stream2LLM 的 `req_prompt_stream_finished` |
-| 输出处理 | revision 匹配且 prompt 完成后才接受 sampled token | Stream2LLM `update_from_output()` 的 partial prompt 抑制逻辑 |
+| KV 失效 | Update 使用源内 LCP，只截断 Update 派生 key 的所有 KV group | Stream2LLM 的 `invalidate_cache_from_position()` 仅作算法参考，不能复制其全局坐标 |
+| 调度输出 | phase 变化时用 `NewRequestData` 同步 token view、计算位置和完整合并 block table；异步 revision fencing 尚待实现 | Stream2LLM 的 `req_prompt_stream_finished` |
+| 输出处理 | PA、Update、Question 未全部提交时丢弃临时 sampled token | Stream2LLM `update_from_output()` 的 partial prompt 抑制逻辑 |
 | 取消清理 | 清空事件队列、来源状态和 KV，复用当前 finished/abort 生命周期 | 当前 vLLM 的 `finish_requests()` 与 `_free_request()` |
 
 ## 第二阶段：阅读参考实现与定位 vLLM 改动点
@@ -528,8 +566,9 @@ Stream2LLM 的控制流可以概括为：
 
 - [ ] **复用实验事件语义**：保留“同一请求 id + 初始/Append/Update/Finish
   事件”的建模方式，但补充 `source_id`、`version` 和 `sequence_no`。
-- [ ] **复用 LCP 算法作为精确基线**：Update 收到来源快照后计算源内 token 级
-  LCP，并将已计算位置回退到 `prefix_len + append_len + update_lcp`。算法本身简单稳定，但状态更新需要适配新版。
+- [x] **复用 LCP 算法作为 Update 域基线**：Update 收到来源快照后计算源内
+  token 级 LCP，只把 `UPDATE` 域已计算位置回退到 `update_lcp`，并只截断
+  Update 派生 key；`PREFIX_APPEND` 的进度和 blocks 保持不变。
 - [ ] **复用 Append 状态不变量**：Append 只能发生在 decode 前，只增加 prompt
   token，不修改已计算前缀，也不能在 finished 后继续追加。
 - [ ] **复用实验 trace 驱动思路**：Crawler 和 ANNS replay driver 可以作为单源
@@ -669,17 +708,24 @@ Stream2LLM 的控制流可以概括为：
 
 ## 当前最小可行版本
 
-- [ ] 仅支持一个 Append 源和一个 Update 源。
-- [ ] Append 只允许尾部追加；Update 使用单调递增版本号和全量候选快照。
+- [x] 支持一个或多个 Append 源和一个 Update 源；多个 Append source 使用
+  请求级事件提交顺序形成同一条单调日志。
+- [x] Append 只允许尾部追加；Update 使用版本化全量快照和 source-local LCP。
+- [x] segment KV 近似原型使用 `PREFIX_APPEND` 与 `UPDATE` 两个物理 key，
+  Question 接在 Update 域后面。
+- [x] P 按 `PA blocks + Update blocks` 导出，proxy 使用物理 token 镜像请求 D，
+  D 侧会裁剪只属于本地首 token 的尾块。
 - [ ] 暂不在流式阶段执行全局 rerank，只保留离线完整上下文对照组。
-- [ ] 先实现**精确重算基线**，确认事件协议、状态机和指标采集正确。
+- [ ] 实现**精确完整上下文重算基线**，用于量化当前 padding 和
+  Append-after-Update 近似的质量损失。
 - [ ] 再加入固定 debounce 时间窗，验证减少无效 prefill 的收益。
-- [ ] 最后实现分区 KV 近似原型，并单独报告质量损失。
+- [ ] 在真实双 GPU NIXL 环境完成 segment 原型集成验证。
 
 ## 待确认问题
 
 - [ ] Stream2LLM 源码位于哪里，基于哪个 vLLM commit 或 release？
-- [ ] 首要目标是精确等价，还是允许通过近似注意力换取更低 TTFT？
+- [x] 当前主实验允许通过近似注意力换取更低 TTFT，同时保留精确重算基线作为
+  质量对照。
 - [ ] Update 候选集合是否保持固定顺序，替换 chunk 后是否需要全局 rerank？
 - [ ] decode 应在什么条件下启动，启动后是否仍允许接收上下文更新？
 - [ ] 首轮实验使用真实搜索/ANNS 系统，还是先用可控延迟的事件回放器？

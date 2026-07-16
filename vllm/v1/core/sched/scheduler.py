@@ -419,18 +419,76 @@ class Scheduler(SchedulerInterface):
         mutation = existing.apply_prompt_stream_event(event)
         incoming.prompt_stream_event = None
 
-        if mutation.num_tokens_to_invalidate <= 0:
+        prompt_stream = existing.prompt_stream
+        assert prompt_stream is not None
+        if prompt_stream.block_size is None:
+            prompt_stream.block_size = self.block_size
+        layout = existing.get_prompt_stream_layout()
+        # P 节点必须为采样出的首 token 留出一个序列位置；proxy 会把它
+        # 追加到 D prompt。否则 physical prompt 刚好等于 max_model_len 时，
+        # D 侧会收到 max_model_len + 1 个输入 token。
+        required_sequence_len = layout.physical_total_len + 1
+        if required_sequence_len > self.max_model_len:
+            logger.error(
+                "Finishing oversized prompt stream request: request_id=%s "
+                "physical_len=%s required_sequence_len=%s logical_len=%s "
+                "max_model_len=%s",
+                existing.request_id,
+                layout.physical_total_len,
+                required_sequence_len,
+                layout.total_len,
+                self.max_model_len,
+            )
+            self.finish_requests(
+                existing.request_id,
+                RequestStatus.FINISHED_ERROR,
+            )
             return
 
-        # Append 与 Update 的 KV 按布局分域管理：Update 事件先在
-        # update source 内部计算 LCP，再转换为全局 KV 保留边界。
-        # scheduler 只需要释放该边界之后的 blocks。
-        blocks_were_freed = self.kv_cache_manager.truncate_blocks_from_position(
-            existing,
-            mutation.common_prefix_len,
-        )
-        if blocks_were_freed:
-            existing.prompt_stream_needs_worker_refresh = True
+        # Segment 模式没有全局连续 fallback。Update 无论当前是否持有 blocks，
+        # 都只允许在 UPDATE 域内按来源 LCP 截断；无 blocks 时该操作自然 no-op。
+        if mutation.kv_segment_to_truncate is not None:
+            blocks_were_freed = (
+                self.kv_cache_manager.truncate_prompt_stream_segment_blocks(
+                    existing,
+                    mutation.kv_segment_to_truncate,
+                    mutation.kv_segment_keep_tokens,
+                )
+            )
+            if blocks_were_freed:
+                existing.prompt_stream_needs_worker_refresh = True
+
+    def _prepare_prompt_stream_execution(self, request: Request) -> None:
+        """在计算 token budget 前刷新流式请求的阶段执行视图。"""
+        if not request.is_prompt_streaming():
+            return
+        request.prepare_prompt_stream_execution(self.block_size)
+        if request.num_prompt_tokens + 1 > self.max_model_len:
+            layout = request.get_prompt_stream_layout()
+            raise ValueError(
+                "Prompt stream physical prompt did not reserve the P sampled "
+                "token within max_model_len: "
+                f"request_id={request.request_id}, "
+                f"physical_len={request.num_prompt_tokens}, "
+                f"required_sequence_len={request.num_prompt_tokens + 1}, "
+                f"logical_len={layout.total_len}, "
+                f"max_model_len={self.max_model_len}."
+            )
+
+    def _get_worker_blocks(self, request: Request) -> KVCacheBlocks:
+        """返回 worker 当前应完整安装的 block table。"""
+        if request.is_prompt_streaming():
+            return self.kv_cache_manager.get_prompt_stream_execution_blocks(request)
+        return self.kv_cache_manager.get_blocks(request.request_id)
+
+    def _get_connector_blocks(self, request: Request) -> KVCacheBlocks:
+        """返回 connector 本轮应观察到的完整 block table。"""
+        return self._get_worker_blocks(request)
+
+    def _mark_prompt_stream_worker_refreshed(self, request: Request) -> None:
+        """记录 worker 已通过 NewRequestData 完整接收当前执行视图。"""
+        if request.is_prompt_streaming():
+            request.prompt_stream_needs_worker_refresh = False
 
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
         self.current_step += 1
@@ -478,6 +536,7 @@ class Scheduler(SchedulerInterface):
         req_index = 0
         while req_index < len(self.running) and token_budget > 0:
             request = self.running[req_index]
+            self._prepare_prompt_stream_execution(request)
 
             if (
                 request.num_output_placeholders > 0
@@ -686,6 +745,7 @@ class Scheduler(SchedulerInterface):
 
                 request = request_queue.peek_request()
                 request_id = request.request_id
+                self._prepare_prompt_stream_execution(request)
 
                 # try to promote blocked statuses while traversing skipped queue.
                 if self._is_blocked_waiting_status(
@@ -960,7 +1020,7 @@ class Scheduler(SchedulerInterface):
                 if self.connector is not None:
                     self.connector.update_state_after_alloc(
                         request,
-                        self.kv_cache_manager.get_blocks(request_id),
+                        self._get_connector_blocks(request),
                         num_external_computed_tokens,
                     )
                     if (
@@ -1010,9 +1070,7 @@ class Scheduler(SchedulerInterface):
 
                 if self.lora_config and request.lora_request:
                     scheduled_loras.add(request.lora_request.lora_int_id)
-                req_to_new_blocks[request_id] = self.kv_cache_manager.get_blocks(
-                    request_id
-                )
+                req_to_new_blocks[request_id] = self._get_worker_blocks(request)
                 num_scheduled_tokens[request_id] = num_new_tokens
                 token_budget -= num_new_tokens
                 request.status = RequestStatus.RUNNING
@@ -1062,36 +1120,63 @@ class Scheduler(SchedulerInterface):
         # This can be potentially used for cascade attention.
         num_common_prefix_blocks = [0] * len(self.kv_cache_config.kv_cache_groups)
         with record_function_or_nullcontext("schedule: get_num_common_prefix_blocks"):
-            if self.running:
+            if self.running and not any(
+                request.is_prompt_streaming() for request in self.running
+            ):
                 any_request_id = self.running[0].request_id
                 num_common_prefix_blocks = (
                     self.kv_cache_manager.get_num_common_prefix_blocks(any_request_id)
                 )
 
-        # Construct the scheduler output.
+        # Prompt stream phase切换必须同时替换 token view 与整张 block table。
+        # 两代 worker 的 NewRequestData 路径都已经支持同 request id 的完整
+        # remove/re-add，因此这里不再把 refresh 冒充普通 preemption。
+        prompt_stream_refresh_reqs = [
+            req
+            for req in itertools.chain(
+                scheduled_running_reqs,
+                scheduled_resumed_reqs,
+            )
+            if req.prompt_stream_needs_worker_refresh
+        ]
+        refresh_req_ids = {req.request_id for req in prompt_stream_refresh_reqs}
+        cached_running_reqs = [
+            req
+            for req in scheduled_running_reqs
+            if req.request_id not in refresh_req_ids
+        ]
+        cached_resumed_reqs = [
+            req
+            for req in scheduled_resumed_reqs
+            if req.request_id not in refresh_req_ids
+        ]
+
+        worker_new_reqs = scheduled_new_reqs + prompt_stream_refresh_reqs
         if self.use_v2_model_runner:
-            scheduled_new_reqs = scheduled_new_reqs + scheduled_resumed_reqs
-            scheduled_resumed_reqs = []
-            new_reqs_data = [
+            worker_new_reqs += cached_resumed_reqs
+            cached_resumed_reqs = []
+
+        new_reqs_data = []
+        for req in worker_new_reqs:
+            worker_blocks = (
+                self._get_worker_blocks(req)
+                if req.is_prompt_streaming()
+                else req_to_new_blocks[req.request_id]
+            )
+            prefill_token_ids = req._all_token_ids if self.use_v2_model_runner else None
+            new_reqs_data.append(
                 NewRequestData.from_request(
                     req,
-                    req_to_new_blocks[req.request_id].get_block_ids(),
-                    req._all_token_ids,
+                    worker_blocks.get_block_ids(),
+                    prefill_token_ids,
                 )
-                for req in scheduled_new_reqs
-            ]
-        else:
-            new_reqs_data = [
-                NewRequestData.from_request(
-                    req, req_to_new_blocks[req.request_id].get_block_ids()
-                )
-                for req in scheduled_new_reqs
-            ]
+            )
+            self._mark_prompt_stream_worker_refreshed(req)
 
         with record_function_or_nullcontext("schedule: make_cached_request_data"):
             cached_reqs_data = self._make_cached_request_data(
-                scheduled_running_reqs,
-                scheduled_resumed_reqs,
+                cached_running_reqs,
+                cached_resumed_reqs,
                 num_scheduled_tokens,
                 scheduled_spec_decode_tokens,
                 req_to_new_blocks,
@@ -1175,7 +1260,12 @@ class Scheduler(SchedulerInterface):
         self.encoder_cache_manager.free(request)
         self._inflight_prefills.discard(request)
         request.status = RequestStatus.PREEMPTED
-        request.num_computed_tokens = 0
+        if request.is_prompt_streaming():
+            # segment blocks 已整体释放，后续必须按 PA -> Update -> Question
+            # 从逻辑 source 状态完整 replay，不能沿用旧 segment 进度。
+            request.reset_prompt_stream_computed_state()
+        else:
+            request.num_computed_tokens = 0
         if request.spec_token_ids:
             request.spec_token_ids = []
         request.num_preemptions += 1
@@ -1198,13 +1288,17 @@ class Scheduler(SchedulerInterface):
         num_scheduled_tokens = scheduler_output.num_scheduled_tokens
         for req_id, num_scheduled_token in num_scheduled_tokens.items():
             request = self.requests[req_id]
-            request.num_computed_tokens += num_scheduled_token
+            request.advance_prompt_stream_computed_tokens(num_scheduled_token)
             if self.defer_block_free:
                 # Record the in-flight step, to fence deferred block freeing.
                 request.last_sched_seq = self.sched_step_seq
             request.is_prefill_chunk = request.num_computed_tokens < (
                 request.num_tokens + request.num_output_placeholders
             )
+            if request.is_prompt_streaming():
+                request.is_prefill_chunk |= (
+                    request.should_discard_prompt_stream_sampled_tokens()
+                )
             scheduler_output.has_structured_output_requests |= (
                 request.use_structured_output and not request.is_prefill_chunk
             )
@@ -1223,7 +1317,9 @@ class Scheduler(SchedulerInterface):
             gid = self.routed_experts_mgr.attn_gid
             self._re_block_ids.update(
                 {
-                    rid: self.kv_cache_manager.get_blocks(rid).get_block_ids()[gid]
+                    rid: self._get_worker_blocks(self.requests[rid]).get_block_ids()[
+                        gid
+                    ]
                     for rid in num_scheduled_tokens
                 }
             )
@@ -1313,19 +1409,17 @@ class Scheduler(SchedulerInterface):
                 ]
                 new_token_ids.append(token_ids)
             scheduled_in_prev_step = req_id in self.prev_step_scheduled_req_ids
-            force_worker_refresh = req.prompt_stream_needs_worker_refresh
             if idx >= num_running_reqs:
                 assert not scheduled_in_prev_step
                 resumed_req_ids.add(req_id)
-            if force_worker_refresh:
-                resumed_req_ids.add(req_id)
-            if not scheduled_in_prev_step or force_worker_refresh:
+            if not scheduled_in_prev_step:
                 all_token_ids[req_id] = req.all_token_ids.copy()
 
             blocks = req_to_new_blocks[req_id]
-            if force_worker_refresh:
-                blocks = self.kv_cache_manager.get_blocks(req_id)
-                req.prompt_stream_needs_worker_refresh = False
+            assert not req.prompt_stream_needs_worker_refresh, (
+                "Prompt stream worker refresh must use NewRequestData: "
+                f"request_id={req_id}."
+            )
             new_block_ids.append(blocks.get_block_ids(allow_none=True))
             num_computed_tokens.append(req.num_computed_tokens)
             num_output_tokens.append(
@@ -1609,6 +1703,10 @@ class Scheduler(SchedulerInterface):
             generated_token_ids = (
                 sampled_token_ids[req_index] if sampled_token_ids else []
             )
+            if request.should_discard_prompt_stream_sampled_tokens():
+                # worker 会为每个 chunk 简化地计算 logits；只有 Question 也
+                # 完成后，采样 token 才属于真正 decode 输出。
+                generated_token_ids = []
 
             scheduled_spec_token_ids = (
                 scheduler_output.scheduled_spec_decode_tokens.get(req_id)
@@ -2052,6 +2150,29 @@ class Scheduler(SchedulerInterface):
                 self.connector.on_new_request(request)
             if self.log_stats:
                 request.record_event(EngineCoreEventType.QUEUED)
+            if request.is_prompt_streaming():
+                prompt_stream = request.prompt_stream
+                assert prompt_stream is not None
+                if prompt_stream.block_size is None:
+                    prompt_stream.block_size = self.block_size
+                layout = request.get_prompt_stream_layout()
+                required_sequence_len = layout.physical_total_len + 1
+                if required_sequence_len > self.max_model_len:
+                    logger.error(
+                        "Rejecting oversized prompt stream start: "
+                        "request_id=%s physical_len=%s "
+                        "required_sequence_len=%s logical_len=%s "
+                        "max_model_len=%s",
+                        request.request_id,
+                        layout.physical_total_len,
+                        required_sequence_len,
+                        layout.total_len,
+                        self.max_model_len,
+                    )
+                    self.finish_requests(
+                        request.request_id,
+                        RequestStatus.FINISHED_ERROR,
+                    )
 
     def finish_requests(
         self, request_ids: str | Iterable[str] | None, finished_status: RequestStatus
@@ -2381,14 +2502,52 @@ class Scheduler(SchedulerInterface):
         if self.connector is None:
             return False, None
 
-        # Free any out-of-window prefix blocks before we hand the block table to
-        # the connector.
-        self.kv_cache_manager.remove_skipped_blocks(
-            request_id=request.request_id,
-            total_computed_tokens=request.num_computed_tokens,
-        )
-
-        block_ids = self.kv_cache_manager.get_block_ids(request.request_id)
+        if request.is_prompt_streaming():
+            block_ids = self.kv_cache_manager.get_prompt_stream_block_ids(request)
+            if request.status in (
+                RequestStatus.FINISHED_LENGTH_CAPPED,
+                RequestStatus.FINISHED_STOPPED,
+            ):
+                layout = request.get_prompt_stream_layout()
+                block_counts = [len(group) for group in block_ids]
+                for group_id, (group, kv_cache_group) in enumerate(
+                    zip(block_ids, self.kv_cache_config.kv_cache_groups)
+                ):
+                    block_size = kv_cache_group.kv_cache_spec.block_size
+                    expected_num_blocks = (
+                        request.num_computed_tokens + block_size - 1
+                    ) // block_size
+                    if len(group) != expected_num_blocks:
+                        raise RuntimeError(
+                            "Prompt stream transfer block table is not contiguous: "
+                            f"request_id={request.request_id}, "
+                            f"group_id={group_id}, "
+                            "num_computed_tokens="
+                            f"{request.num_computed_tokens}, "
+                            f"block_size={block_size}, "
+                            f"expected_blocks={expected_num_blocks}, "
+                            f"actual_blocks={len(group)}."
+                        )
+                logger.info(
+                    "Prompt stream KV finish: request_id=%s "
+                    "num_prompt_tokens=%s num_computed_tokens=%s "
+                    "num_output_tokens=%s num_tokens=%s layout=%s "
+                    "block_counts=%s",
+                    request.request_id,
+                    request.num_prompt_tokens,
+                    request.num_computed_tokens,
+                    request.num_output_tokens,
+                    request.num_tokens,
+                    layout,
+                    block_counts,
+                )
+        else:
+            # 普通请求仍可按 sliding-window 规则释放不再需要的前缀 blocks。
+            self.kv_cache_manager.remove_skipped_blocks(
+                request_id=request.request_id,
+                total_computed_tokens=request.num_computed_tokens,
+            )
+            block_ids = self.kv_cache_manager.get_block_ids(request.request_id)
 
         if not isinstance(self.connector, SupportsHMA):
             # NOTE(Kuntai): We should deprecate this code path after we enforce
@@ -2396,12 +2555,64 @@ class Scheduler(SchedulerInterface):
             # Hybrid memory allocator should be already turned off for this
             # code path, but let's double-check here.
             assert len(self.kv_cache_config.kv_cache_groups) == 1
-            return self.connector.request_finished(request, block_ids[0])
+            connector_result = self.connector.request_finished(request, block_ids[0])
+        else:
+            connector_result = self.connector.request_finished_all_groups(
+                request,
+                block_ids,
+            )
 
-        return self.connector.request_finished_all_groups(request, block_ids)
+        delay_free_blocks, kv_transfer_params = connector_result
+        if request.is_prompt_streaming() and kv_transfer_params is not None:
+            # proxy 必须把同一物理 token 序列交给 D 节点，否则 padding 后的
+            # remote_num_tokens 与 D 侧位置会再次错位。
+            physical_prompt_token_ids = (
+                request.get_prompt_stream_physical_prompt_token_ids()
+            )
+            physical_prompt_len = len(physical_prompt_token_ids)
+            if request.num_computed_tokens < physical_prompt_len:
+                raise RuntimeError(
+                    "Prompt stream finished before its physical prompt KV was "
+                    f"complete: request_id={request.request_id}, "
+                    f"physical_prompt_len={physical_prompt_len}, "
+                    f"num_computed_tokens={request.num_computed_tokens}."
+                )
+            kv_transfer_params["prompt_stream_prompt_token_ids"] = (
+                physical_prompt_token_ids
+            )
+            # D 的 prompt 还可能追加 P 采样出的首 token。若该 token 尚未在 P
+            # 上经过下一轮 forward，remote_num_tokens 只覆盖这里的物理 prompt；
+            # D connector 必须据此裁剪本地 load block table。
+            kv_transfer_params["prompt_stream_physical_prompt_len"] = (
+                physical_prompt_len
+            )
+        return delay_free_blocks, kv_transfer_params
 
     def _request_remaining_blocks(self, request: Request) -> int:
         """Blocks `request` still needs to allocate to hold its full sequence."""
+        if request.is_prompt_streaming():
+            view = request.prompt_stream_execution_view
+            if view is None:
+                return 0
+            segment_key = request.get_prompt_stream_segment_key(
+                request.get_prompt_stream_write_segment()
+            )
+            segment_num_tokens = max(0, request.num_tokens - view.segment_offset)
+            segment_num_computed_tokens = (
+                request.get_prompt_stream_segment_num_computed_tokens()
+            )
+            return self.kv_cache_manager.coordinator.get_num_blocks_to_allocate(
+                request_id=segment_key,
+                num_tokens=segment_num_tokens,
+                new_computed_blocks=(
+                    self.kv_cache_manager.empty_kv_cache_blocks.blocks
+                ),
+                num_encoder_tokens=0,
+                total_computed_tokens=segment_num_computed_tokens,
+                num_tokens_main_model=segment_num_tokens,
+                apply_admission_cap=True,
+            )
+
         full_num_tokens = min(request.num_tokens, self.max_model_len)
         return self.kv_cache_manager.coordinator.get_num_blocks_to_allocate(
             request_id=request.request_id,

@@ -9,7 +9,6 @@ from fastapi.responses import JSONResponse
 from vllm.engine.protocol import EngineClient
 from vllm.entrypoints.serve.prompt_stream.protocol import (
     PromptStreamEventEnvelope,
-    PromptStreamEventResponse,
     PromptStreamStartRequest,
 )
 from vllm.entrypoints.serve.prompt_stream.serving import PromptStreamServing
@@ -58,18 +57,13 @@ async def add_prompt_stream_event(
 ):
     """添加 Append / Update / Source Finished 事件。"""
     try:
-        await prompt_stream_serving(raw_request).add_event(request)
+        response = await prompt_stream_serving(raw_request).add_event(request)
     except ValueError as err:
         raise HTTPException(
             status_code=HTTPStatus.BAD_REQUEST,
             detail=str(err),
         ) from err
-    return JSONResponse(
-        content=PromptStreamEventResponse(
-            request_id=request.request_id,
-            event_type=request.event.event_type,
-        ).model_dump()
-    )
+    return JSONResponse(content=response.model_dump())
 
 
 @router.post("/v1/prompt_stream/finish")

@@ -10,6 +10,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_scheduler import (
     NixlBaseConnectorScheduler,
 )
 from vllm.logger import init_logger
+from vllm.utils.math_utils import cdiv
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -18,6 +19,27 @@ if TYPE_CHECKING:
     from vllm.v1.request import Request
 
 logger = init_logger(__name__)
+
+
+def _trim_prompt_stream_local_blocks(
+    block_ids: BlockIds,
+    kv_cache_config: "KVCacheConfig",
+    num_external_tokens: int,
+) -> BlockIds:
+    """只保留 D 侧实际需要从 P 加载的前缀 blocks。"""
+    if len(block_ids) != len(kv_cache_config.kv_cache_groups):
+        raise ValueError(
+            "Prompt stream local block groups do not match KV cache groups: "
+            f"blocks={len(block_ids)}, "
+            f"groups={len(kv_cache_config.kv_cache_groups)}."
+        )
+    return tuple(
+        group[: cdiv(num_external_tokens, kv_group.kv_cache_spec.block_size)]
+        for group, kv_group in zip(
+            block_ids,
+            kv_cache_config.kv_cache_groups,
+        )
+    )
 
 
 class NixlPullConnectorScheduler(NixlBaseConnectorScheduler):
@@ -155,6 +177,21 @@ class NixlPullConnectorScheduler(NixlBaseConnectorScheduler):
                         if num_external_tokens > 0
                         else ()
                     )
+                    if (
+                        num_external_tokens > 0
+                        and params.get("prompt_stream_physical_prompt_len") is not None
+                    ):
+                        # Prompt stream proxy 会把 P 采样的首 token 接到 D prompt。
+                        # 当 remote prefix 恰好 block 对齐时，D 会为这个本地
+                        # token 多申请一块；NIXL 只能加载覆盖 external tokens 的
+                        # 前缀 blocks，尾块留给 D 本地 forward。
+                        unhashed_local_block_ids = (
+                            _trim_prompt_stream_local_blocks(
+                                unhashed_local_block_ids,
+                                self.kv_cache_config,
+                                num_external_tokens,
+                            )
+                        )
                     local_block_ids = self.get_sw_clipped_blocks(
                         unhashed_local_block_ids
                     )
@@ -261,6 +298,20 @@ class NixlPullConnectorScheduler(NixlBaseConnectorScheduler):
             block_ids = self.get_sw_clipped_blocks(block_ids)
 
             remote_num_tokens = request.num_computed_tokens
+
+        if getattr(request, "is_prompt_streaming", lambda: False)():
+            logger.info(
+                "NIXL prompt stream request_finished: request_id=%s "
+                "is_p_node=%s num_prompt_tokens=%s num_computed_tokens=%s "
+                "num_output_tokens=%s remote_num_tokens=%s block_counts=%s",
+                request.request_id,
+                is_p_node,
+                request.num_prompt_tokens,
+                request.num_computed_tokens,
+                request.num_output_tokens,
+                remote_num_tokens,
+                [len(group) for group in block_ids],
+            )
 
         return delay_free_blocks, dict(
             do_remote_prefill=is_p_node,

@@ -5,13 +5,14 @@ import argparse
 import itertools
 import logging
 import os
+import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import Any
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
@@ -27,6 +28,7 @@ class PromptStreamProxySession:
     api_endpoint: str
     base_request: dict[str, Any]
     decode_prompt_text: str | None
+    decode_prompt_token_ids: list[int] | None
     decode_prompt_finished: bool = False
 
 
@@ -124,6 +126,14 @@ def parse_args():
         nargs="+",
         default=[8200],
     )
+    parser.add_argument(
+        "--disable-kv-transfer",
+        action="store_true",
+        help=(
+            "Do not forward kv_transfer_params to D. This is a debug mode "
+            "for comparing remote KV decode against local D prefill."
+        ),
+    )
     args = parser.parse_args()
 
     if len(args.prefiller_hosts) != len(args.prefiller_ports):
@@ -175,6 +185,30 @@ def _build_decode_base_request(req_data: dict[str, Any]) -> dict[str, Any]:
     return base_request
 
 
+def _get_initial_decode_prompt_token_ids(
+    req_data: dict[str, Any],
+    response_json: dict[str, Any],
+) -> list[int] | None:
+    """提取 P 节点 start 响应里的实际 prefix token ids。
+
+    Args:
+        req_data: 用户发给 proxy `/start` 的原始请求体。
+        response_json: P 节点 `/prompt_stream/start` 返回的 JSON。
+
+    Returns:
+        P 节点实际使用的 prefix token ids。若 P 节点未返回 token_ids，且
+        start 请求本身就是 token id prompt，则回退使用请求里的 token ids。
+    """
+    token_ids = response_json.get("token_ids")
+    if isinstance(token_ids, list):
+        return [int(token_id) for token_id in token_ids]
+
+    prompt = req_data.get("prompt")
+    if isinstance(prompt, list) and all(isinstance(x, int) for x in prompt):
+        return list(prompt)
+    return None
+
+
 def _get_initial_decode_prompt_text(req_data: dict[str, Any]) -> str | None:
     """提取 proxy 侧用于 D 节点 decode 的初始 prompt 文本。
 
@@ -189,6 +223,28 @@ def _get_initial_decode_prompt_text(req_data: dict[str, Any]) -> str | None:
     if isinstance(prompt, str):
         return prompt
     return None
+
+
+def _append_decode_prompt_token_ids(
+    session: PromptStreamProxySession,
+    response_json: dict[str, Any],
+) -> None:
+    """把 P 节点 ACK 中的 append token ids 追加到 D 侧 prompt 镜像。
+
+    Args:
+        session: 当前 prompt stream 会话。
+        response_json: P 节点 `/prompt_stream/event` 返回的 JSON。
+    """
+    if response_json.get("event_type") != "append":
+        return
+
+    token_ids = response_json.get("token_ids")
+    if not isinstance(token_ids, list):
+        session.decode_prompt_token_ids = None
+        return
+
+    if session.decode_prompt_token_ids is not None:
+        session.decode_prompt_token_ids.extend(int(token_id) for token_id in token_ids)
 
 
 def _append_decode_prompt_text(
@@ -215,6 +271,34 @@ def _append_decode_prompt_text(
 
     if session.decode_prompt_text is not None:
         session.decode_prompt_text += event_text
+
+
+def _finish_decode_prompt_token_ids(
+    session: PromptStreamProxySession,
+    response_json: dict[str, Any],
+) -> None:
+    """把 P 节点 ACK 中的 finish token ids 追加到 D 侧 prompt 镜像。
+
+    Args:
+        session: 当前 prompt stream 会话。
+        response_json: P 节点 `/prompt_stream/finish` 返回的 JSON。
+    """
+    # Segment 模式下 P 节点会返回包含 PREFIX_APPEND 尾部 padding 的物理
+    # prompt。D 必须完整采用这份镜像，不能继续使用 proxy 自己的逻辑拼接。
+    physical_prompt_token_ids = response_json.get("prompt_token_ids")
+    if isinstance(physical_prompt_token_ids, list):
+        session.decode_prompt_token_ids = [
+            int(token_id) for token_id in physical_prompt_token_ids
+        ]
+        return
+
+    token_ids = response_json.get("token_ids")
+    if not isinstance(token_ids, list):
+        session.decode_prompt_token_ids = None
+        return
+
+    if session.decode_prompt_token_ids is not None:
+        session.decode_prompt_token_ids.extend(int(token_id) for token_id in token_ids)
 
 
 def _finish_decode_prompt_text(
@@ -253,9 +337,210 @@ def _apply_decode_prompt_to_request(
     """
     if session.api_endpoint != "/completions":
         return
+    if session.decode_prompt_token_ids is not None:
+        decode_request["prompt"] = list(session.decode_prompt_token_ids)
+        decode_request["add_special_tokens"] = False
+        return
     if session.decode_prompt_text is None:
         return
     decode_request["prompt"] = session.decode_prompt_text
+
+
+def _append_prefill_output_token_ids(
+    session: PromptStreamProxySession,
+    response_json: dict[str, Any],
+) -> int:
+    """把 P 节点首 token 追加到 D 侧 prompt token 镜像。
+
+    Args:
+        session: 当前 prompt stream 会话。
+        response_json: P 节点 `/prompt_stream/finish` 返回的 JSON。
+
+    Returns:
+        实际追加的 P 侧输出 token 数。
+    """
+    output_token_ids = response_json.get("output_token_ids")
+    if not isinstance(output_token_ids, list):
+        return 0
+    if session.decode_prompt_token_ids is None:
+        return 0
+
+    normalized_token_ids = [int(token_id) for token_id in output_token_ids]
+    session.decode_prompt_token_ids.extend(normalized_token_ids)
+    return len(normalized_token_ids)
+
+
+def _shrink_decode_max_tokens(
+    decode_request: dict[str, Any],
+    num_prefill_output_tokens: int,
+) -> None:
+    """扣除 P 节点已经生成并交给 D 的首 token 数。
+
+    Args:
+        decode_request: 即将发给 D 节点的 OpenAI 请求体。
+        num_prefill_output_tokens: P 节点已经生成的输出 token 数。
+    """
+    if num_prefill_output_tokens <= 0:
+        return
+    max_tokens = decode_request.get("max_tokens")
+    if isinstance(max_tokens, int):
+        decode_request["max_tokens"] = max(0, max_tokens - num_prefill_output_tokens)
+
+
+def _validate_prompt_stream_transfer(
+    session: PromptStreamProxySession,
+    response_json: dict[str, Any],
+    num_prefill_output_tokens: int,
+) -> None:
+    """在请求 D 之前验证 token view 与远端 KV 覆盖范围一致。"""
+    physical_prompt_token_ids = response_json.get("prompt_token_ids")
+    kv_transfer_params = response_json.get("kv_transfer_params")
+    remote_num_tokens = (
+        kv_transfer_params.get("remote_num_tokens")
+        if isinstance(kv_transfer_params, dict)
+        else None
+    )
+    if not isinstance(physical_prompt_token_ids, list):
+        raise HTTPException(
+            status_code=502,
+            detail="P node did not return physical prompt token ids.",
+        )
+    if not isinstance(remote_num_tokens, int):
+        raise HTTPException(
+            status_code=502,
+            detail="P node did not return an integer remote_num_tokens.",
+        )
+    physical_prompt_len = len(physical_prompt_token_ids)
+    reported_physical_prompt_len = kv_transfer_params.get(
+        "prompt_stream_physical_prompt_len"
+    )
+    if reported_physical_prompt_len != physical_prompt_len:
+        raise HTTPException(
+            status_code=502,
+            detail=(
+                "P node returned inconsistent physical prompt lengths: "
+                f"tokens={physical_prompt_len}, "
+                f"metadata={reported_physical_prompt_len}."
+            ),
+        )
+    decode_prompt_len = physical_prompt_len + num_prefill_output_tokens
+    if not physical_prompt_len <= remote_num_tokens <= decode_prompt_len:
+        raise HTTPException(
+            status_code=502,
+            detail=(
+                "Prompt stream KV/token mismatch: "
+                f"physical_prompt_len={physical_prompt_len}, "
+                f"remote_num_tokens={remote_num_tokens}, "
+                f"decode_prompt_len={decode_prompt_len}."
+            ),
+        )
+    if (
+        session.decode_prompt_token_ids is None
+        or len(session.decode_prompt_token_ids) != decode_prompt_len
+    ):
+        actual_decode_prompt_len = (
+            None
+            if session.decode_prompt_token_ids is None
+            else len(session.decode_prompt_token_ids)
+        )
+        raise HTTPException(
+            status_code=502,
+            detail=(
+                "Proxy failed to construct the exact D token view: "
+                f"expected_len={decode_prompt_len}, "
+                f"actual_len={actual_decode_prompt_len}."
+            ),
+        )
+
+
+def _should_finish_without_decode(
+    decode_request: dict[str, Any],
+    response_json: dict[str, Any],
+    num_prefill_output_tokens: int,
+) -> bool:
+    """判断 P 首 token 是否已经满足原始请求的停止条件。"""
+    if response_json.get("output_finish_reason") == "stop":
+        return True
+    max_tokens = decode_request.get("max_tokens")
+    return (
+        isinstance(max_tokens, int)
+        and max_tokens <= num_prefill_output_tokens
+    )
+
+
+def _build_prefill_only_response(
+    session: PromptStreamProxySession,
+    response_json: dict[str, Any],
+) -> dict[str, Any]:
+    """构造无需启动 D 时的 OpenAI completions 响应。"""
+    prompt_token_ids = response_json.get("prompt_token_ids") or []
+    output_token_ids = response_json.get("output_token_ids") or []
+    completion_tokens = len(output_token_ids)
+    prompt_tokens = len(prompt_token_ids)
+    finish_reason = response_json.get("output_finish_reason")
+    if finish_reason != "stop":
+        finish_reason = "length"
+    return {
+        "id": f"cmpl-{session.request_id}",
+        "object": "text_completion",
+        "created": int(time.time()),
+        "model": session.base_request.get("model"),
+        "choices": [
+            {
+                "index": 0,
+                "text": response_json.get("output_text", ""),
+                "logprobs": None,
+                "finish_reason": finish_reason,
+                "stop_reason": response_json.get("output_stop_reason"),
+                "token_ids": output_token_ids,
+            }
+        ],
+        "usage": {
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": prompt_tokens + completion_tokens,
+        },
+    }
+
+
+def _merge_prefill_output(
+    response_json: dict[str, Any],
+    prefill_response: dict[str, Any],
+    num_prefill_output_tokens: int,
+) -> dict[str, Any]:
+    """把 P 首 token 合并回 D 的非流式 completions 响应。"""
+    if num_prefill_output_tokens <= 0:
+        return response_json
+    choices = response_json.get("choices")
+    if not isinstance(choices, list) or len(choices) != 1:
+        raise HTTPException(
+            status_code=502,
+            detail="D node must return exactly one completion choice.",
+        )
+    choice = choices[0]
+    choice["text"] = prefill_response.get("output_text", "") + choice.get(
+        "text", ""
+    )
+    token_ids = choice.get("token_ids")
+    if isinstance(token_ids, list):
+        choice["token_ids"] = list(
+            prefill_response.get("output_token_ids") or []
+        ) + token_ids
+
+    usage = response_json.get("usage")
+    if isinstance(usage, dict):
+        prompt_tokens = usage.get("prompt_tokens")
+        completion_tokens = usage.get("completion_tokens")
+        if isinstance(prompt_tokens, int):
+            usage["prompt_tokens"] = max(
+                0,
+                prompt_tokens - num_prefill_output_tokens,
+            )
+        if isinstance(completion_tokens, int):
+            usage["completion_tokens"] = (
+                completion_tokens + num_prefill_output_tokens
+            )
+    return response_json
 
 
 def _build_prefill_start_request(req_data: dict[str, Any]) -> dict[str, Any]:
@@ -312,11 +597,23 @@ async def _post_json(
     service_name: str = "prefill",
 ) -> dict[str, Any]:
     """向上游 P/D 节点发送 JSON 请求并返回 JSON 响应。"""
-    response = await client_info["client"].post(
-        endpoint,
-        json=data,
-        headers=_authorization_headers(request_id),
-    )
+    try:
+        response = await client_info["client"].post(
+            endpoint,
+            json=data,
+            headers=_authorization_headers(request_id),
+        )
+    except httpx.RequestError as exc:
+        upstream = f"{client_info['host']}:{client_info['port']}{endpoint}"
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "service": service_name,
+                "endpoint": endpoint,
+                "upstream": upstream,
+                "error": str(exc),
+            },
+        ) from exc
     if response.is_error:
         raise HTTPException(
             status_code=response.status_code,
@@ -325,27 +622,24 @@ async def _post_json(
     return response.json()
 
 
-async def _stream_decode_response(
-    session: PromptStreamProxySession,
-    req_data: dict[str, Any],
-):
-    """从 D 节点流式转发 decode 输出。"""
-    async with session.decode_client_info["client"].stream(
-        "POST",
-        session.api_endpoint,
-        json=req_data,
-        headers=_authorization_headers(session.request_id),
-    ) as response:
-        response.raise_for_status()
-        async for chunk in response.aiter_bytes():
-            yield chunk
-
-
 @app.post("/v1/prompt_stream/start")
 async def start_prompt_stream(request: Request):
     """创建 P/D prompt stream 会话。"""
     req_data = await request.json()
     api_endpoint = _get_api_endpoint(req_data)
+    if api_endpoint != "/completions":
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Prompt stream segment KV currently supports only "
+                "the completions API."
+            ),
+        )
+    if req_data.get("stream", False):
+        raise HTTPException(
+            status_code=400,
+            detail="Prompt stream proxy currently supports stream=false only.",
+        )
     prefill_client_info = get_next_client(request.app, "prefill")
     decode_client_info = get_next_client(request.app, "decode")
 
@@ -365,6 +659,10 @@ async def start_prompt_stream(request: Request):
         api_endpoint=api_endpoint,
         base_request=_build_decode_base_request(req_data),
         decode_prompt_text=_get_initial_decode_prompt_text(req_data),
+        decode_prompt_token_ids=_get_initial_decode_prompt_token_ids(
+            req_data,
+            response_json,
+        ),
     )
     return JSONResponse(content=response_json)
 
@@ -388,6 +686,7 @@ async def add_prompt_stream_event(request: Request):
         req_data,
         session.request_id,
     )
+    _append_decode_prompt_token_ids(session, response_json)
     _append_decode_prompt_text(session, req_data.get("event", {}))
     return JSONResponse(content=response_json)
 
@@ -411,29 +710,73 @@ async def finish_prompt_stream(request: Request):
         req_data,
         session.request_id,
     )
+    # P finish 成功后长期 Request 与 P session 已经结束；proxy 也采用
+    # at-most-once finish，后续 D/校验失败不再保留一个无法重试的空壳会话。
+    request.app.state.prompt_stream_sessions.pop(request_id, None)
+    _finish_decode_prompt_token_ids(session, prefill_response)
     _finish_decode_prompt_text(session, req_data.get("event", {}))
+    num_prefill_output_tokens = 0
+    if not global_args.disable_kv_transfer:
+        num_prefill_output_tokens = _append_prefill_output_token_ids(
+            session,
+            prefill_response,
+        )
+        if num_prefill_output_tokens > 1:
+            raise HTTPException(
+                status_code=502,
+                detail=(
+                    "P node returned more than one prefill output token: "
+                    f"{num_prefill_output_tokens}."
+                ),
+            )
+        _validate_prompt_stream_transfer(
+            session,
+            prefill_response,
+            num_prefill_output_tokens,
+        )
 
     decode_request = dict(session.base_request)
+    if not global_args.disable_kv_transfer and _should_finish_without_decode(
+        decode_request,
+        prefill_response,
+        num_prefill_output_tokens,
+    ):
+        response_json = _build_prefill_only_response(session, prefill_response)
+        return JSONResponse(
+            content=response_json,
+        )
+    _shrink_decode_max_tokens(decode_request, num_prefill_output_tokens)
     _apply_decode_prompt_to_request(session, decode_request)
-    decode_request["kv_transfer_params"] = prefill_response["kv_transfer_params"]
-
-    if decode_request.get("stream", False):
-        return StreamingResponse(
-            _stream_decode_response(session, decode_request),
-            media_type="application/json",
-        )
-
-    response = await session.decode_client_info["client"].post(
-        session.api_endpoint,
-        json=decode_request,
-        headers=_authorization_headers(session.request_id),
+    if not global_args.disable_kv_transfer:
+        decode_request["kv_transfer_params"] = prefill_response["kv_transfer_params"]
+    prompt = decode_request.get("prompt")
+    prompt_len = len(prompt) if isinstance(prompt, list) else None
+    kv_transfer_params = decode_request.get("kv_transfer_params") or {}
+    logger.info(
+        "Proxy finish decode request: request_id=%s prompt_token_len=%s "
+        "remote_num_tokens=%s remote_block_counts=%s "
+        "num_prefill_output_tokens=%s disable_kv_transfer=%s",
+        session.request_id,
+        prompt_len,
+        kv_transfer_params.get("remote_num_tokens"),
+        [len(group) for group in kv_transfer_params.get("remote_block_ids", [])],
+        num_prefill_output_tokens,
+        global_args.disable_kv_transfer,
     )
-    if response.is_error:
-        raise HTTPException(
-            status_code=response.status_code,
-            detail=_format_upstream_error("decode", session.api_endpoint, response),
-        )
-    return JSONResponse(content=response.json())
+
+    decode_response = await _post_json(
+        session.decode_client_info,
+        session.api_endpoint,
+        decode_request,
+        session.request_id,
+        service_name="decode",
+    )
+    response_json = _merge_prefill_output(
+        decode_response,
+        prefill_response,
+        num_prefill_output_tokens,
+    )
+    return JSONResponse(content=response_json)
 
 
 @app.post("/v1/prompt_stream/abort")

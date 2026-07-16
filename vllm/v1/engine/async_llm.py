@@ -440,6 +440,30 @@ class AsyncLLM(EngineClient):
             raise EngineDeadError()
         if sampling_params.n != 1:
             raise ValueError("Prompt stream start currently supports n=1 only.")
+        if self.vllm_config.scheduler_config.async_scheduling:
+            raise ValueError(
+                "Prompt stream segment KV currently requires synchronous "
+                "scheduling; disable async scheduling on the P node."
+            )
+        if self.vllm_config.speculative_config is not None:
+            raise ValueError(
+                "Prompt stream segment KV does not support speculative "
+                "decoding on the P node."
+            )
+        if self.vllm_config.parallel_config.pipeline_parallel_size > 1:
+            raise ValueError(
+                "Prompt stream segment KV currently requires pipeline "
+                "parallel size 1 on the P node."
+            )
+        kv_transfer_config = self.vllm_config.kv_transfer_config
+        if (
+            kv_transfer_config is not None
+            and kv_transfer_config.kv_buffer_device == "cpu"
+        ):
+            raise ValueError(
+                "Prompt stream segment KV currently requires direct device "
+                "KV transfer; NIXL host-buffer mode is not supported."
+            )
 
         if isinstance(prompt, EngineCoreRequest):
             request = prompt

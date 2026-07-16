@@ -73,6 +73,7 @@ class PromptStreamStartResponse(OpenAIBaseModel):
 
     request_id: str
     status: Literal["started"] = "started"
+    token_ids: list[int] | None = None
 
 
 class PromptStreamEventResponse(OpenAIBaseModel):
@@ -81,6 +82,7 @@ class PromptStreamEventResponse(OpenAIBaseModel):
     request_id: str
     status: Literal["accepted"] = "accepted"
     event_type: str
+    token_ids: list[int] | None = None
 
 
 class PromptStreamFinishResponse(OpenAIBaseModel):
@@ -89,3 +91,9 @@ class PromptStreamFinishResponse(OpenAIBaseModel):
     request_id: str
     status: Literal["prefill_finished"] = "prefill_finished"
     kv_transfer_params: dict[str, Any]
+    token_ids: list[int] | None = None
+    prompt_token_ids: list[int] | None = None
+    output_token_ids: list[int] | None = None
+    output_text: str = ""
+    output_finish_reason: str | None = None
+    output_stop_reason: int | str | None = None

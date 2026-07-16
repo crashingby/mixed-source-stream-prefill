@@ -34,6 +34,39 @@ if TYPE_CHECKING:
     from vllm.v1.core.kv_cache_utils import BlockHash
 
 
+class PromptStreamKVSegment(enum.Enum):
+    """流式 prompt 的两个物理 KV 域。"""
+
+    PREFIX_APPEND = "prefix_append"
+    UPDATE = "update"
+
+
+class PromptStreamExecutionPhase(enum.Enum):
+    """流式 prompt 当前需要执行的 prefill 阶段。"""
+
+    PREFIX_APPEND = "prefix_append"
+    UPDATE = "update"
+    QUESTION = "question"
+
+
+@dataclass(frozen=True)
+class PromptStreamExecutionView:
+    """描述 scheduler 和 worker 本轮看到的物理 prompt 视图。
+
+    `token_ids` 已包含 `PREFIX_APPEND` 末尾的 block 对齐 padding。worker
+    必须同时使用这里的 token 序列、`num_computed_tokens` 和按
+    `required_segments` 拼接的 block table，三者不能独立更新。
+    """
+
+    phase: PromptStreamExecutionPhase
+    write_segment: PromptStreamKVSegment
+    required_segments: tuple[PromptStreamKVSegment, ...]
+    token_ids: tuple[int, ...]
+    num_computed_tokens: int
+    prefix_append_physical_len: int
+    segment_offset: int
+
+
 @dataclass
 class StreamingUpdate:
     """Lightweight data for streaming session continuation.
@@ -60,19 +93,25 @@ class StreamingUpdate:
             sampling_params=request.sampling_params,
         )
 
+
 @dataclass
 class PromptStreamMutation:
     """描述一次流式 prompt 事件对 Request prompt 的影响。"""
-    #重复 chunk、旧版本 update、乱序 pending 等，没有实际改 prompt。
+
+    # 重复 chunk、旧版本 update、乱序 pending 等，没有实际改 prompt。
     applied: bool
     old_num_prompt_tokens: int
     new_num_prompt_tokens: int
-    # scheduler 可安全保留的全局 KV 前缀长度。
+    # 仅用于统计和调试的逻辑 prompt 公共前缀长度。
     common_prefix_len: int
-    #已经 prefill 过但现在失效的 token 数。
+    # 已经 prefill 过但现在失效的 segment 内 token 数。
     num_tokens_to_invalidate: int
-    #每次 prompt 真实变化都递增，后面防止 scheduler 用旧状态 decode。
+    # 每次 prompt 真实变化都递增，后面防止 scheduler 用旧状态 decode。
     prompt_revision: int
+    # 需要按 segment 粒度截断的 KV 域；None 表示不需要释放 block。
+    kv_segment_to_truncate: PromptStreamKVSegment | None = None
+    # segment 内部可以安全保留的 token 数，只在 kv_segment_to_truncate 非空时使用。
+    kv_segment_keep_tokens: int = 0
 
     @classmethod
     def noop(
@@ -89,6 +128,7 @@ class PromptStreamMutation:
             num_tokens_to_invalidate=0,
             prompt_revision=prompt_revision,
         )
+
 
 @dataclass
 class PromptSourceState:
@@ -112,6 +152,7 @@ class PromptSourceState:
     #该来源最近一次事件到达时间。
     last_arrival_time: float
 
+
 @dataclass
 class PromptStreamState:
     """保存一个 Request 内部的多源流式 prompt 状态。"""
@@ -121,6 +162,8 @@ class PromptStreamState:
     sources: dict[str, PromptSourceState]
     # source 的稳定到达顺序；最终布局会按 source_type 再分段。
     source_order: list[str]
+    # 所有 Append source 按事件实际提交顺序形成的请求级单调 token 日志。
+    append_token_ids: list[int]
     # PROMPT_FINISHED 事件携带的最终用户问题 / prompt suffix。
     suffix_token_ids: list[int]
     # 请求级流式 prompt 是否结束。
@@ -131,6 +174,16 @@ class PromptStreamState:
     total_tokens_invalidated: int
     # 累计重算 token 数。
     total_tokens_recomputed: int
+    # prefix+append 物理域已经完成 prefill 的 token 数，包含尾部 padding。
+    prefix_append_num_computed_tokens: int = 0
+    # 当前 update 快照已经完成 prefill 的 token 数。
+    update_num_computed_tokens: int = 0
+    # 最终用户问题已经完成 prefill 的 token 数。
+    question_num_computed_tokens: int = 0
+    # scheduler 首次准备执行视图后记录的统一 block size。
+    block_size: int | None = None
+    # PREFIX_APPEND 尾部 padding 使用的确定性 token id。
+    padding_token_id: int = 0
 
 
 @dataclass(frozen=True)
@@ -145,16 +198,22 @@ class PromptStreamLayout:
     append_len: int
     update_len: int
     suffix_len: int
+    prefix_append_padding_len: int = 0
 
     @property
     def total_len(self) -> int:
-        """返回完整 prompt 的 token 数。"""
+        """返回不包含物理 padding 的逻辑 prompt token 数。"""
         return (
             self.prefix_len
             + self.append_len
             + self.update_len
             + self.suffix_len
         )
+
+    @property
+    def physical_total_len(self) -> int:
+        """返回 P/D transfer 使用的物理 prompt token 数。"""
+        return self.total_len + self.prefix_append_padding_len
 
 
 class Request:
@@ -302,6 +361,9 @@ class Request:
 
         # 流式 prefill 的长期状态。只有 scheduler 中的长期 Request 才应初始化。
         self.prompt_stream: PromptStreamState | None = None
+
+        # scheduler/worker 当前共同使用的物理 token 与 KV segment 视图。
+        self.prompt_stream_execution_view: PromptStreamExecutionView | None = None
 
         # prompt 发生真实变化后，worker 侧 cached request 需要刷新 token/block 状态。
         self.prompt_stream_needs_worker_refresh = False
@@ -458,12 +520,34 @@ class Request:
         Returns:
             如果 scheduler 可以进入 decode 阶段，返回 True。
         """
+        if self.prompt_stream is None:
+            return True
+        if not self.prompt_stream.finished:
+            return False
+        if self.prompt_stream.block_size is None:
+            return False
+
+        layout = self.get_prompt_stream_layout()
         return (
-            self.prompt_stream is None
-            or (
-                self.prompt_stream.finished
-                and self.num_computed_tokens >= self.num_prompt_tokens
-            )
+            self.prompt_stream.prefix_append_num_computed_tokens
+            >= layout.prefix_len
+            + layout.append_len
+            + layout.prefix_append_padding_len
+            and self.prompt_stream.update_num_computed_tokens >= layout.update_len
+            and self.prompt_stream.question_num_computed_tokens >= layout.suffix_len
+            and self.num_computed_tokens >= self.num_prompt_tokens
+        )
+
+    def should_discard_prompt_stream_sampled_tokens(self) -> bool:
+        """判断本轮采样结果是否只是中间 prefill 阶段的临时 logits。
+
+        REST 事件可以在 GPU 完成前连续到达。即使当前物理执行视图已经完成，
+        后面仍可能有 Update 或 Question 阶段等待计算；此时 worker 为简化
+        chunked prefill 而采样出的 token 必须在 scheduler 侧丢弃。
+        """
+        return (
+            self.prompt_stream is not None
+            and not self.can_decode_from_prompt_stream()
         )
 
     def get_prompt_stream_revision(self) -> int:
@@ -525,7 +609,7 @@ class Request:
         前这些 token 只是过早产生的临时结果，不能让它们阻止后续 append /
         update / finish 继续修改 prompt。
         """
-        if self.prompt_stream is None or self.prompt_stream.finished:
+        if self.prompt_stream is None or self.can_decode_from_prompt_stream():
             return
         if not self._output_token_ids:
             return
@@ -547,16 +631,24 @@ class Request:
     def _ensure_prompt_stream_state(self) -> PromptStreamState:
         """确保当前请求已经初始化流式 prompt 状态。"""
         if self.prompt_stream is None:
+            prefix_token_ids = self._current_prompt_token_ids()
             self.prompt_stream = PromptStreamState(
-                prefix_token_ids=self._current_prompt_token_ids(),
+                prefix_token_ids=prefix_token_ids,
                 sources={},
                 source_order=[],
+                append_token_ids=[],
                 suffix_token_ids=[],
                 finished=False,
                 revision=0,
                 total_tokens_invalidated=0,
                 total_tokens_recomputed=0,
+                prefix_append_num_computed_tokens=0,
+                update_num_computed_tokens=0,
+                question_num_computed_tokens=0,
+                padding_token_id=prefix_token_ids[-1] if prefix_token_ids else 0,
             )
+            # Segment KV 依赖事件到达时的上下文，不能复用普通全局 prefix cache。
+            self.skip_reading_prefix_cache = True
         return self.prompt_stream
 
     def _validate_prompt_stream_can_mutate(self, event: PromptStreamEvent) -> None:
@@ -659,15 +751,35 @@ class Request:
                 prompt_stream.revision,
             )
 
-        old_prompt_token_ids = self._current_prompt_token_ids()
+        old_prompt_token_ids = self._rebuild_prompt_from_stream_state()
+        old_prefix_append_len = self.get_prompt_stream_prefix_append_len()
+        old_prefix_append_num_computed_tokens = (
+            prompt_stream.prefix_append_num_computed_tokens
+        )
         source.token_ids.extend(event.token_ids or [])
+        # Append 的 KV 语义是请求级尾部追加。source.token_ids 负责来源级
+        # 去重和完成状态，物理顺序则必须使用全局事件提交顺序，不能按
+        # source 分组重排交错到达的 chunks。
+        prompt_stream.append_token_ids.extend(event.token_ids or [])
         source.version = max(source.version, event.version)
         source.next_sequence_no += 1
         source.last_arrival_time = event.arrival_time
         if event.chunk_id is not None:
             source.seen_chunk_ids.add(event.chunk_id)
 
-        return self._sync_prompt_from_stream_state(old_prompt_token_ids)
+        # 上一轮 block 对齐 padding 位于旧逻辑尾部。Append 到来后从旧逻辑
+        # 长度开始覆盖，因此只保留真正属于 prefix+append 的已计算 token。
+        prompt_stream.prefix_append_num_computed_tokens = min(
+            old_prefix_append_num_computed_tokens,
+            old_prefix_append_len,
+        )
+        mutation = self._sync_prompt_from_stream_state(old_prompt_token_ids)
+        mutation.num_tokens_to_invalidate = max(
+            0,
+            old_prefix_append_num_computed_tokens - old_prefix_append_len,
+        )
+        prompt_stream.total_tokens_invalidated += mutation.num_tokens_to_invalidate
+        return mutation
 
     def _apply_prompt_stream_update(
         self,
@@ -715,14 +827,10 @@ class Request:
             old_update_token_ids,
             new_update_token_ids,
         )
-        layout_before_update = self.get_prompt_stream_layout()
-        kv_cache_keep_token_len = (
-            layout_before_update.prefix_len
-            + layout_before_update.append_len
-            + update_common_prefix_len
+        old_prompt_token_ids = self._rebuild_prompt_from_stream_state()
+        old_update_num_computed_tokens = (
+            prompt_stream.update_num_computed_tokens
         )
-
-        old_prompt_token_ids = self._current_prompt_token_ids()
         source.token_ids = new_update_token_ids
         source.version = event.version
         source.next_sequence_no += 1
@@ -730,10 +838,21 @@ class Request:
         if event.chunk_id is not None:
             source.seen_chunk_ids.add(event.chunk_id)
 
-        return self._sync_prompt_from_stream_state(
-            old_prompt_token_ids,
-            kv_cache_keep_token_len=kv_cache_keep_token_len,
+        # Update 只在来源内部做 LCP。旧快照 LCP 之后的已计算进度立即回退，
+        # PREFIX_APPEND 域的进度和 blocks 完全不受影响。
+        prompt_stream.update_num_computed_tokens = min(
+            old_update_num_computed_tokens,
+            update_common_prefix_len,
         )
+        mutation = self._sync_prompt_from_stream_state(old_prompt_token_ids)
+        mutation.kv_segment_to_truncate = PromptStreamKVSegment.UPDATE
+        mutation.kv_segment_keep_tokens = update_common_prefix_len
+        mutation.num_tokens_to_invalidate = max(
+            0,
+            old_update_num_computed_tokens - update_common_prefix_len,
+        )
+        prompt_stream.total_tokens_invalidated += mutation.num_tokens_to_invalidate
+        return mutation
 
     def _mark_prompt_source_finished(
         self,
@@ -770,6 +889,11 @@ class Request:
         self._validate_prompt_stream_can_mutate(event)
         prompt_stream = self._ensure_prompt_stream_state()
         new_suffix_token_ids = list(event.token_ids or [])
+        if not new_suffix_token_ids:
+            raise ValueError(
+                "PROMPT_FINISHED must carry a non-empty final question for "
+                f"request_id={self.request_id}."
+            )
 
         if prompt_stream.finished:
             if prompt_stream.suffix_token_ids != new_suffix_token_ids:
@@ -782,9 +906,10 @@ class Request:
                 prompt_stream.revision,
             )
 
-        old_prompt_token_ids = self._current_prompt_token_ids()
+        old_prompt_token_ids = self._rebuild_prompt_from_stream_state()
         prompt_stream.suffix_token_ids = new_suffix_token_ids
         prompt_stream.finished = True
+        prompt_stream.question_num_computed_tokens = 0
         return self._sync_prompt_from_stream_state(old_prompt_token_ids)
 
     def _current_prompt_token_ids(self) -> list[int]:
@@ -799,12 +924,79 @@ class Request:
     ) -> list[int]:
         """按 source 到达顺序收集某个分段的 token。"""
         assert self.prompt_stream is not None
+        if source_type == PromptSourceType.APPEND:
+            return list(self.prompt_stream.append_token_ids)
+
         token_ids: list[int] = []
         for source_id in self.prompt_stream.source_order:
             source = self.prompt_stream.sources[source_id]
             if source.source_type == source_type:
                 token_ids.extend(source.token_ids)
         return token_ids
+
+    def get_prompt_stream_prefix_append_len(self) -> int:
+        """返回 prefix+append 段的逻辑 token 数。"""
+        if self.prompt_stream is None:
+            return self.num_prompt_tokens
+        append_len = len(
+            self._get_prompt_stream_segment_token_ids(PromptSourceType.APPEND)
+        )
+        return len(self.prompt_stream.prefix_token_ids) + append_len
+
+    def get_prompt_stream_update_len(self) -> int:
+        """返回 update 段的逻辑 token 数。"""
+        if self.prompt_stream is None:
+            return 0
+        return len(self._get_prompt_stream_segment_token_ids(PromptSourceType.UPDATE))
+
+    def get_prompt_stream_question_len(self) -> int:
+        """返回最终用户问题 / suffix 段的逻辑 token 数。"""
+        if self.prompt_stream is None:
+            return 0
+        return len(self.prompt_stream.suffix_token_ids)
+
+    def get_prompt_stream_segment_key(
+        self,
+        segment: PromptStreamKVSegment,
+    ) -> str:
+        """返回某个 KV segment 在 KV manager 中使用的 request key。
+
+        block 仍然归属于同一个逻辑 request_id，但 update 与后续 question
+        共用一个派生 key，避免和 prefix+append 段共用生命周期。
+        """
+        if segment == PromptStreamKVSegment.PREFIX_APPEND:
+            return self.request_id
+        return f"{self.request_id}::prompt_stream::{segment.value}"
+
+    def get_prompt_stream_required_segments(
+        self,
+    ) -> tuple[PromptStreamKVSegment, ...]:
+        """返回 worker 当前执行视图需要安装的 KV segment 顺序。"""
+        if self.prompt_stream_execution_view is None:
+            return ()
+        return self.prompt_stream_execution_view.required_segments
+
+    def get_prompt_stream_write_segment(self) -> PromptStreamKVSegment:
+        """返回当前 forward 应写入的物理 KV segment。"""
+        if self.prompt_stream_execution_view is None:
+            raise RuntimeError(
+                "Prompt stream execution view is not prepared for "
+                f"request_id={self.request_id}."
+            )
+        return self.prompt_stream_execution_view.write_segment
+
+    def get_prompt_stream_segment_num_computed_tokens(self) -> int:
+        """返回当前写入 segment 内部已经计算的 token 数。"""
+        if self.prompt_stream_execution_view is None:
+            raise RuntimeError(
+                "Prompt stream execution view is not prepared for "
+                f"request_id={self.request_id}."
+            )
+        return max(
+            0,
+            self.num_computed_tokens
+            - self.prompt_stream_execution_view.segment_offset,
+        )
 
     def get_prompt_stream_layout(self) -> PromptStreamLayout:
         """返回当前 prompt 在 KV cache 中应呈现的逻辑布局。
@@ -826,26 +1018,22 @@ class Request:
         update_token_ids = self._get_prompt_stream_segment_token_ids(
             PromptSourceType.UPDATE
         )
+        prefix_append_len = len(self.prompt_stream.prefix_token_ids) + len(
+            append_token_ids
+        )
+        padding_len = 0
+        if self.prompt_stream.block_size is not None and prefix_append_len > 0:
+            padding_len = (-prefix_append_len) % self.prompt_stream.block_size
         return PromptStreamLayout(
             prefix_len=len(self.prompt_stream.prefix_token_ids),
             append_len=len(append_token_ids),
             update_len=len(update_token_ids),
             suffix_len=len(self.prompt_stream.suffix_token_ids),
+            prefix_append_padding_len=padding_len,
         )
 
     def _rebuild_prompt_from_stream_state(self) -> list[int]:
-        """按近似注意力布局重建全局 prompt token 序列。
-
-        当前研究语义把 Append 和 Update 的 KV 分域理解为：
-
-        - Append 源稳定累积，先放在全局 prompt 中。
-        - Update 源按版本快照更新，放在 Append 源之后。
-        - PROMPT_FINISHED 携带最终用户问题，作为 suffix 放在最后。
-
-        因此 update 事件只会影响 update segment 的 KV；append 事件会扩展
-        append segment，并使后面的 update segment / suffix 需要基于新的
-        append KV 重新计算。
-        """
+        """重建不包含物理 padding 的最终逻辑 prompt。"""
         assert self.prompt_stream is not None
         prompt_token_ids = list(self.prompt_stream.prefix_token_ids)
         prompt_token_ids.extend(
@@ -856,6 +1044,276 @@ class Request:
         )
         prompt_token_ids.extend(self.prompt_stream.suffix_token_ids)
         return prompt_token_ids
+
+    def _get_prefix_append_physical_token_ids(self) -> list[int]:
+        """返回补齐到 block 边界的 PREFIX_APPEND 物理 token 序列。
+
+        第一版使用 prefix 最后一个 token 作为确定性 padding token。padding
+        会参与 attention，因此属于论文近似的一部分；后续可用显式 mask 或
+        finish-time KV compaction 消除这项误差。
+        """
+        assert self.prompt_stream is not None
+        if self.prompt_stream.block_size is None:
+            raise RuntimeError(
+                "Prompt stream block size has not been initialized for "
+                f"request_id={self.request_id}."
+            )
+
+        token_ids = list(self.prompt_stream.prefix_token_ids)
+        token_ids.extend(
+            self._get_prompt_stream_segment_token_ids(PromptSourceType.APPEND)
+        )
+        if token_ids:
+            num_padding_tokens = (-len(token_ids)) % self.prompt_stream.block_size
+            token_ids.extend(
+                [self.prompt_stream.padding_token_id] * num_padding_tokens
+            )
+        return token_ids
+
+    def get_prompt_stream_physical_prompt_token_ids(self) -> list[int]:
+        """返回 P/D transfer 必须共同使用的物理 prompt token 序列。"""
+        if self.prompt_stream is None:
+            return self._current_prompt_token_ids()
+        token_ids = self._get_prefix_append_physical_token_ids()
+        token_ids.extend(
+            self._get_prompt_stream_segment_token_ids(PromptSourceType.UPDATE)
+        )
+        token_ids.extend(self.prompt_stream.suffix_token_ids)
+        return token_ids
+
+    def _select_prompt_stream_execution_view(
+        self,
+    ) -> PromptStreamExecutionView:
+        """根据各分段目标和已提交进度选择下一阶段执行视图。"""
+        assert self.prompt_stream is not None
+        prefix_append_token_ids = self._get_prefix_append_physical_token_ids()
+        update_token_ids = self._get_prompt_stream_segment_token_ids(
+            PromptSourceType.UPDATE
+        )
+        question_token_ids = self.prompt_stream.suffix_token_ids
+        prefix_append_physical_len = len(prefix_append_token_ids)
+
+        # PREFIX_APPEND 始终具有最高优先级，保证快速到达的 Update/Finish
+        # 事件不能跳过尚未真正写入 GPU KV 的 append tokens。
+        if (
+            self.prompt_stream.prefix_append_num_computed_tokens
+            < prefix_append_physical_len
+        ):
+            return PromptStreamExecutionView(
+                phase=PromptStreamExecutionPhase.PREFIX_APPEND,
+                write_segment=PromptStreamKVSegment.PREFIX_APPEND,
+                required_segments=(PromptStreamKVSegment.PREFIX_APPEND,),
+                token_ids=tuple(prefix_append_token_ids),
+                num_computed_tokens=(
+                    self.prompt_stream.prefix_append_num_computed_tokens
+                ),
+                prefix_append_physical_len=prefix_append_physical_len,
+                segment_offset=0,
+            )
+
+        # Update delta 基于完整 PREFIX_APPEND KV 和 update 源内 LCP KV。
+        if self.prompt_stream.update_num_computed_tokens < len(update_token_ids):
+            execution_token_ids = prefix_append_token_ids + update_token_ids
+            return PromptStreamExecutionView(
+                phase=PromptStreamExecutionPhase.UPDATE,
+                write_segment=PromptStreamKVSegment.UPDATE,
+                required_segments=(
+                    PromptStreamKVSegment.PREFIX_APPEND,
+                    PromptStreamKVSegment.UPDATE,
+                ),
+                token_ids=tuple(execution_token_ids),
+                num_computed_tokens=(
+                    prefix_append_physical_len
+                    + self.prompt_stream.update_num_computed_tokens
+                ),
+                prefix_append_physical_len=prefix_append_physical_len,
+                segment_offset=prefix_append_physical_len,
+            )
+
+        # Question 与 Update 共用 UPDATE 物理域，避免制造第三个 partial-block
+        # 边界；它只会在前两阶段全部提交后开始计算。
+        if (
+            self.prompt_stream.finished
+            and self.prompt_stream.question_num_computed_tokens
+            < len(question_token_ids)
+        ):
+            execution_token_ids = (
+                prefix_append_token_ids + update_token_ids + question_token_ids
+            )
+            return PromptStreamExecutionView(
+                phase=PromptStreamExecutionPhase.QUESTION,
+                write_segment=PromptStreamKVSegment.UPDATE,
+                required_segments=(
+                    PromptStreamKVSegment.PREFIX_APPEND,
+                    PromptStreamKVSegment.UPDATE,
+                ),
+                token_ids=tuple(execution_token_ids),
+                num_computed_tokens=(
+                    prefix_append_physical_len
+                    + len(update_token_ids)
+                    + self.prompt_stream.question_num_computed_tokens
+                ),
+                prefix_append_physical_len=prefix_append_physical_len,
+                segment_offset=prefix_append_physical_len,
+            )
+
+        # 没有待计算阶段时保留完整度最高的视图。未封口请求不会继续 decode；
+        # 封口请求则从这个视图自然进入原有 decode catch-up 路径。
+        if update_token_ids or question_token_ids:
+            execution_token_ids = (
+                prefix_append_token_ids + update_token_ids + question_token_ids
+            )
+            phase = (
+                PromptStreamExecutionPhase.QUESTION
+                if self.prompt_stream.finished
+                else PromptStreamExecutionPhase.UPDATE
+            )
+            return PromptStreamExecutionView(
+                phase=phase,
+                write_segment=PromptStreamKVSegment.UPDATE,
+                required_segments=(
+                    PromptStreamKVSegment.PREFIX_APPEND,
+                    PromptStreamKVSegment.UPDATE,
+                ),
+                token_ids=tuple(execution_token_ids),
+                num_computed_tokens=len(execution_token_ids),
+                prefix_append_physical_len=prefix_append_physical_len,
+                segment_offset=prefix_append_physical_len,
+            )
+
+        return PromptStreamExecutionView(
+            phase=PromptStreamExecutionPhase.PREFIX_APPEND,
+            write_segment=PromptStreamKVSegment.PREFIX_APPEND,
+            required_segments=(PromptStreamKVSegment.PREFIX_APPEND,),
+            token_ids=tuple(prefix_append_token_ids),
+            num_computed_tokens=len(prefix_append_token_ids),
+            prefix_append_physical_len=prefix_append_physical_len,
+            segment_offset=0,
+        )
+
+    def prepare_prompt_stream_execution(self, block_size: int) -> bool:
+        """准备 scheduler/worker 下一轮共同使用的 segment 执行视图。
+
+        Args:
+            block_size: scheduler 使用的统一 KV block size。
+
+        Returns:
+            如果 token、计算位置或所需 block table 发生变化，返回 True。
+
+        Side Effects:
+            会刷新 Request 的普通调度字段，并要求 scheduler 通过
+            `NewRequestData` 完整覆盖 worker 的缓存请求状态。
+        """
+        prompt_stream = self._ensure_prompt_stream_state()
+        if block_size <= 0:
+            raise ValueError(
+                f"Prompt stream block_size must be positive: {block_size}."
+            )
+        if prompt_stream.block_size is None:
+            prompt_stream.block_size = block_size
+        elif prompt_stream.block_size != block_size:
+            raise ValueError(
+                "Prompt stream block size changed for "
+                f"request_id={self.request_id}: old={prompt_stream.block_size}, "
+                f"new={block_size}."
+            )
+
+        new_view = self._select_prompt_stream_execution_view()
+        if new_view == self.prompt_stream_execution_view:
+            return False
+        old_view = self.prompt_stream_execution_view
+        if (
+            old_view is not None
+            and old_view.phase == new_view.phase
+            and old_view.write_segment == new_view.write_segment
+            and old_view.required_segments == new_view.required_segments
+            and old_view.token_ids == new_view.token_ids
+            and old_view.prefix_append_physical_len
+            == new_view.prefix_append_physical_len
+            and old_view.segment_offset == new_view.segment_offset
+        ):
+            # 同一执行视图的 chunked prefill 只推进进度；cached request 路径
+            # 会收到新的 num_computed_tokens，无需重装 token 和 block table。
+            self.prompt_stream_execution_view = new_view
+            return False
+
+        # 中间阶段不允许携带上一个物理视图采样出的临时 output token。
+        if self._output_token_ids and not self.can_decode_from_prompt_stream():
+            self._output_token_ids.clear()
+            self.output_token_ids = ConstantList(self._output_token_ids)
+            self.spec_token_ids.clear()
+            self.num_output_placeholders = 0
+            self.async_tokens_to_discard = 0
+
+        self.prompt_stream_execution_view = new_view
+        self.prompt_token_ids = list(new_view.token_ids)
+        self._all_token_ids = self.prompt_token_ids + list(self._output_token_ids)
+        self.num_prompt_tokens = len(self.prompt_token_ids)
+        self.num_computed_tokens = new_view.num_computed_tokens
+        self.all_token_ids = ConstantList(self._all_token_ids)
+        self.output_token_ids = ConstantList(self._output_token_ids)
+        self.prompt_stream_needs_worker_refresh = True
+
+        # Prompt stream 不进入普通 prefix cache，但清空 hashes 可避免调试时
+        # 把旧的逻辑 prompt hash 误认为当前物理执行视图。
+        self.block_hashes.clear()
+        self._prompt_embeds_per_block_hashes.clear()
+        return True
+
+    def advance_prompt_stream_computed_tokens(self, num_scheduled_tokens: int) -> None:
+        """提交一轮 forward 完成的 segment 进度并推进全局计算位置。"""
+        if self.prompt_stream is None or self.prompt_stream_execution_view is None:
+            self.num_computed_tokens += num_scheduled_tokens
+            return
+        if num_scheduled_tokens <= 0:
+            raise ValueError(
+                "Prompt stream scheduled token count must be positive for "
+                f"request_id={self.request_id}: {num_scheduled_tokens}."
+            )
+
+        view = self.prompt_stream_execution_view
+        new_num_computed_tokens = self.num_computed_tokens + num_scheduled_tokens
+        if view.phase == PromptStreamExecutionPhase.PREFIX_APPEND:
+            self.prompt_stream.prefix_append_num_computed_tokens = min(
+                new_num_computed_tokens,
+                len(view.token_ids),
+            )
+        elif view.phase == PromptStreamExecutionPhase.UPDATE:
+            local_num_computed_tokens = max(
+                0,
+                new_num_computed_tokens - view.segment_offset,
+            )
+            self.prompt_stream.update_num_computed_tokens = min(
+                local_num_computed_tokens,
+                self.get_prompt_stream_update_len(),
+            )
+        else:
+            local_num_computed_tokens = max(
+                0,
+                new_num_computed_tokens
+                - view.segment_offset
+                - self.get_prompt_stream_update_len(),
+            )
+            self.prompt_stream.question_num_computed_tokens = min(
+                local_num_computed_tokens,
+                self.get_prompt_stream_question_len(),
+            )
+
+        self.num_computed_tokens = new_num_computed_tokens
+
+    def reset_prompt_stream_computed_state(self) -> None:
+        """在 preemption 后清空物理进度，但保留长期逻辑 source 状态。"""
+        if self.prompt_stream is None:
+            return
+        self.prompt_stream.prefix_append_num_computed_tokens = 0
+        self.prompt_stream.update_num_computed_tokens = 0
+        self.prompt_stream.question_num_computed_tokens = 0
+        self.prompt_stream_execution_view = None
+        self.prompt_stream_needs_worker_refresh = True
+        self._output_token_ids.clear()
+        self.output_token_ids = ConstantList(self._output_token_ids)
+        self.spec_token_ids.clear()
+        self.num_computed_tokens = 0
 
     @staticmethod
     def _get_common_prefix_len(
@@ -873,19 +1331,19 @@ class Request:
     def _sync_prompt_from_stream_state(
         self,
         old_prompt_token_ids: list[int],
-        kv_cache_keep_token_len: int | None = None,
     ) -> PromptStreamMutation:
-        """把 PromptStreamState 同步回 Request 的调度字段。
+        """提交逻辑 prompt revision，物理执行视图由 scheduler 后续准备。
 
         Args:
-            old_prompt_token_ids: 修改流式状态前的全局 prompt token。
-            kv_cache_keep_token_len: scheduler 可安全保留的全局 KV 前缀长度。
-                Append 和 PROMPT_FINISHED 可以直接使用全局 prompt LCP；Update
-                需要先计算 update source 内部 LCP，再加上 prefix/append 偏移。
+            old_prompt_token_ids: 修改流式状态前的逻辑 prompt token。
+
+        Returns:
+            本次逻辑变化的统计摘要。KV 截断边界由事件处理函数按 segment
+            单独填写，绝不回退到全局连续 prompt 截断。
         """
         assert self.prompt_stream is not None
         new_prompt_token_ids = self._rebuild_prompt_from_stream_state()
-        global_common_prefix_len = self._get_common_prefix_len(
+        common_prefix_len = self._get_common_prefix_len(
             old_prompt_token_ids,
             new_prompt_token_ids,
         )
@@ -894,48 +1352,18 @@ class Request:
                 self.num_prompt_tokens,
                 self.prompt_stream.revision,
             )
-
-        if kv_cache_keep_token_len is None:
-            common_prefix_len = global_common_prefix_len
-        else:
-            if kv_cache_keep_token_len > global_common_prefix_len:
-                raise ValueError(
-                    "Prompt stream KV keep boundary exceeds global prompt LCP "
-                    f"for request_id={self.request_id}: "
-                    f"keep={kv_cache_keep_token_len}, "
-                    f"global_lcp={global_common_prefix_len}."
-                )
-            common_prefix_len = kv_cache_keep_token_len
-
         old_num_prompt_tokens = len(old_prompt_token_ids)
-        old_num_computed_tokens = self.num_computed_tokens
-        num_tokens_to_invalidate = max(
-            0,
-            old_num_computed_tokens - common_prefix_len,
-        )
-
-        self.prompt_token_ids = new_prompt_token_ids
-        self._all_token_ids = new_prompt_token_ids.copy()
-        self.num_prompt_tokens = len(new_prompt_token_ids)
-        self.num_computed_tokens = min(
-            self.num_computed_tokens,
-            common_prefix_len,
-        )
         self.prompt_stream.revision += 1
-        self.prompt_stream.total_tokens_invalidated += num_tokens_to_invalidate
+        # 事件可能在 GPU forward 之前连续到达；执行视图由 scheduler 按
+        # PREFIX_APPEND -> UPDATE -> QUESTION 的提交进度动态选择。
         self.prompt_stream_needs_worker_refresh = True
-
-        if common_prefix_len < old_num_prompt_tokens:
-            self.block_hashes.clear()
-            self._prompt_embeds_per_block_hashes.clear()
-        self.update_block_hashes()
 
         return PromptStreamMutation(
             applied=True,
             old_num_prompt_tokens=old_num_prompt_tokens,
-            new_num_prompt_tokens=self.num_prompt_tokens,
+            new_num_prompt_tokens=len(new_prompt_token_ids),
             common_prefix_len=common_prefix_len,
-            num_tokens_to_invalidate=num_tokens_to_invalidate,
+            num_tokens_to_invalidate=0,
             prompt_revision=self.prompt_stream.revision,
         )
 

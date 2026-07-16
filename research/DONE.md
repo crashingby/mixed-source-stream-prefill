@@ -1,441 +1,586 @@
-# 流式 Prompt Prefill 当前实现说明
+# 流式 Prompt Prefill 当前实现
 
-这份文档记录当前分支已经实现的内容。重点不是历史讨论过程，而是说明现在代码里已经形成的边界、状态模型和调度路径。
+本文记录当前代码已经实现的行为。描述范围从 `EngineCoreRequest` 转成长期
+`Request` 开始，一直到 scheduler、worker KV block table、NIXL P/D transfer
+以及实验 proxy。
 
-当前实现已经把流式 prompt 的核心逻辑基本隔离到 `EngineCoreRequest -> Request` 之后：
+当前实现已经删除普通连续 prompt 的 KV fallback。只要一个请求进入
+prompt stream 模式，它就必须走 segment-aware 路径。
 
-- `EngineCoreRequest` 只负责携带一次入站事件。
-- `Request` 保存长期状态，并把多次事件合成为当前有效 prompt。
-- `Scheduler` 负责把事件应用到长期 `Request`，并根据变化释放失效 KV、刷新 worker 侧状态。
-- 前端如何构造事件、如何把 chunk 传进 engine，后续再设计。
+## 设计结论
 
-## 核心设计目标
-
-这个实现面向混合来源的流式 prefill，主要支持两类来源：
-
-- **Append source**：来源内容只追加，不修改过去已经提交的 token。
-- **Update source**：来源内容以快照方式更新，新版本可以替换上一版本的部分或全部 token。
-
-整体 prompt 的逻辑布局固定为：
+一个逻辑请求只拥有两个物理 KV 域：
 
 ```text
-prefix/template + append segment + update segment + suffix/user question
+request_id
+├── PREFIX_APPEND: prefix + 所有 append + block 对齐 padding
+└── UPDATE: 当前 update 快照 + 最终用户问题 + 后续 decode token
 ```
 
-在 P/D 分离语境下，P 节点最终传给 D 节点的 KV cache 也应该按照同样顺序理解：
+KV manager 内部使用两个 key：
 
-```text
-通用模板 KV + Append 部分 KV + Update 部分 KV + 用户问题 KV
-```
-
-这里需要特别注意：Update 部分的 prefill 是论文设计中的近似计算，不要求等价于完整 prompt 一次性 prefill。当前目标是先把状态管理、调度边界和 KV 释放路径搭起来。
-
-## 事件模型
-
-流式 prompt 的传输层事件定义在 `vllm/v1/engine/prompt_stream.py`。
-
-### `PromptStreamEventType`
-
-当前事件类型包括：
-
-- `APPEND`：某个来源追加一段 token。
-- `UPDATE`：某个来源提交一个新版本的完整 token 快照。
-- `SOURCE_FINISHED`：某个来源结束，不再发送新内容。
-- `PROMPT_FINISHED`：整个 prompt stream 封口，并携带最终用户问题。
-
-其中 `PROMPT_FINISHED = "prompt_finished"` 是请求级 barrier。它不是某个 source 的结束事件，而是表示最终用户问题已经到达，P 节点可以完成最后一段 prefill。
-
-### `PromptSourceType`
-
-当前来源语义只有两种：
-
-- `APPEND`：该 source 的 token 只能追加。
-- `UPDATE`：该 source 的 token 表示当前版本快照。
-
-source 创建后不能改变类型。如果同一个 `source_id` 先作为 Append 出现、后面又作为 Update 出现，`Request` 会报错。
-
-### `PromptStreamEvent`
-
-`PromptStreamEvent` 是一次入站事件，主要字段语义如下：
-
-| 字段 | 含义 |
-| --- | --- |
-| `request_id` | 事件所属请求。必须和长期 `Request.request_id` 一致。 |
-| `source_id` | 同一个请求内的来源实例，例如检索器、网页源、ANN source。 |
-| `event_type` | 本次事件是 append、update、source finished 还是 prompt finished。 |
-| `source_type` | source 采用 Append 还是 Update 语义；`PROMPT_FINISHED` 可以不依赖它。 |
-| `chunk_id` | 幂等键，用于避免重复应用同一个 chunk。 |
-| `version` | 来源内容版本；Update 用它过滤旧版本。 |
-| `sequence_no` | 来源内部的到达顺序，用于检测乱序或缺口。 |
-| `token_ids` | Append 的新增 token、Update 的完整快照，或 `PROMPT_FINISHED` 的最终用户问题。 |
-| `arrival_time` | 前端观察到内容可用的时间，用于后续调度和延迟分析。 |
-
-## EngineCoreRequest 的边界
-
-`EngineCoreRequest` 现在只增加了一个字段：
-
-```python
-prompt_stream_event: PromptStreamEvent | None = None
-```
-
-这个字段的定位很轻：
-
-- 普通请求保持为 `None`。
-- 流式 prompt 的后续事件通过这个字段进入 engine core。
-- `EngineCoreRequest` 不保存长期流式状态。
-- `EngineCoreRequest` 不负责判断 Append / Update 怎么改 prompt。
-
-真正的状态管理从 `Request.from_engine_core_request()` 之后开始。
-
-## Request 的长期状态
-
-`Request` 现在是流式 prompt 的长期状态持有者。它不是单次事件，而是 scheduler 里持续存在的请求对象。
-
-新增的关键字段包括：
-
-- `prompt_stream_event`：本次从 `EngineCoreRequest` 转来的入站事件。对于长期 Request，事件被应用后会清空。
-- `prompt_stream`：长期流式 prompt 状态，类型是 `PromptStreamState | None`。
-- `prompt_stream_needs_worker_refresh`：当 prompt token 或 block 状态发生变化时，要求 scheduler 刷新 worker 侧 cached request 数据。
-
-### `PromptStreamState`
-
-`PromptStreamState` 保存一个请求内所有流式 source 的当前状态：
-
-| 字段 | 含义 |
-| --- | --- |
-| `prefix_token_ids` | 流式 source 之前的固定 prompt，例如 system prompt 或通用模板。 |
-| `sources` | `source_id -> PromptSourceState` 的映射。 |
-| `source_order` | source 首次出现顺序；重建 prompt 时按类型分段后仍保持各段内部稳定顺序。 |
-| `suffix_token_ids` | `PROMPT_FINISHED` 携带的最终用户问题。 |
-| `finished` | 请求级 prompt stream 是否已经封口。 |
-| `revision` | prompt 每次真实变化后递增。 |
-| `total_tokens_invalidated` | 累计失效 token 数。 |
-| `total_tokens_recomputed` | 预留统计字段，目前还没有完整维护。 |
-
-### `PromptSourceState`
-
-每个 source 的状态保存在 `PromptSourceState` 中：
-
-- `source_id`：来源 ID。
-- `source_type`：Append 或 Update。
-- `token_ids`：该来源当前有效 token。
-- `version`：当前有效版本。
-- `next_sequence_no`：下一条期望到达的序号。
-- `seen_chunk_ids`：已经应用过的 chunk，用于去重。
-- `pending_events`：乱序到达但暂时不能应用的事件。
-- `finished`：该 source 是否结束。
-- `last_arrival_time`：最近一次事件到达时间。
-
-当前 `pending_events` 只是暂存乱序事件，尚未实现自动补洞消费。
-
-### `PromptStreamLayout`
-
-`PromptStreamLayout` 用于显式描述当前 prompt 在 KV cache 中的逻辑分段：
-
-```python
-@dataclass(frozen=True)
-class PromptStreamLayout:
-    prefix_len: int
-    append_len: int
-    update_len: int
-    suffix_len: int
-```
-
-`Request.get_prompt_stream_layout()` 返回四段长度。后续接 P/D transfer 时，可以用它把 KV cache 的逻辑边界传给 connector 或 debug 工具。
-
-## Request 如何应用事件
-
-Scheduler 面向流式 prompt 的统一入口是：
-
-```python
-Request.apply_prompt_stream_event(event)
-```
-
-它根据 `event.event_type` 分发到不同处理函数：
-
-| 事件 | 处理函数 | 主要行为 |
+| 物理域 | KV manager key | 生命周期 |
 | --- | --- | --- |
-| `APPEND` | `_apply_prompt_stream_append()` | 追加该 source 的 token。 |
-| `UPDATE` | `_apply_prompt_stream_update()` | 用新快照替换该 update source 的 token。 |
-| `SOURCE_FINISHED` | `_mark_prompt_source_finished()` | 标记单个 source 结束。 |
-| `PROMPT_FINISHED` | `_mark_prompt_stream_finished()` | 写入最终用户问题，并封口整个 prompt stream。 |
+| `PREFIX_APPEND` | 原始 `request_id` | prefix 固定，append 只在尾部增长。 |
+| `UPDATE` | `request_id::prompt_stream::update` | update 后缀可失效；问题和 decode 接在其后。 |
 
-所有会修改 prompt 的事件都会先经过 `_validate_prompt_stream_can_mutate()` 校验。
+Question 不再单独使用第三个 key。这样只有 `PREFIX_APPEND -> UPDATE` 一个
+物理边界，Update 与 Question 之间可以沿用普通连续 block 分配。
 
-当前校验规则是：
+## 当前 KV Cache block 管理总览
 
-- 已经生成 output token 后，不能再修改 prompt。
-- 当前只支持 token-id prompt，不支持 prompt embeds 或 mixed token/embed 输入。
-- `APPEND`、`UPDATE`、`PROMPT_FINISHED` 必须携带 `token_ids`。
-
-## Append 语义
-
-Append 事件表示某个 source 新增了一段 token。
-
-当前行为是：
-
-- 如果 prompt stream 已经 `finished`，拒绝追加。
-- 如果 source 已经 `finished`，拒绝追加。
-- 如果 `chunk_id` 已经出现过，返回 no-op，避免重复应用。
-- 如果 `sequence_no` 不是期望值，把事件放入 `pending_events`，暂不应用。
-- 否则把 `event.token_ids` 追加到该 source 的 `token_ids` 后面。
-
-Append 应用后会调用 `_sync_prompt_from_stream_state()`，把新的流式状态同步回 `Request.prompt_token_ids` 和 `_all_token_ids`。
-
-## Update 语义
-
-Update 事件表示某个 source 当前版本的完整快照。
-
-当前行为是：
-
-- MVP 阶段最多只允许一个 Update source。
-- 如果 prompt stream 已经 `finished`，拒绝更新。
-- 如果 source 已经 `finished`，拒绝更新。
-- 如果 `chunk_id` 已经出现过，返回 no-op。
-- 如果 `sequence_no` 不是期望值，把事件放入 `pending_events`，暂不应用。
-- 如果 `version` 小于当前版本，认为是旧事件，返回 no-op。
-- 如果 `version` 相同但 token 内容不同，认为是冲突事件，直接报错。
-- 否则用 `event.token_ids` 替换该 update source 的 `token_ids`。
-
-Update 应用前会先比较旧 update 快照和新 update 快照，得到 **update 源内 LCP**。
-然后把这个局部 LCP 加上 `prefix_len + append_len`，转换成 scheduler 可以使用的全局 KV 保留边界。
-最后再触发 `_sync_prompt_from_stream_state()`。
-
-## PROMPT_FINISHED 语义
-
-`PROMPT_FINISHED` 是整个 prompt stream 的封口事件。
-
-它的 `token_ids` 被解释为最终用户问题，写入：
-
-```python
-PromptStreamState.suffix_token_ids
-```
-
-当前行为是：
-
-- 如果还没有 `PromptStreamState`，先初始化。
-- 如果 prompt stream 尚未 finished，写入 suffix，设置 `finished=True`，然后同步 prompt。
-- 如果 prompt stream 已经 finished 且 suffix 完全一致，返回 no-op。
-- 如果 prompt stream 已经 finished 但 suffix 不一致，报错，避免同一个请求被两个不同最终问题封口。
-
-这个事件到达后，scheduler 不会立刻跳过最终用户问题。它只是解除“不能 decode”的 barrier；最终用户问题仍然需要被 prefill 完，之后才会自然进入首 token decode。
-
-## Prompt 重建和 revision
-
-每次 Append、Update 或 PROMPT_FINISHED 改变有效 token 后，Request 会调用：
-
-```python
-_sync_prompt_from_stream_state(old_prompt_token_ids)
-```
-
-同步流程是：
-
-1. 用 `_rebuild_prompt_from_stream_state()` 重建全局 prompt。
-2. 计算或接收 scheduler 可安全保留的全局 KV 前缀长度 `common_prefix_len`。
-   - Append 和 `PROMPT_FINISHED` 使用旧全局 prompt 与新全局 prompt 的 LCP。
-   - Update 使用 update 源内 LCP，再加上 `prefix_len + append_len` 偏移。
-3. 如果 token 序列没有变化，返回 `PromptStreamMutation.noop()`。
-4. 如果发生变化，更新：
-   - `prompt_token_ids`
-   - `_all_token_ids`
-   - `num_prompt_tokens`
-   - `num_computed_tokens`
-   - `prompt_stream.revision`
-   - `prompt_stream.total_tokens_invalidated`
-   - `prompt_stream_needs_worker_refresh`
-5. 如果公共前缀短于旧 prompt，清空 `block_hashes` 和 `_prompt_embeds_per_block_hashes`，然后重新计算 block hashes。
-
-重建 prompt 的固定顺序是：
+当前实现的核心选择是：**逻辑上有 prefix、append、update、question 四段，
+物理 KV block 只分成两个域**。这样做是为了让 Append 可以持续尾部增长，同时让
+Update 有独立的失效边界。
 
 ```text
-prefix_token_ids
-+ 所有 Append source token_ids
-+ 所有 Update source token_ids
-+ suffix_token_ids
+逻辑 prompt:
+prefix + append + update + question
+
+物理 KV:
+PREFIX_APPEND blocks = prefix + append + padding
+UPDATE blocks        = update + question + decode
 ```
 
-这就是当前 Request 侧和后续 D 节点 KV 排布需要对齐的逻辑顺序。
+两个物理域仍然归属于同一个长期请求，但在 KV manager 内部使用不同 key 管理：
 
-## PromptStreamMutation
+- **`PREFIX_APPEND` 使用原始 `request_id`**：prefix 固定，append 只允许尾部追加。
+  这个域的 block 不会因为 Update 改变而释放。
+- **`UPDATE` 使用派生 key `request_id::prompt_stream::update`**：Update 快照变化时，
+  只在这个域里按 source-local LCP 截断；Question 和后续 decode token 也接在这个域后面。
 
-`PromptStreamMutation` 是 Request 返回给 scheduler 的变化摘要。
+申请 block 时使用 **segment-local 坐标**。例如 Append 阶段只看
+`PREFIX_APPEND` 当前长度和已计算进度；Update 阶段只看 Update 域当前已经保留了
+多少 token 的 KV。worker 真正执行时，再由 scheduler 拼出本轮需要安装的完整
+block table。
 
-它包含：
+### Append 阶段的 block 管理
 
-| 字段 | 含义 |
-| --- | --- |
-| `applied` | 事件是否真实改变了 prompt。 |
-| `old_num_prompt_tokens` | 修改前 prompt 长度。 |
-| `new_num_prompt_tokens` | 修改后 prompt 长度。 |
-| `common_prefix_len` | scheduler 可安全保留的全局 KV 前缀长度。Update 场景下它等于 `prefix_len + append_len + update_source_lcp`。 |
-| `num_tokens_to_invalidate` | 已经 prefill 过但现在失效的 token 数。 |
-| `prompt_revision` | 修改后的 prompt revision。 |
-
-Scheduler 不需要理解 Append / Update 的内部细节，只需要根据这个 mutation 判断是否释放 KV、是否刷新 worker 侧缓存。
-
-## Scheduler 如何接收流式事件
-
-`Scheduler.add_request()` 现在区分两种情况。
-
-### 已存在长期 Request
-
-如果同一个 `request_id` 已经在 `self.requests` 里，并且新来的临时 `Request` 带有 `prompt_stream_event`：
-
-```python
-self._apply_prompt_stream_request(existing, request)
-return
-```
-
-这里的关键点是：
-
-- `incoming Request` 只是事件载体。
-- `existing Request` 才保存长期状态。
-- 事件应用完成后，`incoming.prompt_stream_event` 会被清空。
-
-这就是当前实现中 “EngineCoreRequest 之后隔离” 的主要边界。
-
-### 第一次进入 scheduler 的 Request
-
-如果 `request_id` 还不存在，但这个 Request 自带 `prompt_stream_event`：
-
-- scheduler 会先在这个 Request 上应用该事件。
-- 然后清空 `request.prompt_stream_event`。
-- 再把这个 Request 放入 waiting queue，并登记到 `self.requests`。
-
-这使得第一条事件也能初始化长期 `PromptStreamState`。
-
-## Scheduler 的 decode barrier
-
-流式 prompt 请求在 `PROMPT_FINISHED` 前不能进入 decode。
-
-对应逻辑在：
-
-```python
-Scheduler._cap_prompt_stream_num_new_tokens(request, num_new_tokens)
-```
-
-行为是：
-
-- 普通请求不受影响。
-- 已经 `PROMPT_FINISHED` 且 prompt token 已经 prefill 完的请求不裁剪。
-- 未封口的流式 prompt 请求，只允许调度剩余 prompt token。
-- 如果 prompt token 已经 prefill 到当前末尾，但还没收到 `PROMPT_FINISHED`，本轮调度 token 数会变成 0，从而等待最终用户问题。
-
-对应的 Request 判断函数是：
-
-```python
-Request.is_prompt_stream_finished()
-```
-
-它要求同时满足：
-
-- `prompt_stream.finished == True`
-- `num_computed_tokens >= num_prompt_tokens`
-
-因此 `PROMPT_FINISHED` 到达后，suffix 仍然会被正常 prefill；只有 suffix 也完成后，才允许进入 decode。
-
-## KV cache 失效路径
-
-当 Request 应用事件后返回的 `PromptStreamMutation.num_tokens_to_invalidate > 0`，scheduler 会调用：
-
-```python
-self.kv_cache_manager.truncate_blocks_from_position(
-    existing,
-    mutation.common_prefix_len,
-)
-```
-
-当前新增了三层接口：
+Append 阶段只写 `PREFIX_APPEND` 域：
 
 ```text
-KVCacheManager.truncate_blocks_from_position(request, keep_tokens)
-KVCacheCoordinator.truncate_blocks_from_position(request_id, keep_tokens)
-SingleTypeKVCacheManager.truncate_blocks_from_position(request_id, keep_tokens)
+worker token view  = PA_physical
+worker block table = PREFIX_APPEND blocks
+write segment      = PREFIX_APPEND
 ```
 
-含义是：保留 `keep_tokens` 对应的安全前缀，释放之后的 KV blocks。
-
-需要注意：KV cache 是 block 粒度管理的，所以 `SingleTypeKVCacheManager` 会根据 block size 向上取整保留 block。这意味着当前是 block 级截断，不是精确 token 级截断。
-
-## Worker 侧 cached request 刷新
-
-Prompt 改变后，Request 会设置：
-
-```python
-prompt_stream_needs_worker_refresh = True
-```
-
-`Scheduler._make_cached_request_data()` 会检查这个标志：
-
-- 把该 request 加入 `resumed_req_ids`。
-- 重新发送完整 `all_token_ids`。
-- 如果需要，重新获取当前 block ids。
-- 发送完后清掉 `prompt_stream_needs_worker_refresh`。
-
-这样 worker 侧不会继续使用旧 prompt token 或旧 block table。
-
-## 当前实现的近似语义
-
-当前代码在 token 序列层面使用统一布局：
+其中：
 
 ```text
-prefix + append + update + suffix
+PA_physical = prefix + append + padding
 ```
 
-Update 快照变化时，当前实现不再直接用全局 prompt LCP 推导失效边界，而是先计算：
+`padding` 是为了让 `PREFIX_APPEND` 的物理长度按 block size 对齐。这样 finish
+时把 `PREFIX_APPEND blocks + UPDATE blocks` 直接交给 D 节点时，D 侧普通连续
+block table 的位置计算不会把 Update 的第一个 token 落到 PA 的半空 block 里。
+
+如果 Append 又来了新 chunk：
+
+- 旧的 PA 逻辑 token 对应的 KV 保留。
+- 旧 PA 尾部 padding 会被新的 append token 覆盖。
+- 如果当前 PA blocks 容量不够，KV manager 继续给原始 `request_id` 申请新 block。
+- 已经存在的 Update blocks 不释放、不重算，也不会出现在 Append 阶段的 worker view。
+
+因此 Append-after-Update 的当前语义是：**Append 只推进 PA 域，Update 域保持原样**。
+这符合本项目当前的近似设计，但不是严格完整 prompt 重算。
+
+### Update 阶段的 block 管理
+
+Update 阶段写 `UPDATE` 域，但读取两个域：
 
 ```text
-update_source_lcp = LCP(old_update_source_tokens, new_update_source_tokens)
+worker token view  = PA_physical + U_new
+worker block table = PREFIX_APPEND blocks + UPDATE blocks
+write segment      = UPDATE
 ```
 
-然后转换成全局 KV 保留边界：
+Update 的复用边界只由 Update source 内部决定：
 
 ```text
-common_prefix_len = prefix_len + append_len + update_source_lcp
+L = LCP(U_old, U_new)
+C_U = min(旧 Update 已计算进度, L)
 ```
 
-这样 scheduler 仍然只需要处理一个全局 token 位置，但这个位置的来源语义是 **update 源内 LCP**。
+事件到达后：
 
-当前仍然没有专门的 attention mask、分段 block table 或显式 KV segment metadata 来表达 Append / Update 的物理分域。因此现在可以认为：**Update 的失效边界已经按源内 LCP 计算，但物理 KV 分域仍是 MVP 近似实现**。
+- `PREFIX_APPEND` 的 blocks 和进度不变。
+- `UPDATE` 域的已提交进度回退到 `C_U`。
+- KV manager 只截断 `request_id::prompt_stream::update` 在 `L` 之后的 blocks。
+- 下一轮 prefill 从 `U_new[C_U:]` 开始，前缀 KV 是 `PA_physical KV + U_new[:C_U] KV`。
 
-## 当前已经完成的边界
+这里的 `L` 是语义上允许保留的最长前缀，`C_U` 是实际上已经写入 KV 的安全复用进度。
+如果旧 Update 还没算完，即使 LCP 更长，也不能跳过尚未真实写入的 KV。
 
-已经完成的部分包括：
+### Question 和 decode 的 block 管理
 
-- `EngineCoreRequest` 增加 `prompt_stream_event`，作为一次事件入口。
-- `Request.from_engine_core_request()` 把事件转入 Request。
-- `Request` 保存长期 `PromptStreamState`。
-- `Request` 支持 Append、Update、Source Finished 和 Prompt Finished 四类事件。
-- `PROMPT_FINISHED` 会把最终用户问题写入 suffix。
-- `Request` 会把流式状态重建为统一 prompt token 序列。
-- `PromptStreamMutation` 把 prompt 变化摘要返回给 scheduler；Update 场景下其 `common_prefix_len` 来自 update 源内 LCP 加全局偏移。
-- scheduler 会把重复 `request_id` 的流式事件应用到长期 Request。
-- scheduler 在 prompt stream 封口前阻止提前 decode。
-- scheduler 会根据公共前缀释放失效 KV blocks。
-- worker cached request 会在 prompt 改变后刷新。
-- `Request.get_prompt_stream_layout()` 已经提供四段逻辑长度，供后续 P/D transfer 接入。
+`PROMPT_FINISHED` 到达后，Question 不创建第三个物理域，而是追加到 `UPDATE`
+域后面：
 
-## 当前还没有完成的部分
+```text
+worker token view  = PA_physical + U + Q
+worker block table = PREFIX_APPEND blocks + UPDATE blocks
+write segment      = UPDATE
+```
 
-后续仍需要继续设计或实现：
+Question prefill 完成后，P 节点会采样出唯一的首 token。这个 token 属于后续
+decode 序列；如果它已经在 P 侧经过下一轮 forward，`remote_num_tokens` 可以覆盖
+它的 KV。如果还没有，D 节点会把这个 token 放在自己的 prompt 尾部并本地 forward。
+proxy 当前允许这两种合法范围：
 
-- **前端事件入口**：还没有定义外部 API 如何把 chunk、source、version 和最终用户问题转成 `PromptStreamEvent`。
-- **乱序事件消费**：`pending_events` 目前只暂存乱序事件，还不会在缺口补齐后自动应用。
-- **多 Update source**：当前明确限制最多一个 Update source。
-- **精确 KV 分域**：目前是 block 级 LCP 截断，还没有真正表达 Append KV 和 Update KV 的物理分区。
-- **P/D transfer 扩展**：还没有把 `PromptStreamLayout` 写入 `kv_transfer_params` 或 connector 协议。
-- **测试用例**：还需要补 Append、Update、PROMPT_FINISHED、KV 截断和 decode barrier 的单元测试 / 集成测试。
-- **统计字段**：`total_tokens_recomputed` 目前是预留字段，还没有系统维护。
-- **prompt embeds 支持**：当前流式 prompt mutation 只支持 token-id prompt。
+```text
+physical_prompt_len <= remote_num_tokens <= physical_prompt_len + 1
+```
 
-## 推荐的下一步
+### finish 时交给 D 的 block 顺序
 
-比较自然的下一步是先补最小测试，而不是马上改前端：
+P 节点 finish 时导出的远端 block ids 固定按下面顺序拼接：
 
-- 构造一个 Request，连续应用 Append 事件，确认 prompt 按 append segment 增长。
-- 构造一个 Update source，提交两个版本，确认 update 源内 LCP、全局 KV 保留边界和 `num_tokens_to_invalidate` 正确。
-- 发送 `PROMPT_FINISHED`，确认最终用户问题进入 suffix。
-- 在 scheduler 层模拟重复 `request_id` 的事件进入，确认长期 Request 被更新，临时 Request 不保留状态。
-- 检查 `PROMPT_FINISHED` 前不会进入 decode，`PROMPT_FINISHED` 后 suffix prefill 完才允许 decode。
+```text
+remote_block_ids = PREFIX_APPEND block ids + UPDATE block ids
+```
 
-这些测试能先保护当前边界，然后再继续设计前端 chunk API 和 P/D transfer metadata。
+此时 `UPDATE blocks` 已经包含：
+
+```text
+当前 Update 快照 + Question + 可能已经 forward 的 P 首 token KV
+```
+
+scheduler 会在调用 connector 前校验：
+
+```text
+len(remote_block_ids[group]) == ceil(num_computed_tokens / block_size)
+```
+
+如果两个 segment 拼起来不能形成 D 侧可解释的连续物理 block table，会直接失败，
+不会把错位 block ids 交给 NIXL。
+
+## 逻辑状态和执行状态已经分离
+
+`PromptStreamState` 保存长期逻辑事实：
+
+- 固定 `prefix_token_ids`。
+- 每个 Append / Update source 的当前 token、版本、序号和去重状态。
+- 所有 Append source 共享一条按事件提交顺序增长的请求级 token 日志；交错
+  到达的 source 不会在重建 prompt 时被重新分组。
+- 最终用户问题 `suffix_token_ids`。
+- 请求是否收到 `PROMPT_FINISHED`。
+- `PREFIX_APPEND`、Update 和 Question 各自真正完成 prefill 的进度。
+
+`PromptStreamExecutionView` 保存 worker 本轮必须共同使用的执行事实：
+
+- 当前阶段是 `PREFIX_APPEND`、`UPDATE` 还是 `QUESTION`。
+- 本轮写入哪个物理 KV 域。
+- worker 需要安装哪些 segment block table。
+- worker 本轮看到的完整物理 token ids。
+- 本轮开始前的 `num_computed_tokens`。
+- `UPDATE` 域在全局物理序列中的起点。
+
+这两个对象不能合并。逻辑 prompt 始终是：
+
+```text
+prefix + append + update + question
+```
+
+物理执行 prompt 则可能包含对齐 padding，并且 Append 事件期间不会把已有
+Update token 放进本轮 worker view。
+
+## 为什么要有阶段状态机
+
+REST `/event` 是 ack 接口。前端可以在 GPU 尚未完成一次 prefill 时连续发送：
+
+```text
+start -> append 0 -> append 1 -> update -> finish
+```
+
+因此不能用“最后收到的事件”直接覆盖一个 active view。当前 scheduler 每轮
+都根据目标长度和已提交进度选择第一个未完成阶段：
+
+```text
+PREFIX_APPEND -> UPDATE -> QUESTION -> DECODE
+```
+
+这保证即使 `finish` 最先进入 EngineCore 队列，Question 也不会把尚未计算的
+Append 或 Update 当作现成 KV 前缀。
+
+中间阶段结束时，worker 为简化 chunked prefill 可能仍计算 logits。scheduler
+会丢弃这些临时 sampled tokens；只有 Question 也完成后，采样结果才作为真正
+decode 输出。
+
+## PREFIX_APPEND 的 block 对齐
+
+两组独立 block id 不能无条件直接拼接。设 block size 为 16，
+`PREFIX_APPEND` 有 19 个 token。如果直接使用：
+
+```text
+[PA block 0, PA block 1, UPDATE block 0]
+```
+
+全局位置 19 仍会映射到 block table 下标 1，而不是 `UPDATE block 0`。
+
+当前第一版使用显式物理 padding 解决这个问题：
+
+```text
+PA_physical = prefix + append + padding
+len(PA_physical) % block_size == 0
+```
+
+padding token id 在 Request 初始化时确定：
+
+- prefix 非空时，复用 prefix 最后一个 token id。
+- prefix 为空时，使用 token id 0。
+
+padding 会真正完成 prefill，也会参与 attention。因此它是当前近似计算的一部分，
+不是严格等价的 attention mask。后续若要消除这项误差，需要实现以下方案之一：
+
+- attention mask 能跳过物理 padding。
+- finish 时把两段 KV compact/copy 成严格连续 blocks。
+- attention backend 原生支持 segment offset。
+
+## Append 事件如何计算
+
+设：
+
+```text
+P = 固定 prefix
+A_old = 之前已经到达的 append tokens
+A_new = 本次新增 chunk
+U = 当前 update 快照
+C_PA = min(旧 PA 已计算进度, len(P + A_old))
+```
+
+`A_old` 使用全局事件提交顺序，而不是先按 source 分组再拼接。否则
+`A -> B -> A` 会把最后一个 A chunk 插回 B 之前，破坏“只在尾部追加”和旧
+KV 可保留的前提。
+
+Append 的逻辑目标变成：
+
+```text
+P + A_old + A_new
+```
+
+本轮 worker 执行视图是：
+
+```text
+token ids          = P + A_old + A_new + 新 padding
+num_computed       = C_PA
+worker block table = PREFIX_APPEND blocks
+write segment      = PREFIX_APPEND
+```
+
+需要 prefill 的 token 是：
+
+```text
+(P + A_old + A_new + 新 padding)[C_PA:]
+```
+
+本次可见的 KV 前缀是：
+
+```text
+(P + A_old)[:C_PA] 对应的 PA KV
+```
+
+如果旧 PA 已经全部提交，`C_PA = len(P + A_old)`，上述公式才简化成“只计算
+`A_new + 新 padding`，并读取完整 `P KV + A_old KV`”。如果多个事件在 GPU
+完成前快速到达，scheduler 会先补齐尚未提交的旧 PA token，不能把它们误认为
+已经存在的 KV。
+
+如果上一轮 PA 末尾已有旧 padding，本次从旧逻辑尾部开始覆盖它。KV manager
+只在 PA 容量不足时继续申请新 blocks。
+
+已经存在的 Update blocks 不释放、不重算，也不放进本次 Append worker view。
+这正是当前论文原型要求的近似语义。
+
+## Update 事件如何计算
+
+当前只支持一个 Update source。设：
+
+```text
+U_old = 上一版本 update token ids
+U_new = 本次完整快照
+L = LCP(U_old, U_new)
+C_U = min(旧 Update 已计算进度, L)
+```
+
+LCP 只在 Update source 内计算：
+
+```text
+L = source_local_lcp(U_old, U_new)
+```
+
+它不包含 prefix，也不包含 Append。
+
+事件到达后：
+
+1. Update 已提交进度回退到 `C_U`。
+2. KV manager 只截断 `UPDATE` key 在 `L` 之后的 blocks。
+3. `PREFIX_APPEND` blocks 和进度保持不变。
+
+本轮 worker 执行视图是：
+
+```text
+token ids          = PA_physical + U_new
+num_computed       = len(PA_physical) + C_U
+worker block table = PREFIX_APPEND blocks + UPDATE blocks
+write segment      = UPDATE
+```
+
+本次需要 prefill 的 tokens 是：
+
+```text
+U_new[C_U:]
+```
+
+它使用的 KV 前缀是：
+
+```text
+PA_physical KV + U_new[:C_U] KV
+```
+
+这里 `L` 是 Update 域允许保留的语义上界，`C_U` 才是已经真实写入 KV、可以
+直接复用的进度。如果旧版本只完成了一部分 prefill，即使这一部分都落在 LCP
+内，也只能从实际完成位置继续计算。
+
+普通全局 `truncate_blocks_from_position(request_id, global_lcp)` fallback 已经
+完全删除。即使 Update 当前还没有 blocks，截断也只会对派生 Update key 做
+no-op，不会触碰 PA。
+
+## PROMPT_FINISHED 如何计算用户问题
+
+`PROMPT_FINISHED` 携带最终用户问题 `Q`。它只是请求级输入 barrier，不会跳过
+前面尚未完成的阶段。当前接口要求 `Q` 至少包含一个 token；空 Question 不会
+产生 final forward，容易在之前的临时 sampled token 已丢弃后形成时序相关卡死，
+因此直接 fail closed。
+
+只有 PA 和 Update 都提交后，Question 才进入 worker：
+
+```text
+token ids          = PA_physical + U + Q
+num_computed       = len(PA_physical) + len(U)
+worker block table = PREFIX_APPEND blocks + UPDATE blocks
+write segment      = UPDATE
+```
+
+因此 Question KV 直接追加在 Update blocks 后面，不建立第三个物理域。
+
+Question 完成后，decode barrier 才打开。判断条件不再只看一个全局计数，而是
+同时检查：
+
+- `PREFIX_APPEND` 物理 token 全部提交。
+- 当前 Update 快照全部提交。
+- Question 全部提交。
+- 当前物理 prompt 已全部完成 prefill。
+
+## Append 在 Update 之后到达
+
+如果 Update 已经计算完，又到达 Append chunk，行为如下：
+
+1. worker 暂时切回只包含 `PREFIX_APPEND` 的执行视图。
+2. 从旧 PA 的逻辑尾部覆盖 padding，计算新 Append 与新 padding。
+3. Update blocks 原样保留。
+4. 后续 Update 变化或 Question 到达时，再安装 `PA + UPDATE` 完整 block table。
+
+这意味着旧 Update KV 不会因为 Append 增长而重算。它仍编码计算当时看到的
+PA 上下文和位置，最终却被拼到最新 PA 后面。这是本项目明确选择的近似注意力
+语义，不是标准完整 prompt prefill 的严格等价结果。
+
+## KVCacheManager 已实现的行为
+
+prompt stream 使用专门的 segment allocator：
+
+- 分配时使用当前 write segment 的派生 key。
+- token 数和已计算进度都使用 segment-local 坐标。
+- allocator 返回本轮新申请的 blocks。
+- scheduler 在 worker phase 切换时另外读取完整 execution blocks。
+- Update 截断只操作 Update key。
+- abort / finish 会释放两个 key。
+- preemption 会释放两个域，并把物理进度清零；长期 source 状态保留，之后按
+  `PA -> Update -> Question` 完整 replay。
+
+prompt stream segment blocks 当前不会进入普通 prefix cache。原因是 Update KV
+不仅由 Update token 决定，还依赖事件发生时的 PA 上下文；沿用普通 prompt
+hash 会产生错误共享。
+
+当前 allocator 明确限制：
+
+- 只支持 block size 一致的 full-attention / MLA KV groups。
+- 不支持 sliding-window、Mamba、chunked-local attention 或 cross-attention。
+- P 节点 start 会拒绝任何 speculative decoding 配置；segment allocator 也不
+  接受 lookahead slots。
+- 不接受本地 prefix-cache hit、外部 KV load 或 encoder KV。
+- P 节点只允许同步调度和 pipeline parallel size 1；async scheduling / PP 会在
+  `AsyncLLM.add_prompt_stream_request()` 入口直接拒绝，避免事件修改在途 batch。
+- 当前只支持 NIXL 直接 device KV transfer。host-buffer 模式对同一 partial
+  block 的增量覆盖还缺少重新保存语义，因此也会在 start 入口直接拒绝。
+
+不满足这些条件会 fail closed，而不是退回普通连续 block table。
+
+## Scheduler 到 worker 的刷新方式
+
+phase 切换时必须同时更新三项内容：
+
+```text
+token ids + num_computed_tokens + 完整 block table
+```
+
+旧实现把 prompt mutation 塞进 `CachedRequestData.resumed_req_ids`，但 force
+refresh 时只读取原始 `request_id` 的 PA blocks，而且 cached worker 的 token
+视图可能没有更新。
+
+当前实现改为：
+
+- phase 切换或 token view 变化时，把请求作为 `NewRequestData` 发给 worker。
+- legacy GPU runner 复用 `_update_streaming_request()`，移除旧 batch row 后完整
+  更新 prompt、计算位置和 block table。
+- V2 GPU runner 复用已有 remove/re-add 路径，并以 `overwrite=True` 安装整表。
+- 同一 phase 的后续 chunk 只走 cached diff，不重复重装完整状态。
+
+同时修复了一个 token view bug：重新绑定 `_all_token_ids` 后会同步重建
+`ConstantList`，scheduler 不会再把落后一个事件的 token ids 发给 worker。
+
+## P/D transfer 的最终布局
+
+P 节点结束时导出的 block ids 固定为：
+
+```text
+PREFIX_APPEND block ids + UPDATE block ids
+```
+
+这里的 Update blocks 已经包含：
+
+```text
+当前 Update 快照 + Question + 已经真正 forward 的后续 token KV
+```
+
+connector 调用前会逐 KV group 校验：
+
+```text
+actual block count == ceil(num_computed_tokens / block_size)
+```
+
+如果拼接结果不是普通 D 请求能够解释的连续物理布局，会直接抛出错误，不再把
+错误 block ids 交给 NIXL。
+
+`remote_num_tokens` 仍由 connector 根据 P 侧实际 `num_computed_tokens` 生成。
+只有真正经过 forward 并写入 KV 的位置才应计入这个值。
+
+P 在 final Question forward 后采样出的首 token 不一定已经拥有 KV。正常情况下：
+
+```text
+remote_num_tokens = len(PA_physical + Update + Question)
+D prompt tokens   = PA_physical + Update + Question + P sampled token
+```
+
+D 为 sampled token 可能额外申请一个本地 block，尤其是 `remote_num_tokens` 恰好
+block 对齐时。NIXL D 侧现在会把 local load block ids 裁剪到
+`ceil(num_external_tokens / block_size)`，只从 P 拉取远端真正覆盖的前缀；最后
+一个 sampled token 由 D 本地 forward。若某种执行路径已经在 P 上计算该 token，
+`remote_num_tokens` 也可以覆盖它，proxy 的区间校验同样成立。
+
+## proxy 如何和物理布局对齐
+
+P 侧 `kv_transfer_params` 生成时会附带当前物理 prompt token ids。serving 层
+将它从 connector 参数中取出，作为 finish 响应的 `prompt_token_ids` 返回。
+
+proxy 收到后会用这份序列完整替换自己的逻辑 token 镜像，再追加 P 侧返回的
+output token ids。D 节点最终收到：
+
+```text
+PA_physical + Update + Question + P 侧已返回的 output tokens
+```
+
+发往 D 之前会强制验证：
+
+```text
+physical_prompt_len <= remote_num_tokens <= D_prompt_len
+D_prompt_len = physical_prompt_len + len(P sampled tokens)
+```
+
+此外，`kv_transfer_params.prompt_stream_physical_prompt_len` 必须和 P 返回的
+`prompt_token_ids` 长度一致；不一致时 proxy 返回 502。
+
+P 当前只允许 `n=1`，所以 sampled token 最多一个。D 返回非流式 completion 后，
+proxy 会把这个 P 首 token 的文本和 token id 合并回最终响应，并修正 usage；若首
+token 已触发 stop，或原请求只要求一个 token，则不再启动 D。
+
+## RESTFUL 链路
+
+当前实验链路保持：
+
+```text
+frontend
+  -> research/scripts/proxy_server.py
+  -> P /v1/prompt_stream/start
+  -> P /v1/prompt_stream/event
+  -> P /v1/prompt_stream/finish
+  -> D /v1/completions
+```
+
+P 节点接口仍支持 text / token ids 双模式；进入 `PromptStreamEvent` 前统一完成
+tokenization。start 保存一个长期 output collector，event 只返回 ack，finish
+等待最终输出和 `kv_transfer_params`。当前 proxy MVP 只接受 completions API 和
+`stream=false`；chat prompt 的 renderer 镜像及流式响应首 token 合并尚未实现，
+因此会在 start 入口直接返回 400，而不是发送错位 KV。
+
+P 和 proxy 在 finish 成功后都会删除各自的长期 session，避免已完成 request id
+被错误复用。
+
+## 已添加的测试
+
+新增 `tests/v1/test_prompt_stream_request.py`，覆盖：
+
+- 连续快速到达的 Append、Update、Finish 仍按阶段顺序执行。
+- `PREFIX_APPEND` 的 padding 和物理 token view。
+- 多个 Append source 交错到达时保持全局尾部追加顺序。
+- 空 Question 被拒绝。
+- Append-after-Update 不回退 Update 已提交进度；即使新 PA 跨 block 边界，
+  Update block ids 也保持不变，worker 仍按新的 `PA ids + Update ids` 安装整表。
+- Update 使用 source-local LCP。
+- Update 截断不改变 PA blocks。
+- 两个 segment 使用独立 key 分配，并严格按 `PA ids + Update ids` 合并。
+- Question 复用 Update 的 partial block，不创建第三个 key。
+- preemption 释放两个 key 后从长期 source 状态 replay。
+- D prompt 多出本地 sampled token 尾块时，NIXL load block ids 正确裁剪。
+- `_all_token_ids` 与 `ConstantList` 始终一致。
+
+当前环境没有安装 `pytest` 和 `ruff`，所以没有运行正式 pytest / ruff 命令。
+已经完成的本地验证是：
+
+```text
+py_compile: 通过
+git diff --check: 通过
+直接调用 10 个 Request/KV/NIXL 边界测试函数: 通过
+```
+
+直接测试运行时只有无 GPU 环境下的 NVML / Triton 提示，没有断言失败。
+
+## 当前明确未完成的内容
+
+- 还没有在真实双 GPU NIXL 环境重新跑 append-only 集成测试。
+- padding 会参与 attention，尚未实现严格 mask 或 KV compaction。
+- Append-after-Update 保留旧 Update KV 是论文近似，位置和上下文不是完整重算结果。
+- 当前只支持一个 Update source。
+- 乱序事件会暂存，但缺口补齐后的自动消费尚未实现。
+- 如果 P 首 token 已满足停止条件、proxy 无需启动 D，或 D 请求在 KV 拉取前失败，
+  P 已进入 delay-free 状态的 NIXL blocks 当前只能等待 lease 到期释放；这会产生
+  短期显存占用和 expired-KV 日志，但不改变成功请求的 token/block 排布。
+- prompt embeds、多模态位置编码、Mamba、sliding window 和 speculative decode
+  尚未接入 segment allocator。
+- 异步多 batch 场景还没有用 prompt revision 对在途旧结果做完整 fencing；当前
+  代码已拒绝 async scheduling 和 PP>1，而不是静默运行不安全路径。
+- 物理 prompt 加上 P 必采样的首 token 超过 `max_model_len` 时，scheduler 会把
+  该请求标记为 `FINISHED_ERROR` 并释放两个 segment；start 和后续 event 都走
+  请求级失败，不再让长度异常退出整个调度循环。由于 event 是异步 ack，具体
+  超长原因还没有通过独立错误通道回传给已经返回的 `/event`。
+- `total_tokens_recomputed` 统计字段尚未完整维护。
+
+下一步最有价值的验证是重新启动 P、D 和 proxy，确认 P 日志中的：
+
+```text
+physical prompt len
+remote_num_tokens
+merged block counts
+```
+
+与 proxy 日志满足 `remote_num_tokens <= prompt_token_len <=
+remote_num_tokens + 1`，然后比较启用和禁用 NIXL 的输出。如果仍异常，就继续
+检查 NIXL worker 实际复制的远端/本地 block id 对。

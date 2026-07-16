@@ -13,11 +13,12 @@ from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.kv_cache_utils import KVCacheBlock
 from vllm.v1.kv_cache_interface import (
     KVCacheConfig,
+    KVCacheSpecKind,
     get_kv_cache_spec_kind,
     get_kv_cache_spec_sliding_window,
 )
 from vllm.v1.metrics.stats import PrefixCacheStats
-from vllm.v1.request import Request, RequestStatus
+from vllm.v1.request import PromptStreamKVSegment, Request, RequestStatus
 
 logger = init_logger(__name__)
 
@@ -125,6 +126,7 @@ class KVCacheManager:
         watermark: float = 0.0,
     ) -> None:
         self.max_model_len = max_model_len
+        self.scheduler_block_size = scheduler_block_size
         # When unset, fall back to `max_model_len` so the recycling-aware cap
         # collapses to the prior (uncapped) admission behavior. The scheduler
         # always supplies the real value at runtime.
@@ -156,6 +158,25 @@ class KVCacheManager:
         self.num_kv_cache_groups = len(kv_cache_config.kv_cache_groups)
         self.block_pool = self.coordinator.block_pool
         self.kv_cache_config = kv_cache_config
+
+        # 第一版 segment 执行要求每个 group 使用同一个 full-attention block
+        # size；否则一个 padding 边界无法同时对齐多组 block table。
+        prompt_stream_supported_kinds = {
+            KVCacheSpecKind.FULL_ATTENTION,
+            KVCacheSpecKind.MLA_ATTENTION,
+        }
+        prompt_stream_block_sizes = {
+            group.kv_cache_spec.block_size
+            for group in kv_cache_config.kv_cache_groups
+        }
+        self.prompt_stream_segments_supported = (
+            prompt_stream_block_sizes == {scheduler_block_size}
+            and all(
+                get_kv_cache_spec_kind(group.kv_cache_spec)
+                in prompt_stream_supported_kinds
+                for group in kv_cache_config.kv_cache_groups
+            )
+        )
 
         # Watermark: minimum number of KV cache blocks to keep free when
         # admitting waiting/preempted requests, to avoid frequent preemptions.
@@ -211,6 +232,11 @@ class KVCacheManager:
                 - A list of blocks that are computed for the request.
                 - The number of computed tokens.
         """
+        # Segment KV 的内容依赖事件到达时的上下文，不能按普通 prompt hash
+        # 在不同请求之间复用。
+        if request.is_prompt_streaming():
+            return self.empty_kv_cache_blocks, 0
+
         # We skip finding the prefix cache hit when prefix caching is
         # disabled or the request is marked as skipping kv cache read
         # (which happens when the request requires prompt logprobs
@@ -240,6 +266,82 @@ class KVCacheManager:
             )
 
         return self.create_kv_cache_blocks(computed_blocks), num_new_computed_tokens
+
+    def _allocate_prompt_stream_slots(
+        self,
+        request: Request,
+        num_new_tokens: int,
+        num_lookahead_tokens: int,
+        reserved_blocks: int,
+        has_scheduled_reqs: bool,
+    ) -> KVCacheBlocks | None:
+        """只为当前写入 segment 分配 blocks。
+
+        普通 `allocate_slots()` 假设所有 token 都属于 `request_id` 的一条连续
+        block table。流式 prompt 则以 segment-local 进度分配，并由 scheduler
+        另外把所需 segment 拼成 worker execution block table。
+
+        Args:
+            request: 已准备 `PromptStreamExecutionView` 的长期请求。
+            num_new_tokens: 本轮实际 forward 的 token 数。
+            num_lookahead_tokens: speculative decode 预留 token 数。
+            reserved_blocks: 必须为其它请求保留的空闲 block 数。
+            has_scheduled_reqs: 当前 batch 是否已经调度其它请求。
+
+        Returns:
+            当前 segment 本轮新分配的 blocks；容量不足时返回 None。
+        """
+        if not self.prompt_stream_segments_supported:
+            raise ValueError(
+                "Prompt stream segment KV currently requires full-attention "
+                "groups with one uniform scheduler block size."
+            )
+        if num_lookahead_tokens:
+            raise ValueError(
+                "Prompt stream segment KV does not support speculative "
+                f"lookahead tokens: request_id={request.request_id}, "
+                f"num_lookahead_tokens={num_lookahead_tokens}."
+            )
+        if num_new_tokens <= 0:
+            raise ValueError(
+                "Prompt stream segment allocation requires positive new tokens: "
+                f"request_id={request.request_id}, num_new_tokens={num_new_tokens}."
+            )
+
+        write_segment = request.get_prompt_stream_write_segment()
+        segment_key = request.get_prompt_stream_segment_key(write_segment)
+        segment_num_computed_tokens = (
+            request.get_prompt_stream_segment_num_computed_tokens()
+        )
+        segment_num_tokens = segment_num_computed_tokens + num_new_tokens
+
+        empty_computed_blocks = self.empty_kv_cache_blocks.blocks
+        num_blocks_to_allocate = self.coordinator.get_num_blocks_to_allocate(
+            request_id=segment_key,
+            num_tokens=segment_num_tokens,
+            new_computed_blocks=empty_computed_blocks,
+            num_encoder_tokens=0,
+            total_computed_tokens=segment_num_computed_tokens,
+            num_tokens_main_model=segment_num_tokens,
+        )
+
+        watermark_blocks = 0
+        if has_scheduled_reqs and request.status in (
+            RequestStatus.WAITING,
+            RequestStatus.PREEMPTED,
+        ):
+            watermark_blocks = self.watermark_blocks
+        available_blocks = self.block_pool.get_num_free_blocks() - reserved_blocks
+        if num_blocks_to_allocate + watermark_blocks > available_blocks:
+            return None
+
+        new_blocks = self.coordinator.allocate_new_blocks(
+            request_id=segment_key,
+            num_tokens=segment_num_tokens,
+            num_tokens_main_model=segment_num_tokens,
+        )
+        # Prompt stream segment blocks intentionally stay unhashed and unshared。
+        return self.create_kv_cache_blocks(new_blocks)
 
     def allocate_slots(
         self,
@@ -337,6 +439,30 @@ class KVCacheManager:
         Returns:
             A list of new allocated blocks.
         """
+        if request.is_prompt_streaming():
+            has_new_computed_blocks = (
+                new_computed_blocks is not None
+                and any(new_computed_blocks.blocks)
+            )
+            if (
+                num_new_computed_tokens
+                or num_external_computed_tokens
+                or has_new_computed_blocks
+                or num_encoder_tokens
+            ):
+                raise ValueError(
+                    "Prompt stream segment allocation does not support prefix "
+                    "cache hits, external KV loads, or encoder KV: "
+                    f"request_id={request.request_id}."
+                )
+            return self._allocate_prompt_stream_slots(
+                request=request,
+                num_new_tokens=num_new_tokens,
+                num_lookahead_tokens=num_lookahead_tokens,
+                reserved_blocks=reserved_blocks,
+                has_scheduled_reqs=has_scheduled_reqs,
+            )
+
         # When loading KV data asynchronously, we may have zero new tokens to
         # compute while still allocating slots for externally computed tokens.
         if num_new_tokens == 0 and num_external_computed_tokens == 0:
@@ -465,7 +591,56 @@ class KVCacheManager:
         Args:
             request: The request to free the blocks.
         """
+        if request.is_prompt_streaming():
+            self.free_prompt_stream_segments(request)
+            return
         self.coordinator.free(request.request_id)
+
+    def _prompt_stream_segment_key(
+        self,
+        request: Request,
+        segment: PromptStreamKVSegment,
+    ) -> str:
+        """返回流式 prompt segment 在 KV manager 内部使用的 key。"""
+        return request.get_prompt_stream_segment_key(segment)
+
+    def get_prompt_stream_segment_keys(self, request: Request) -> list[str]:
+        """返回一个流式 prompt 请求可能持有的所有 segment keys。
+
+        prefix+append 段继续使用原始 request_id；update 与 question 共享同一
+        个派生 key。释放或导出 blocks 时必须同时处理两个 key，避免泄漏。
+        """
+        return [
+            self._prompt_stream_segment_key(
+                request,
+                PromptStreamKVSegment.PREFIX_APPEND,
+            ),
+            self._prompt_stream_segment_key(request, PromptStreamKVSegment.UPDATE),
+        ]
+
+    def has_prompt_stream_segment_blocks(
+        self,
+        request: Request,
+        segment: PromptStreamKVSegment,
+    ) -> bool:
+        """判断某个流式 prompt segment 是否已经持有独立 KV blocks。"""
+        segment_key = self._prompt_stream_segment_key(request, segment)
+        return self.coordinator.has_blocks(segment_key)
+
+    def free_prompt_stream_segments(self, request: Request) -> None:
+        """释放同一个逻辑流式 prompt 请求下所有 segment blocks。"""
+        # 先释放尾部 UPDATE 域，再释放长期 PREFIX_APPEND 域。
+        segment_keys = self.get_prompt_stream_segment_keys(request)
+        self.coordinator.free_many(list(reversed(segment_keys)))
+
+    def pop_prompt_stream_segments_for_free(
+        self,
+        request: Request,
+    ) -> list[KVCacheBlock]:
+        """弹出流式 prompt 所有 segment blocks，供 scheduler 延迟释放。"""
+        return self.coordinator.pop_many_blocks_for_free(
+            self.get_prompt_stream_segment_keys(request)
+        )
 
     def remove_skipped_blocks(
         self, request_id: str, total_computed_tokens: int
@@ -491,6 +666,8 @@ class KVCacheManager:
         Returns:
             The request's blocks in allocation order.
         """
+        if request.is_prompt_streaming():
+            return self.pop_prompt_stream_segments_for_free(request)
         return self.coordinator.pop_blocks_for_free(request.request_id)
 
     def truncate_blocks_from_position(
@@ -498,13 +675,22 @@ class KVCacheManager:
         request: Request,
         keep_tokens: int,
     ) -> bool:
-        """释放请求在指定 token 位置之后的 KV blocks。
-
-        该接口用于流式 prompt update：Append segment 的 KV 可以保留，Update
-        segment 只释放与上一版本最长公共前缀之后的 blocks。
-        """
+        """释放普通连续请求在指定 token 位置之后的 KV blocks。"""
         return self.coordinator.truncate_blocks_from_position(
             request.request_id,
+            keep_tokens,
+        )
+
+    def truncate_prompt_stream_segment_blocks(
+        self,
+        request: Request,
+        segment: PromptStreamKVSegment,
+        keep_tokens: int,
+    ) -> bool:
+        """按 segment 内 token 位置截断流式 prompt 的独立 KV blocks。"""
+        segment_key = self._prompt_stream_segment_key(request, segment)
+        return self.coordinator.truncate_blocks_from_position(
+            segment_key,
             keep_tokens,
         )
 
@@ -600,6 +786,33 @@ class KVCacheManager:
         """Get the block ids of a request."""
         return self.get_blocks(request_id).get_block_ids()
 
+    def get_prompt_stream_blocks(self, request: Request) -> KVCacheBlocks:
+        """按 P/D transfer 顺序返回两个物理 segment 的完整 blocks。"""
+        segment_keys = self.get_prompt_stream_segment_keys(request)
+        return self.create_kv_cache_blocks(
+            self.coordinator.get_merged_blocks(segment_keys)
+        )
+
+    def get_prompt_stream_execution_blocks(self, request: Request) -> KVCacheBlocks:
+        """返回 worker 当前执行视图需要完整覆盖的 blocks。
+
+        Append 阶段只安装 PREFIX_APPEND；Update、Question 和后续 decode
+        安装 PREFIX_APPEND + UPDATE。该方法必须与 Request 的 execution
+        token view 同步调用。
+        """
+        required_segments = request.get_prompt_stream_required_segments()
+        segment_keys = [
+            self._prompt_stream_segment_key(request, segment)
+            for segment in required_segments
+        ]
+        return self.create_kv_cache_blocks(
+            self.coordinator.get_merged_blocks(segment_keys)
+        )
+
+    def get_prompt_stream_block_ids(self, request: Request) -> tuple[list[int], ...]:
+        """按最终逻辑布局返回流式 prompt 的 block ids。"""
+        return self.get_prompt_stream_blocks(request).get_block_ids()
+
     def cache_blocks(self, request: Request, num_computed_tokens: int) -> None:
         """Cache the blocks for the request, if enabled.
 
@@ -608,7 +821,7 @@ class KVCacheManager:
             num_computed_tokens: The number of computed tokens, including tokens
                 that are already cached and tokens to be cached.
         """
-        if self.enable_caching:
+        if self.enable_caching and not request.is_prompt_streaming():
             self.coordinator.cache_blocks(request, num_computed_tokens)
 
     def create_kv_cache_blocks(

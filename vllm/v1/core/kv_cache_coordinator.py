@@ -291,6 +291,13 @@ class KVCacheCoordinator(ABC):
         for manager in self.single_type_managers:
             manager.free(request_id)
 
+    def has_blocks(self, request_id: str) -> bool:
+        """判断某个 request key 是否已经持有 KV blocks。"""
+        return any(
+            bool(manager.req_to_blocks.get(request_id))
+            for manager in self.single_type_managers
+        )
+
     def pop_blocks_for_free(self, request_id: str) -> list[KVCacheBlock]:
         """
         Pop the request's bookkeeping from all single-type managers and
@@ -308,6 +315,21 @@ class KVCacheCoordinator(ABC):
         blocks: list[KVCacheBlock] = []
         for manager in self.single_type_managers:
             blocks.extend(manager.pop_blocks_for_free(request_id))
+        return blocks
+
+    def free_many(self, request_ids: Sequence[str]) -> None:
+        """释放同一个逻辑请求下的多个 segment request key。"""
+        for request_id in request_ids:
+            self.free(request_id)
+
+    def pop_many_blocks_for_free(
+        self,
+        request_ids: Sequence[str],
+    ) -> list[KVCacheBlock]:
+        """弹出多个 segment request key 的 blocks，交给 scheduler 延迟释放。"""
+        blocks: list[KVCacheBlock] = []
+        for request_id in request_ids:
+            blocks.extend(self.pop_blocks_for_free(request_id))
         return blocks
 
     def truncate_blocks_from_position(
@@ -364,6 +386,21 @@ class KVCacheCoordinator(ABC):
             manager.req_to_blocks.get(request_id) or []
             for manager in self.single_type_managers
         )
+
+    def get_merged_blocks(
+        self,
+        request_ids: Sequence[str],
+    ) -> tuple[list[KVCacheBlock], ...]:
+        """按 request key 顺序拼接多个 segment 的 blocks。"""
+        merged_blocks: list[list[KVCacheBlock]] = [
+            [] for _ in self.single_type_managers
+        ]
+        for request_id in request_ids:
+            for group_id, manager in enumerate(self.single_type_managers):
+                merged_blocks[group_id].extend(
+                    manager.req_to_blocks.get(request_id) or []
+                )
+        return tuple(merged_blocks)
 
     @abstractmethod
     def find_longest_cache_hit(
