@@ -2503,6 +2503,10 @@ class Scheduler(SchedulerInterface):
             return False, None
 
         if request.is_prompt_streaming():
+            # 流式 prompt 的 block table 由两个 segment 合并而来：
+            # PREFIX_APPEND blocks + UPDATE blocks。connector 只看到合并后的
+            # 物理顺序，因此 request.num_computed_tokens 必须和这个物理序列
+            # 的 block 数对齐。
             block_ids = self.kv_cache_manager.get_prompt_stream_block_ids(request)
             if request.status in (
                 RequestStatus.FINISHED_LENGTH_CAPPED,
@@ -2565,7 +2569,8 @@ class Scheduler(SchedulerInterface):
         delay_free_blocks, kv_transfer_params = connector_result
         if request.is_prompt_streaming() and kv_transfer_params is not None:
             # proxy 必须把同一物理 token 序列交给 D 节点，否则 padding 后的
-            # remote_num_tokens 与 D 侧位置会再次错位。
+            # remote_num_tokens 与 D 侧位置会再次错位。这个物理序列包含
+            # PREFIX_APPEND 末尾 padding、update 快照和最终用户问题。
             physical_prompt_token_ids = (
                 request.get_prompt_stream_physical_prompt_token_ids()
             )

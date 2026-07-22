@@ -310,6 +310,9 @@ class KVCacheManager:
 
         write_segment = request.get_prompt_stream_write_segment()
         segment_key = request.get_prompt_stream_segment_key(write_segment)
+        # 这里使用 segment-local 进度，而不是 request.num_computed_tokens。
+        # 例如 update 阶段的全局 num_computed_tokens 已经包含 PREFIX_APPEND，
+        # 但 UPDATE 域申请 blocks 时只关心 update/question 物理域内部长度。
         segment_num_computed_tokens = (
             request.get_prompt_stream_segment_num_computed_tokens()
         )
@@ -787,7 +790,12 @@ class KVCacheManager:
         return self.get_blocks(request_id).get_block_ids()
 
     def get_prompt_stream_blocks(self, request: Request) -> KVCacheBlocks:
-        """按 P/D transfer 顺序返回两个物理 segment 的完整 blocks。"""
+        """按 P/D transfer 顺序返回两个物理 segment 的完整 blocks。
+
+        最终传给 connector 的顺序固定为 PREFIX_APPEND blocks 在前，
+        UPDATE blocks 在后。PREFIX_APPEND 末尾可能有 padding KV，因此这里
+        只能按 block 级拼接，不能表达 token 级无缝 compaction。
+        """
         segment_keys = self.get_prompt_stream_segment_keys(request)
         return self.create_kv_cache_blocks(
             self.coordinator.get_merged_blocks(segment_keys)
@@ -799,6 +807,10 @@ class KVCacheManager:
         Append 阶段只安装 PREFIX_APPEND；Update、Question 和后续 decode
         安装 PREFIX_APPEND + UPDATE。该方法必须与 Request 的 execution
         token view 同步调用。
+
+        这里返回的是 worker 本轮 attention 可读的完整 block table；真正新
+        申请的 blocks 仍由 `_allocate_prompt_stream_slots()` 根据 write_segment
+        单独决定。
         """
         required_segments = request.get_prompt_stream_required_segments()
         segment_keys = [

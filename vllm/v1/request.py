@@ -35,7 +35,14 @@ if TYPE_CHECKING:
 
 
 class PromptStreamKVSegment(enum.Enum):
-    """流式 prompt 的两个物理 KV 域。"""
+    """流式 prompt 的两个物理 KV 域。
+
+    `PREFIX_APPEND` 保存通用模板和所有 append chunk。它只会单调增长，
+    因此可以使用原始 request_id 持有紧凑 block table。
+
+    `UPDATE` 保存 update 快照和最终用户问题。update 快照可能失效重算，
+    所以它必须和 PREFIX_APPEND 隔离，避免释放 update 后缀时误伤稳定前缀。
+    """
 
     PREFIX_APPEND = "prefix_append"
     UPDATE = "update"
@@ -56,6 +63,13 @@ class PromptStreamExecutionView:
     `token_ids` 已包含 `PREFIX_APPEND` 末尾的 block 对齐 padding。worker
     必须同时使用这里的 token 序列、`num_computed_tokens` 和按
     `required_segments` 拼接的 block table，三者不能独立更新。
+
+    这里需要区分两个概念：
+    - `required_segments` 表示本轮 attention 需要读哪些 KV blocks。
+    - `write_segment` 表示本轮新 token 的 KV 应写入哪个物理 segment。
+
+    例如 update 阶段会读取 `PREFIX_APPEND + UPDATE`，但只向 `UPDATE`
+    segment 继续申请/写入新 blocks。
     """
 
     phase: PromptStreamExecutionPhase
@@ -756,6 +770,10 @@ class Request:
         old_prefix_append_num_computed_tokens = (
             prompt_stream.prefix_append_num_computed_tokens
         )
+
+        # Append 只改 PREFIX_APPEND 域。旧 update/question 的 token 语义仍然
+        # 保留，但 scheduler 会先把新 append 追平，再重新进入 update/question
+        # 执行视图。
         source.token_ids.extend(event.token_ids or [])
         # Append 的 KV 语义是请求级尾部追加。source.token_ids 负责来源级
         # 去重和完成状态，物理顺序则必须使用全局事件提交顺序，不能按
@@ -838,13 +856,18 @@ class Request:
         if event.chunk_id is not None:
             source.seen_chunk_ids.add(event.chunk_id)
 
-        # Update 只在来源内部做 LCP。旧快照 LCP 之后的已计算进度立即回退，
-        # PREFIX_APPEND 域的进度和 blocks 完全不受影响。
+        # Update 只在来源内部做 LCP。这里不把 prefix/template 或 append
+        # 纳入公共前缀比较，否则 append 到达会错误扩大 update 的可复用范围。
+        # 旧快照 LCP 之后的已计算进度立即回退，PREFIX_APPEND 域的进度和
+        # blocks 完全不受影响。
         prompt_stream.update_num_computed_tokens = min(
             old_update_num_computed_tokens,
             update_common_prefix_len,
         )
         mutation = self._sync_prompt_from_stream_state(old_prompt_token_ids)
+        # KV 释放只发生在 UPDATE segment。KV manager 会按 block 粒度释放
+        # `update_common_prefix_len` 之后的 blocks；如果 LCP 落在半个 block
+        # 内，会保留包含 LCP 的整块，后续 forward 从 token 级进度继续覆盖。
         mutation.kv_segment_to_truncate = PromptStreamKVSegment.UPDATE
         mutation.kv_segment_keep_tokens = update_common_prefix_len
         mutation.num_tokens_to_invalidate = max(
@@ -1064,6 +1087,9 @@ class Request:
             self._get_prompt_stream_segment_token_ids(PromptSourceType.APPEND)
         )
         if token_ids:
+            # PREFIX_APPEND 和 UPDATE 使用不同的 block table。为了让二者能
+            # 在 worker/D 节点侧按 block list 直接拼接，PREFIX_APPEND 必须
+            # 在物理序列上补齐到 block 边界。
             num_padding_tokens = (-len(token_ids)) % self.prompt_stream.block_size
             token_ids.extend(
                 [self.prompt_stream.padding_token_id] * num_padding_tokens
@@ -1112,6 +1138,8 @@ class Request:
             )
 
         # Update delta 基于完整 PREFIX_APPEND KV 和 update 源内 LCP KV。
+        # 注意这里传给 worker 的 token_ids 是“可见物理上下文 + update 快照”，
+        # 但新分配/写入的 KV 只属于 UPDATE segment。
         if self.prompt_stream.update_num_computed_tokens < len(update_token_ids):
             execution_token_ids = prefix_append_token_ids + update_token_ids
             return PromptStreamExecutionView(
@@ -1131,7 +1159,8 @@ class Request:
             )
 
         # Question 与 Update 共用 UPDATE 物理域，避免制造第三个 partial-block
-        # 边界；它只会在前两阶段全部提交后开始计算。
+        # 边界。它只会在 PREFIX_APPEND 和 UPDATE 快照全部提交后开始计算，
+        # 因此最终 D 侧看到的后半段是 update tokens 后面直接接 question。
         if (
             self.prompt_stream.finished
             and self.prompt_stream.question_num_computed_tokens

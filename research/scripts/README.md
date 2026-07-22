@@ -1,6 +1,8 @@
 # Prompt Stream 实验脚本
 
-这个目录放的是流式 prefill 的最小联调脚本。当前目标不是做完整 RAG 系统，而是先把“前端 → proxy → P 节点 → D 节点”的 RESTFUL 链路跑通。
+这个目录放的是流式 prefill 的最小联调脚本。当前目标不是做完整 RAG 系统，而是先把
+“前端 -> proxy -> P 节点 -> D 节点”的 RESTFUL 链路跑通，并确认 P/D 分离下的
+NIXL KV transfer 可以工作。
 
 ## 脚本说明
 
@@ -19,277 +21,408 @@
 
 ### `append_frontend.py`
 
-`append_frontend.py` 是一个非常小的前端/RAG mock。它默认只发送 append 文本事件，流程是：
+`append_frontend.py` 是一个最小前端/RAG mock。它默认只发送 append 文本事件：
 
 1. 向 proxy 发送 `/v1/prompt_stream/start`，其中 `prompt` 是固定模板/prefix。
 2. 连续向 proxy 发送多个 `/v1/prompt_stream/event`，每个事件都是 `event_type=append`。
-3. 向 proxy 发送 `/v1/prompt_stream/finish`，其中事件是 `event_type=prompt_finished`，文本是最后的用户问题。
+3. 向 proxy 发送 `/v1/prompt_stream/finish`，其中 `event_type=prompt_finished`，文本是最后的用户问题。
 4. 打印 proxy 返回的最终 decode 响应。
 
 这个脚本故意不做 tokenizer。它发送原始文本，由 P 节点的 prompt stream RESTFUL serving 层负责把 `text` 转成 `token_ids`。
 
-## 启动顺序
+### `update_frontend.py`
 
-下面命令按单机双卡示例编写：
+`update_frontend.py` 是一个最小 update 语义前端/RAG mock。它默认只发送一个 update source 的文本快照：
 
-- P 节点使用 `CUDA_VISIBLE_DEVICES=0`，监听 `8100`，NIXL side-channel 端口为 `5600`。
-- D 节点使用 `CUDA_VISIBLE_DEVICES=1`，监听 `8200`，NIXL side-channel 端口为 `5601`。
-- proxy 监听 `8000`。
+1. 向 proxy 发送 `/v1/prompt_stream/start`，其中 `prompt` 是固定模板/prefix。
+2. 连续向 proxy 发送多个 `/v1/prompt_stream/event`，每个事件都是 `event_type=update`。
+3. 每个 update 事件的 `text` 都表示该 source 的**完整当前快照**，不是增量 patch。
+4. 向 proxy 发送 `/v1/prompt_stream/finish`，其中 `event_type=prompt_finished`，文本是最后的用户问题。
+5. 打印 proxy 返回的最终 decode 响应。
 
-如果机器显存比较紧张，优先调低 `--gpu-memory-utilization`。例如 24 GiB 卡上
-`0.85` 可能要求约 20 GiB 空闲显存；如果启动时报 free memory 不足，可以先改成
-`0.65` 或 `0.6` 做联调。sbatch 脚本还默认设置 `MAX_NUM_SEQS=16`，
-用于减少 vLLM warmup sampler 和调度状态占用；如果仍然 OOM，可以继续降到 `8`。
+这个脚本用于测试 update 源内 LCP、旧 update 后缀失效、以及 finish 后 update KV 与 prefix/append/question 的组合逻辑。
 
-### 1. 启动 P 节点
+### `start_p_node.sbatch` / `start_d_node.sbatch`
 
-P 节点是 NIXL producer，负责流式 prefill，并在 finish 后把可被 D 拉取的
-KV block 信息放进 `kv_transfer_params`。
+这两个脚本用于在 Slurm 集群上提交 P/D vLLM server：
+
+- `start_p_node.sbatch`：启动 P 节点，即 NIXL producer。
+- `start_d_node.sbatch`：启动 D 节点，即 NIXL consumer。
+
+脚本默认使用 `SLURM_SUBMIT_DIR` 作为仓库根目录，因此建议在 vLLM 仓库根目录下提交。
+
+## 占位符说明
+
+下面的通用命令使用占位符。实际运行时请替换为你的环境值：
+
+| 占位符 | 含义 | 示例 |
+| --- | --- | --- |
+| `<REPO_ROOT>` | 当前 vLLM 仓库根目录 | `/path/to/vllm` |
+| `<MODEL_PATH>` | 本地模型目录或 Hugging Face 模型名 | `/path/to/Qwen2.5-3B` |
+| `<SERVED_MODEL_NAME>` | OpenAI API 请求体里的 `model` 名称 | `qwen2.5-3b` |
+| `<P_HOST>` | P 节点 hostname 或 IP | `gpu-node-p` |
+| `<D_HOST>` | D 节点 hostname 或 IP | `gpu-node-d` |
+| `<PROXY_HOST>` | proxy 所在机器的 hostname 或 IP | `127.0.0.1` |
+| `<P_PORT>` | P 节点 OpenAI server 端口 | `8100` |
+| `<D_PORT>` | D 节点 OpenAI server 端口 | `8200` |
+| `<PROXY_PORT>` | proxy 端口 | `8000` |
+| `<P_NIXL_PORT>` | P 节点 NIXL side-channel 端口 | `5600` |
+| `<D_NIXL_PORT>` | D 节点 NIXL side-channel 端口 | `5601` |
+| `<GPU_UTIL>` | vLLM 可占用 GPU 显存比例 | `0.6` |
+| `<MAX_MODEL_LEN>` | vLLM 最大上下文长度 | `4096` |
+| `<MAX_NUM_SEQS>` | vLLM 最大并发序列数 | `16` |
+| `<GPU_NODE>` | Slurm GPU 节点名 | `g2c12` |
+
+注意：`append_frontend.py --model` 要填写 `<SERVED_MODEL_NAME>`，不是 `<MODEL_PATH>`。
+`update_frontend.py --model` 也一样要填写 `<SERVED_MODEL_NAME>`。
+`<MODEL_PATH>` 只出现在启动 vLLM server 或提交 sbatch job 的命令中。
+
+## 参数关系
+
+### `max_tokens`
+
+`append_frontend.py --max-tokens` 和 `update_frontend.py --max-tokens` 表示用户希望最终 completion 最多生成多少 token。
+例如：
+
+```shell
+.venv/bin/python research/scripts/append_frontend.py \
+  --proxy-url http://<PROXY_HOST>:<PROXY_PORT> \
+  --model <SERVED_MODEL_NAME> \
+  --max-tokens 64 \
+  --temperature 0
+```
+
+proxy 内部会把发给 P 节点的请求强制改成：
+
+```text
+P max_tokens = 1
+```
+
+原因是 P 节点只负责 prefill 到最终问题，并采样首 token。之后 proxy 会把 D 节点的
+`max_tokens` 减去 P 已经生成的 token 数。因此当用户设置：
+
+```text
+max_tokens = 64
+```
+
+实际链路通常是：
+
+```text
+P 节点生成 1 个 token
+D 节点最多继续生成 63 个 token
+最终 completion_tokens 约为 64
+```
+
+如果最终响应里 `finish_reason=length`，通常就是达到了这个总生成上限。
+
+### `gpu_memory_utilization` 和 `max_num_seqs`
+
+`<GPU_UTIL>` 控制 vLLM 预留多少 GPU 显存给 KV cache 和运行时状态。24 GiB A30 上，
+`0.85` 往往要求约 20 GiB 空闲显存；如果节点上已有残留进程，启动会失败。
+
+`<MAX_NUM_SEQS>` 控制最大并发序列数。联调阶段建议先用 `16`，如果 vLLM warmup sampler
+仍然 OOM，可以降到 `8`。
+
+## 单机手动启动模板
+
+如果 P/D/proxy 都在同一台机器上，可以先用手动命令联调。
+
+### 启动 P 节点
 
 ```shell
 CUDA_VISIBLE_DEVICES=0 \
 UCX_NET_DEVICES=all \
-VLLM_NIXL_SIDE_CHANNEL_PORT=5600 \
+VLLM_NIXL_SIDE_CHANNEL_PORT=<P_NIXL_PORT> \
 python -m vllm.entrypoints.openai.api_server \
-  --model ~/Models/Qwen2.5-3B/ \
-  --served-model-name qwen2.5-3b \
+  --model <MODEL_PATH> \
+  --served-model-name <SERVED_MODEL_NAME> \
   --trust-remote-code \
   --dtype auto \
-  --gpu-memory-utilization 0.65 \
-  --max-model-len 4096 \
+  --gpu-memory-utilization <GPU_UTIL> \
+  --max-model-len <MAX_MODEL_LEN> \
+  --max-num-seqs <MAX_NUM_SEQS> \
   --host 0.0.0.0 \
-  --port 8100 \
+  --port <P_PORT> \
   --enforce-eager \
   --no-async-scheduling \
   --kv-transfer-config '{"kv_connector":"NixlConnector","kv_role":"kv_producer","kv_load_failure_policy":"fail"}'
 ```
 
-注意点：
-
-- `--no-async-scheduling` 当前必须显式加上。prompt stream MVP 暂时拒绝异步调度，
-  避免事件修改与在途 batch 交错。
-- `VLLM_NIXL_SIDE_CHANNEL_PORT` 需要和 D 节点不同，避免端口冲突。
-- `--served-model-name qwen2.5-3b` 是后续 OpenAI 请求体里的 `model` 字段。
-
-### 2. 启动 D 节点
-
-D 节点是 NIXL consumer，继续暴露普通 OpenAI `/v1/completions` 接口。proxy
-会把 P 返回的物理 prompt token ids、P 首 token 和 `kv_transfer_params` 一起转发给它。
+### 启动 D 节点
 
 ```shell
 CUDA_VISIBLE_DEVICES=1 \
 UCX_NET_DEVICES=all \
-VLLM_NIXL_SIDE_CHANNEL_PORT=5601 \
+VLLM_NIXL_SIDE_CHANNEL_PORT=<D_NIXL_PORT> \
 python -m vllm.entrypoints.openai.api_server \
-  --model ~/Models/Qwen2.5-3B/ \
-  --served-model-name qwen2.5-3b \
+  --model <MODEL_PATH> \
+  --served-model-name <SERVED_MODEL_NAME> \
   --trust-remote-code \
   --dtype auto \
-  --gpu-memory-utilization 0.65 \
-  --max-model-len 4096 \
+  --gpu-memory-utilization <GPU_UTIL> \
+  --max-model-len <MAX_MODEL_LEN> \
+  --max-num-seqs <MAX_NUM_SEQS> \
   --host 0.0.0.0 \
-  --port 8200 \
+  --port <D_PORT> \
   --enforce-eager \
   --no-async-scheduling \
   --kv-transfer-config '{"kv_connector":"NixlConnector","kv_role":"kv_consumer","kv_load_failure_policy":"fail"}'
 ```
 
-注意点：
+### 启动 proxy
 
-- P/D 的 `--model` 和 `--served-model-name` 应保持一致。
-- D 节点必须能访问 P 节点通过 NIXL side-channel 暴露的远端 blocks。
-- 如果只想验证 prompt/token 构造，不想启用 KV 拉取，可以保留 D 节点启动参数，
-  但在 proxy 启动时加 `--disable-kv-transfer`。
+```shell
+.venv/bin/python research/scripts/proxy_server.py \
+  --host 0.0.0.0 \
+  --port <PROXY_PORT> \
+  --prefiller-hosts <P_HOST> \
+  --prefiller-ports <P_PORT> \
+  --decoder-hosts <D_HOST> \
+  --decoder-ports <D_PORT>
+```
 
-### 用 `sbatch` 启动 P/D 节点
+如果 P、D、proxy 不在同一个节点上，`<P_HOST>` 和 `<D_HOST>` 不能写 `127.0.0.1`。
+`127.0.0.1` 永远表示 proxy 当前所在机器自己。
 
-如果登录节点上的 GPU 被占用，可以用 Slurm 把 P/D 节点提交到空闲计算节点。
-本目录已经提供两个脚本：
+## Slurm 启动模板
 
-- `start_p_node.sbatch`：启动 P 节点，即 NIXL producer，默认 OpenAI 端口 `8100`，
-  NIXL side-channel 端口 `5600`。
-- `start_d_node.sbatch`：启动 D 节点，即 NIXL consumer，默认 OpenAI 端口 `8200`，
-  NIXL side-channel 端口 `5601`。
+### 提交 P/D job
 
-提交前先创建日志目录：
+先创建日志目录：
 
 ```shell
 mkdir -p research/scripts/logs
 ```
 
-然后提交两个 job：
+使用默认参数提交：
 
 ```shell
 sbatch research/scripts/start_p_node.sbatch
 sbatch research/scripts/start_d_node.sbatch
 ```
 
-如果你的集群分区名不是 `gpu`，需要先修改两个 sbatch 文件顶部的：
+用环境变量覆盖常用参数：
 
 ```shell
-#SBATCH --partition=gpu
-```
-
-也可以按集群要求调整 `--gres=gpu:1`、`--cpus-per-task`、`--mem` 和 `--time`。
-
-脚本默认把 `sbatch` 的提交目录 `SLURM_SUBMIT_DIR` 当作仓库根目录。因此建议在
-`/workplace/home/huangxinying/Projects/vllm` 下提交；如果从别的目录提交，需要显式传
-`REPO_ROOT=/workplace/home/huangxinying/Projects/vllm`。
-
-脚本支持用环境变量临时覆盖常用参数，不需要每次编辑文件。例如：
-
-```shell
-MODEL_PATH=/workplace/home/huangxinying/Models/Qwen2.5-3B/ \
-SERVED_MODEL_NAME=qwen2.5-3b \
-GPU_MEMORY_UTILIZATION=0.6 \
-MAX_NUM_SEQS=16 \
+MODEL_PATH=<MODEL_PATH> \
+SERVED_MODEL_NAME=<SERVED_MODEL_NAME> \
+GPU_MEMORY_UTILIZATION=<GPU_UTIL> \
+MAX_MODEL_LEN=<MAX_MODEL_LEN> \
+MAX_NUM_SEQS=<MAX_NUM_SEQS> \
 sbatch research/scripts/start_p_node.sbatch
 ```
 
 D 节点同理：
 
 ```shell
-MODEL_PATH=/workplace/home/huangxinying/Models/Qwen2.5-3B/ \
-SERVED_MODEL_NAME=qwen2.5-3b \
-GPU_MEMORY_UTILIZATION=0.6 \
-MAX_NUM_SEQS=16 \
+MODEL_PATH=<MODEL_PATH> \
+SERVED_MODEL_NAME=<SERVED_MODEL_NAME> \
+GPU_MEMORY_UTILIZATION=<GPU_UTIL> \
+MAX_MODEL_LEN=<MAX_MODEL_LEN> \
+MAX_NUM_SEQS=<MAX_NUM_SEQS> \
 sbatch research/scripts/start_d_node.sbatch
 ```
 
-如果需要改端口，也可以覆盖：
+如果从仓库根目录以外的位置提交，需要显式传：
 
 ```shell
-PORT=8110 NIXL_SIDE_CHANNEL_PORT=5610 sbatch research/scripts/start_p_node.sbatch
-PORT=8210 NIXL_SIDE_CHANNEL_PORT=5611 sbatch research/scripts/start_d_node.sbatch
+REPO_ROOT=<REPO_ROOT> sbatch research/scripts/start_p_node.sbatch
 ```
 
-Slurm 只知道 GPU 资源是否被 Slurm job 分配，不一定知道显存是否真的空。如果某个节点上有
-手动启动的进程或残留进程，`sinfo` 仍可能显示节点 `idle`，但 vLLM 会因为 free memory
-不足启动失败。遇到这种情况，可以显式排除问题节点：
+### 指定或排除节点
+
+Slurm 只知道 GPU 资源是否被 Slurm job 分配，不一定知道显存是否真的空。如果节点上有
+手动启动的 GPU 进程或残留进程，`sinfo` 仍可能显示节点 `idle`，但 vLLM 会因为 free memory
+不足启动失败。
+
+指定节点：
 
 ```shell
-sbatch --exclude=g2c15 research/scripts/start_d_node.sbatch
+sbatch --nodelist=<GPU_NODE> research/scripts/start_p_node.sbatch
+sbatch --nodelist=<GPU_NODE> research/scripts/start_d_node.sbatch
 ```
 
-也可以直接指定一个你想测试的节点：
+排除节点：
 
 ```shell
-sbatch --nodelist=g2c12 research/scripts/start_p_node.sbatch
-sbatch --nodelist=g2c13 research/scripts/start_d_node.sbatch
+sbatch --exclude=<GPU_NODE> research/scripts/start_d_node.sbatch
 ```
 
-如果想先探测某个节点上 Slurm 分给你的 GPU 显存，可以跑一个短命令：
+探测某个节点上 Slurm 分给你的 GPU 显存：
 
 ```shell
-srun -p gpu --nodelist=g2c12 --gres=gpu:1 nvidia-smi
+srun -p gpu --nodelist=<GPU_NODE> --gres=gpu:1 nvidia-smi
 ```
 
-脚本自身也会在启动 vLLM 前打印 `nvidia-smi`，日志里可以直接看到被分配 GPU 的
-`memory.total`、`memory.used` 和 `memory.free`。
-
-提交后查看 job：
+### 查看 job 和日志
 
 ```shell
 squeue -u "$USER"
 scontrol show job <JOB_ID>
 ```
 
-最重要的是看日志，因为脚本会在启动 vLLM 前打印实际计算节点信息：
+脚本会在启动 vLLM 前打印节点和 GPU 信息：
 
 ```shell
 cat research/scripts/logs/vllm-p-<JOB_ID>.out
 cat research/scripts/logs/vllm-d-<JOB_ID>.out
 ```
 
-日志开头会包含类似信息：
+日志开头会包含：
 
 ```text
-SLURM_JOB_ID=123456
-SLURM_JOB_NODELIST=gpu-node-12
-HOSTNAME=gpu-node-12
-HOST_IP=10.4.1.115
+SLURM_JOB_ID=<JOB_ID>
+SLURM_JOB_NODELIST=<GPU_NODE>
+HOSTNAME=<GPU_NODE>
+HOST_IP=<NODE_IP_LIST>
 ROLE=prefill-producer
-OPENAI_PORT=8100
-NIXL_SIDE_CHANNEL_PORT=5600
+OPENAI_PORT=<P_PORT>
+NIXL_SIDE_CHANNEL_PORT=<P_NIXL_PORT>
+CUDA_VISIBLE_DEVICES=<VISIBLE_GPU_ID>
+SLURM_JOB_GPUS=<PHYSICAL_GPU_ID>
 ```
 
-这里的 `HOSTNAME` 或 `HOST_IP` 就是 proxy 需要连接的地址。假设 P 节点日志里是
-`gpu-node-12`，D 节点日志里是 `gpu-node-13`，proxy 应该这样启动：
+`HOSTNAME` 或 `HOST_IP` 就是 proxy 的 `<P_HOST>` / `<D_HOST>`。
+
+## 运行前端测试脚本
+
+### 运行 append-only 示例
+
+```shell
+.venv/bin/python research/scripts/append_frontend.py \
+  --proxy-url http://<PROXY_HOST>:<PROXY_PORT> \
+  --model <SERVED_MODEL_NAME> \
+  --max-tokens 64 \
+  --temperature 0
+```
+
+也可以自己指定 append chunk：
+
+```shell
+.venv/bin/python research/scripts/append_frontend.py \
+  --proxy-url http://<PROXY_HOST>:<PROXY_PORT> \
+  --model <SERVED_MODEL_NAME> \
+  --chunk "检索片段 1：vLLM 的 EngineCore 保存请求状态。" \
+  --chunk "检索片段 2：proxy 会先把事件发给 P 节点。" \
+  --final-question "\n用户问题：proxy 在 decode 前做了什么？\n回答："
+```
+
+### 运行 update-only 示例
+
+```shell
+.venv/bin/python research/scripts/update_frontend.py \
+  --proxy-url http://<PROXY_HOST>:<PROXY_PORT> \
+  --model <SERVED_MODEL_NAME> \
+  --max-tokens 64 \
+  --temperature 0
+```
+
+也可以自己指定 update 快照。注意每个 `--snapshot` 都是同一个 source 的**完整当前快照**，不是增量 diff：
+
+```shell
+.venv/bin/python research/scripts/update_frontend.py \
+  --proxy-url http://<PROXY_HOST>:<PROXY_PORT> \
+  --model <SERVED_MODEL_NAME> \
+  --snapshot "检索快照 v0：proxy 收到流式事件。" \
+  --snapshot "检索快照 v1：proxy 收到流式 prefill 事件，然后请求 D 节点 decode。" \
+  --final-question "\n用户问题：最新快照里 proxy 在 decode 前做了什么？\n回答："
+```
+
+## 禁用 KV transfer 的对照实验
+
+当 D 节点输出异常时，可以先让 proxy 加 `--disable-kv-transfer` 做 baseline：
 
 ```shell
 .venv/bin/python research/scripts/proxy_server.py \
   --host 0.0.0.0 \
-  --port 8000 \
-  --prefiller-hosts gpu-node-12 \
-  --prefiller-ports 8100 \
-  --decoder-hosts gpu-node-13 \
-  --decoder-ports 8200
-```
-
-如果集群 DNS 不能解析节点名，就改用日志里的 `HOST_IP`：
-
-```shell
-.venv/bin/python research/scripts/proxy_server.py \
-  --host 0.0.0.0 \
-  --port 8000 \
-  --prefiller-hosts 10.4.1.115 \
-  --prefiller-ports 8100 \
-  --decoder-hosts 10.4.1.116 \
-  --decoder-ports 8200
-```
-
-注意：`127.0.0.1` 只表示当前机器自己。P、D、proxy 如果不在同一个计算节点上，
-proxy 的 `--prefiller-hosts` 和 `--decoder-hosts` 不能写 `127.0.0.1`。
-
-### 3. 启动 proxy
-
-```shell
-.venv/bin/python research/scripts/proxy_server.py \
-  --host 127.0.0.1 \
-  --port 8000 \
-  --prefiller-hosts 127.0.0.1 \
-  --prefiller-ports 8100 \
-  --decoder-hosts 127.0.0.1 \
-  --decoder-ports 8200
-```
-
-常用参数：
-
-- `--host` / `--port`：proxy 自己监听的地址。
-- `--prefiller-hosts` / `--prefiller-ports`：一个或多个 P 节点地址，数量必须一致。
-- `--decoder-hosts` / `--decoder-ports`：一个或多个 D 节点地址，数量必须一致。
-- `--disable-kv-transfer`：调试开关。proxy 仍然会调用 P 节点完成流式 prefill，但不会把 `kv_transfer_params` 转发给 D 节点，D 节点会用 proxy 拼出的 prompt token ids 自己完整 prefill。
-
-如果传入多个 P/D 节点，proxy 会用 round-robin 选择节点。
-
-#### 禁用 KV transfer 的对照实验
-
-当 D 节点输出异常时，可以先用 `--disable-kv-transfer` 做 baseline：
-
-```shell
-.venv/bin/python research/scripts/proxy_server.py \
-  --host 127.0.0.1 \
-  --port 8000 \
-  --prefiller-hosts 127.0.0.1 \
-  --prefiller-ports 8100 \
-  --decoder-hosts 127.0.0.1 \
-  --decoder-ports 8200 \
+  --port <PROXY_PORT> \
+  --prefiller-hosts <P_HOST> \
+  --prefiller-ports <P_PORT> \
+  --decoder-hosts <D_HOST> \
+  --decoder-ports <D_PORT> \
   --disable-kv-transfer
 ```
 
 这个模式用于区分两类问题：
 
-- 如果禁用 KV transfer 后输出正常，说明 prompt/token ids 本身没问题，异常更可能来自 P→D KV 内容、block 顺序或 block 对齐。
+- 如果禁用 KV transfer 后输出正常，说明 prompt/token ids 本身没问题，异常更可能来自 P -> D KV 内容、block 顺序或 block 对齐。
 - 如果禁用 KV transfer 后输出仍然异常，说明问题可能在 prompt 构造、token ids 或普通 completions 请求本身。
 
-正常验证 P→D KV 传输时不要加这个参数。
+正常验证 P -> D KV transfer 时不要加 `--disable-kv-transfer`。
 
-注意：`append_frontend.py` 的 `--model` 参数是 OpenAI API 请求体里的
-`model` 字段，应该填写 P/D 节点启动时的 `--served-model-name`，例如
-`qwen2.5-3b`，而不是本地模型路径。`--model ~/Models/...` 只应该出现
-在启动 vLLM server 的命令里。
+## 当前环境示例
 
-### 4. 运行 append-only 前端示例
+这一节是当前实验环境的可复制命令。对外发布 README 时可以删除。
+
+### 当前模型和通用参数
+
+```shell
+export MODEL_PATH=/workplace/home/huangxinying/Models/Qwen2.5-3B/
+export SERVED_MODEL_NAME=qwen2.5-3b
+export GPU_MEMORY_UTILIZATION=0.6
+export MAX_MODEL_LEN=4096
+export MAX_NUM_SEQS=16
+```
+
+### 当前推荐的 Slurm 提交流程
+
+示例：P 跑在 `g2c13`，D 跑在 `g2c12`。
+
+```shell
+mkdir -p research/scripts/logs
+```
+
+```shell
+MODEL_PATH=/workplace/home/huangxinying/Models/Qwen2.5-3B/ \
+SERVED_MODEL_NAME=qwen2.5-3b \
+GPU_MEMORY_UTILIZATION=0.6 \
+MAX_MODEL_LEN=4096 \
+MAX_NUM_SEQS=16 \
+sbatch --nodelist=g2c13 research/scripts/start_p_node.sbatch
+```
+
+```shell
+MODEL_PATH=/workplace/home/huangxinying/Models/Qwen2.5-3B/ \
+SERVED_MODEL_NAME=qwen2.5-3b \
+GPU_MEMORY_UTILIZATION=0.6 \
+MAX_MODEL_LEN=4096 \
+MAX_NUM_SEQS=16 \
+sbatch --nodelist=g2c12 research/scripts/start_d_node.sbatch
+```
+
+如果某个节点显存或工具链有问题，可以换成其它空闲节点，或排除问题节点：
+
+```shell
+sbatch --exclude=g2c15 research/scripts/start_d_node.sbatch
+```
+
+### 当前 proxy 启动示例
+
+假设 P 日志显示 `HOSTNAME=g2c13`，D 日志显示 `HOSTNAME=g2c12`：
+
+```shell
+.venv/bin/python research/scripts/proxy_server.py \
+  --host 0.0.0.0 \
+  --port 8000 \
+  --prefiller-hosts g2c13 \
+  --prefiller-ports 8100 \
+  --decoder-hosts g2c12 \
+  --decoder-ports 8200
+```
+
+如果 P/D 都在同一节点，例如都在 `g2c13`：
+
+```shell
+.venv/bin/python research/scripts/proxy_server.py \
+  --host 0.0.0.0 \
+  --port 8000 \
+  --prefiller-hosts g2c13 \
+  --prefiller-ports 8100 \
+  --decoder-hosts g2c13 \
+  --decoder-ports 8200
+```
+
+### 当前 append-only 测试示例
 
 ```shell
 .venv/bin/python research/scripts/append_frontend.py \
@@ -299,15 +432,14 @@ proxy 的 `--prefiller-hosts` 和 `--decoder-hosts` 不能写 `127.0.0.1`。
   --temperature 0
 ```
 
-也可以自己指定 append chunk：
+### 当前 update-only 测试示例
 
 ```shell
-.venv/bin/python research/scripts/append_frontend.py \
+.venv/bin/python research/scripts/update_frontend.py \
   --proxy-url http://127.0.0.1:8000 \
   --model qwen2.5-3b \
-  --chunk "检索片段 1：vLLM 的 EngineCore 保存请求状态。" \
-  --chunk "检索片段 2：proxy 会先把事件发给 P 节点。" \
-  --final-question "\n用户问题：proxy 在 decode 前做了什么？\n回答："
+  --max-tokens 64 \
+  --temperature 0
 ```
 
 ## RESTFUL 请求形状
@@ -355,6 +487,26 @@ proxy 会把这个请求转发给 P 节点，并返回：
 }
 ```
 
+### Update event
+
+```json
+{
+  "request_id": "p-node-internal-request-id",
+  "event": {
+    "source_id": "demo_update_source",
+    "event_type": "update",
+    "source_type": "update",
+    "chunk_id": "demo_update_source-snapshot-0",
+    "version": 0,
+    "sequence_no": 0,
+    "text": "Document snapshot text",
+    "arrival_time": 1783760000.0
+  }
+}
+```
+
+update 事件的 `text` 是该来源当前版本的完整快照。P 节点内部会只在 update 源内比较新旧 token ids 的 LCP，并让不匹配的 update 后缀重新 prefill。
+
 ### Finish
 
 ```json
@@ -375,8 +527,8 @@ proxy 会把这个请求转发给 P 节点，并返回：
 
 ## 当前限制
 
-- `append_frontend.py` 只覆盖 append-only 文本模式。
-- update/source_finished/token_ids 双模式之后可以继续补测试脚本。
+- `append_frontend.py` 覆盖 append-only 文本模式。
+- `update_frontend.py` 覆盖单 update source 的文本快照模式；多 update source、source_finished 和 token_ids 双模式之后可以继续补测试脚本。
 - proxy 当前只接受 `api=completions` 和 `stream=false`。chat renderer 的物理
   token 镜像与流式响应中的 P 首 token 合并尚未实现，因此这两种请求会在
   start 阶段返回 400。
@@ -390,4 +542,6 @@ proxy 会把这个请求转发给 P 节点，并返回：
 - 启用 KV transfer 时，proxy 会检查
   `physical_prompt_len <= remote_num_tokens <= D_prompt_len`。如果不满足会返回
   502，不会让 D 静默加载错位 KV。
+- Slurm 节点显示 `idle` 不代表 GPU 显存一定空闲；以 sbatch 日志中的 `nvidia-smi`
+  输出为准。
 - 这个目录里的脚本是研究原型工具，不是生产服务入口。
