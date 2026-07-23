@@ -42,6 +42,18 @@ NIXL KV transfer 可以工作。
 
 这个脚本用于测试 update 源内 LCP、旧 update 后缀失效、以及 finish 后 update KV 与 prefix/append/question 的组合逻辑。
 
+### `mixed_frontend.py`
+
+`mixed_frontend.py` 是一个 append/update 混合语义前端/RAG mock。它默认发送一组交错事件：
+
+```text
+append -> update -> append -> append -> update -> finish
+```
+
+这个脚本用于测试更接近真实 RAG 的事件顺序：稳定上下文持续 append，同时一个可变检索结果以 update 快照形式被刷新。每个 append 事件是新增 chunk；每个 update 事件仍然是同一个 update source 的**完整当前快照**，不是增量 diff。
+
+脚本也支持用多个 `--event` 自定义事件顺序，例如 `--event append:...` 和 `--event update:...`。
+
 ### `start_p_node.sbatch` / `start_d_node.sbatch`
 
 这两个脚本用于在 Slurm 集群上提交 P/D vLLM server：
@@ -74,14 +86,14 @@ NIXL KV transfer 可以工作。
 | `<GPU_NODE>` | Slurm GPU 节点名 | `g2c12` |
 
 注意：`append_frontend.py --model` 要填写 `<SERVED_MODEL_NAME>`，不是 `<MODEL_PATH>`。
-`update_frontend.py --model` 也一样要填写 `<SERVED_MODEL_NAME>`。
+`update_frontend.py --model` 和 `mixed_frontend.py --model` 也一样要填写 `<SERVED_MODEL_NAME>`。
 `<MODEL_PATH>` 只出现在启动 vLLM server 或提交 sbatch job 的命令中。
 
 ## 参数关系
 
 ### `max_tokens`
 
-`append_frontend.py --max-tokens` 和 `update_frontend.py --max-tokens` 表示用户希望最终 completion 最多生成多少 token。
+`append_frontend.py --max-tokens`、`update_frontend.py --max-tokens` 和 `mixed_frontend.py --max-tokens` 表示用户希望最终 completion 最多生成多少 token。
 例如：
 
 ```shell
@@ -328,6 +340,35 @@ SLURM_JOB_GPUS=<PHYSICAL_GPU_ID>
   --final-question "\n用户问题：最新快照里 proxy 在 decode 前做了什么？\n回答："
 ```
 
+### 运行 mixed append/update 示例
+
+```shell
+.venv/bin/python research/scripts/mixed_frontend.py \
+  --proxy-url http://<PROXY_HOST>:<PROXY_PORT> \
+  --model <SERVED_MODEL_NAME> \
+  --max-tokens 64 \
+  --temperature 0
+```
+
+默认事件顺序是：
+
+```text
+append -> update -> append -> append -> update -> finish
+```
+
+也可以用多个 `--event` 自定义混合事件顺序。格式是 `<append|update>:text`，命令行顺序就是发送顺序：
+
+```shell
+.venv/bin/python research/scripts/mixed_frontend.py \
+  --proxy-url http://<PROXY_HOST>:<PROXY_PORT> \
+  --model <SERVED_MODEL_NAME> \
+  --event "append:稳定片段 1：EngineCore 保存长期请求状态。" \
+  --event "append:稳定片段 2：Append chunk 单调加入 prefix_append KV 域。" \
+  --event "update:可变快照 v0：proxy 收到流式事件。" \
+  --event "update:可变快照 v1：proxy 收到流式事件，并在 decode 前请求 P 节点 prefill。" \
+  --final-question "\n用户问题：稳定片段和最新快照说明 proxy 在 decode 前做什么？\n回答："
+```
+
 ## 禁用 KV transfer 的对照实验
 
 当 D 节点输出异常时，可以先让 proxy 加 `--disable-kv-transfer` 做 baseline：
@@ -442,9 +483,19 @@ sbatch --exclude=g2c15 research/scripts/start_d_node.sbatch
   --temperature 0
 ```
 
+### 当前 mixed append/update 测试示例
+
+```shell
+.venv/bin/python research/scripts/mixed_frontend.py \
+  --proxy-url http://127.0.0.1:8000 \
+  --model qwen2.5-3b \
+  --max-tokens 64 \
+  --temperature 0
+```
+
 ## RESTFUL 请求形状
 
-`append_frontend.py` 对 proxy 发送的核心请求如下。
+这些 frontend 脚本对 proxy 发送的核心请求如下。`mixed_frontend.py` 只是按同一个 `request_id` 交错发送 Append event 和 Update event。
 
 ### Start
 
@@ -528,7 +579,8 @@ update 事件的 `text` 是该来源当前版本的完整快照。P 节点内部
 ## 当前限制
 
 - `append_frontend.py` 覆盖 append-only 文本模式。
-- `update_frontend.py` 覆盖单 update source 的文本快照模式；多 update source、source_finished 和 token_ids 双模式之后可以继续补测试脚本。
+- `update_frontend.py` 覆盖单 update source 的文本快照模式。
+- `mixed_frontend.py` 覆盖单 append source + 单 update source 的文本混合模式；多 update source、source_finished 和 token_ids 双模式之后可以继续补测试脚本。
 - proxy 当前只接受 `api=completions` 和 `stream=false`。chat renderer 的物理
   token 镜像与流式响应中的 P 首 token 合并尚未实现，因此这两种请求会在
   start 阶段返回 400。

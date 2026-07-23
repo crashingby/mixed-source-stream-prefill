@@ -7,6 +7,44 @@
 当前实现已经删除普通连续 prompt 的 KV fallback。只要一个请求进入
 prompt stream 模式，它就必须走 segment-aware 路径。
 
+## 阶段性联调结果
+
+截至目前，`research/scripts` 下三个最小前端脚本都已经在真实 P/D 分离链路上
+完成 smoke test：
+
+| 测试脚本 | 覆盖场景 | 当前结果 | 说明 |
+| --- | --- | --- | --- |
+| `append_frontend.py` | append-only 文本事件 | 通过 | 验证稳定 chunk 单调进入 `PREFIX_APPEND` 域，并能 finish 后请求 D decode。 |
+| `update_frontend.py` | 单 update source 文本快照 | 通过 | 验证 update 完整快照、source-local LCP、`UPDATE` 域 prefill 和 finish decode 链路。 |
+| `mixed_frontend.py` | append / update 交错事件 | 通过 | 验证 `append -> update -> append -> append -> update -> finish` 这类混合事件序列可以跑通。 |
+
+这三个测试均走实验 proxy：
+
+```text
+frontend script
+  -> research/scripts/proxy_server.py
+  -> P /v1/prompt_stream/start
+  -> P /v1/prompt_stream/event
+  -> P /v1/prompt_stream/finish
+  -> D /v1/completions
+```
+
+目前可以确认的工程闭环是：
+
+- RESTFUL start / event / finish 能把文本事件送入 P 节点，并由 P 节点完成 tokenization。
+- Append chunk 能进入 `PREFIX_APPEND` 物理 KV 域。
+- Update snapshot 能进入 `UPDATE` 物理 KV 域，并使用 update 源内 LCP。
+- finish 后最终用户问题能接在 update 后面继续 prefill。
+- proxy 能拿到 P 返回的物理 prompt token ids 和 `kv_transfer_params`，再请求 D 节点 decode。
+- append-only、update-only 和混合模式都已经能返回非错误 completion。
+
+这仍然是 smoke test，不等价于完整正确性证明。当前仍保留这些近似和限制：
+
+- `PREFIX_APPEND` 末尾 padding 会参与 attention。
+- Append-after-Update 不强制重算已有 update KV，属于当前论文原型的近似语义。
+- 当前只覆盖单 update source，尚未测试多 update source 或 source_finished 自动收尾。
+- 当前测试主要验证链路和 block 排布没有直接崩溃，还没有系统化比较启用/禁用 NIXL 的输出一致性。
+
 ## 设计结论
 
 一个逻辑请求只拥有两个物理 KV 域：
@@ -524,7 +562,7 @@ tokenization。start 保存一个长期 output collector，event 只返回 ack�
 P 和 proxy 在 finish 成功后都会删除各自的长期 session，避免已完成 request id
 被错误复用。
 
-## 已添加的测试
+## 已添加的单元测试和脚本
 
 新增 `tests/v1/test_prompt_stream_request.py`，覆盖：
 
@@ -543,7 +581,7 @@ P 和 proxy 在 finish 成功后都会删除各自的长期 session，避免已�
 - `_all_token_ids` 与 `ConstantList` 始终一致。
 
 当前环境没有安装 `pytest` 和 `ruff`，所以没有运行正式 pytest / ruff 命令。
-已经完成的本地验证是：
+已经完成的本地代码级验证是：
 
 ```text
 py_compile: 通过
@@ -553,9 +591,17 @@ git diff --check: 通过
 
 直接测试运行时只有无 GPU 环境下的 NVML / Triton 提示，没有断言失败。
 
+新增 `research/scripts` 下的端到端 smoke test 脚本：
+
+- `append_frontend.py`：append-only 文本模式。
+- `update_frontend.py`：单 update source 文本快照模式。
+- `mixed_frontend.py`：单 append source + 单 update source 的混合文本模式。
+
+这三个脚本都已经在实验 P/D 分离链路上跑通过。
+
 ## 当前明确未完成的内容
 
-- 还没有在真实双 GPU NIXL 环境重新跑 append-only 集成测试。
+- 已完成 append-only、update-only、mixed 的真实 P/D smoke test，但还没有形成可重复的自动化集成测试。
 - padding 会参与 attention，尚未实现严格 mask 或 KV compaction。
 - Append-after-Update 保留旧 Update KV 是论文近似，位置和上下文不是完整重算结果。
 - 当前只支持一个 Update source。
@@ -573,7 +619,8 @@ git diff --check: 通过
   超长原因还没有通过独立错误通道回传给已经返回的 `/event`。
 - `total_tokens_recomputed` 统计字段尚未完整维护。
 
-下一步最有价值的验证是重新启动 P、D 和 proxy，确认 P 日志中的：
+下一步最有价值的验证是把三类 smoke test 固化成可重复脚本或 pytest 集成测试，
+并系统记录 P 日志中的：
 
 ```text
 physical prompt len
@@ -581,6 +628,6 @@ remote_num_tokens
 merged block counts
 ```
 
-与 proxy 日志满足 `remote_num_tokens <= prompt_token_len <=
-remote_num_tokens + 1`，然后比较启用和禁用 NIXL 的输出。如果仍异常，就继续
-检查 NIXL worker 实际复制的远端/本地 block id 对。
+与 proxy 日志中的 D prompt 长度关系。之后再比较启用和禁用 NIXL 的输出差异，
+判断剩余误差主要来自 padding 近似、Append-after-Update 近似，还是 NIXL 实际复制
+的远端/本地 block id 对。
