@@ -409,11 +409,20 @@ export MAX_NUM_SEQS=16
 
 示例：P 跑在 `g2c13`，D 跑在 `g2c12`。
 
+这两个 job 位于**不同物理节点**时，必须分别设置
+`VLLM_NIXL_SIDE_CHANNEL_HOST`。该变量是节点对外发布给 NIXL 对端的握手地址；
+P finish 返回的 `kv_transfer_params.remote_host` 就来自 P 的这个值。默认值是
+`localhost`，只适用于 P/D 位于同一物理节点的情况，跨节点时会让 D 错连到自己。
+
+这里直接使用可被集群节点互相解析的 Slurm 主机名。若集群 DNS 不可用，可替换为
+对应节点日志中 `HOST_IP` 的可达内网 IP（本环境优先使用 `10.4.1.x` 地址）。
+
 ```shell
 mkdir -p research/scripts/logs
 ```
 
 ```shell
+VLLM_NIXL_SIDE_CHANNEL_HOST=g2c13 \
 MODEL_PATH=/workplace/home/huangxinying/Models/Qwen2.5-3B/ \
 SERVED_MODEL_NAME=qwen2.5-3b \
 GPU_MEMORY_UTILIZATION=0.6 \
@@ -423,6 +432,7 @@ sbatch --nodelist=g2c13 research/scripts/start_p_node.sbatch
 ```
 
 ```shell
+VLLM_NIXL_SIDE_CHANNEL_HOST=g2c12 \
 MODEL_PATH=/workplace/home/huangxinying/Models/Qwen2.5-3B/ \
 SERVED_MODEL_NAME=qwen2.5-3b \
 GPU_MEMORY_UTILIZATION=0.6 \
@@ -430,6 +440,24 @@ MAX_MODEL_LEN=4096 \
 MAX_NUM_SEQS=16 \
 sbatch --nodelist=g2c12 research/scripts/start_d_node.sbatch
 ```
+
+两个 job 日志启动后应分别确认：
+
+```text
+HOSTNAME=g2c13
+NIXL_SIDE_CHANNEL_HOST=g2c13
+NIXL_SIDE_CHANNEL_PORT=5600
+
+HOSTNAME=g2c12
+NIXL_SIDE_CHANNEL_HOST=g2c12
+NIXL_SIDE_CHANNEL_PORT=5601
+```
+
+当前 sbatch 脚本会打印并传递 `NIXL_SIDE_CHANNEL_HOST` 与
+`NIXL_SIDE_CHANNEL_PORT`。若提交命令没有显式设置 host，脚本会以该 Slurm job 的
+`hostname` 作为默认值；显式设置仍可用于改用可达内网 IP。P finish 返回给 proxy
+的 `kv_transfer_params.remote_host` 必须是 P 节点地址，不能是 `localhost` 或
+`127.0.0.1`。
 
 如果某个节点显存或工具链有问题，可以换成其它空闲节点，或排除问题节点：
 
@@ -451,7 +479,9 @@ sbatch --exclude=g2c15 research/scripts/start_d_node.sbatch
   --decoder-ports 8200
 ```
 
-如果 P/D 都在同一节点，例如都在 `g2c13`：
+如果 P/D 都在同一节点，例如都在 `g2c13`，proxy 两侧 host 都填写该节点即可；
+此时 side-channel 使用 `localhost` 也能工作，但仍建议保留 sbatch 的自动 host 设置，
+这样后续迁移为跨节点部署时不会遗漏配置。
 
 ```shell
 .venv/bin/python research/scripts/proxy_server.py \

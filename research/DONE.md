@@ -564,8 +564,14 @@ P 和 proxy 在 finish 成功后都会删除各自的长期 session，避免已�
 
 ## 已添加的单元测试和脚本
 
-新增 `tests/v1/test_prompt_stream_request.py`，覆盖：
+`tests/v1/test_prompt_stream_request.py` 
 
+当前覆盖：
+
+- 固定模板先完成 bootstrap prefill；随后 Append 与 Update 作为同一个请求内的
+  FIFO work item 竞争，不再由 `PREFIX_APPEND` 的硬编码优先级决定。
+- Update 先获调度、Append 后到时，Update 冻结当时已经提交的
+  `PREFIX_APPEND` 物理 token/KV 快照，不能读取该 Append chunk。
 - 连续快速到达的 Append、Update、Finish 仍按阶段顺序执行。
 - `PREFIX_APPEND` 的 padding 和物理 token view。
 - 多个 Append source 交错到达时保持全局尾部追加顺序。
@@ -583,11 +589,6 @@ P 和 proxy 在 finish 成功后都会删除各自的长期 session，避免已�
 当前环境没有安装 `pytest` 和 `ruff`，所以没有运行正式 pytest / ruff 命令。
 已经完成的本地代码级验证是：
 
-```text
-py_compile: 通过
-git diff --check: 通过
-直接调用 10 个 Request/KV/NIXL 边界测试函数: 通过
-```
 
 直接测试运行时只有无 GPU 环境下的 NVML / Triton 提示，没有断言失败。
 

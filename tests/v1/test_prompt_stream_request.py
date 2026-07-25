@@ -86,7 +86,7 @@ def _make_event(
 
 
 def _start_request(request: Request, block_size: int = 4) -> None:
-    """应用 start 空事件并准备第一个 PREFIX_APPEND 视图。"""
+    """应用 start 空事件并准备固定模板的 bootstrap 视图。"""
     request.apply_prompt_stream_event(
         _make_event(
             PromptStreamEventType.APPEND,
@@ -117,6 +117,7 @@ def test_rapid_events_preserve_prefill_phase_order() -> None:
     """Finish 快速到达时仍必须按 PA、Update、Question 顺序提交。"""
     request = _make_request([1, 2, 3])
     _start_request(request)
+    _finish_active_view(request)
 
     request.apply_prompt_stream_event(
         _make_event(
@@ -182,6 +183,49 @@ def test_rapid_events_preserve_prefill_phase_order() -> None:
         20,
     ]
     _assert_token_views_consistent(request)
+
+
+def test_update_can_run_before_later_append_and_freezes_prefix_snapshot() -> None:
+    """Update 先获调度时，不得读取尚未提交的 Append KV。"""
+    request = _make_request([1, 2, 3])
+    _start_request(request)
+    _finish_active_view(request)
+
+    # 两个 source 都就绪，但 Update 事件先进入统一 work 队列。
+    request.apply_prompt_stream_event(
+        _make_event(
+            PromptStreamEventType.UPDATE,
+            [10, 11],
+            source_id="update",
+            source_type=PromptSourceType.UPDATE,
+        )
+    )
+    request.apply_prompt_stream_event(
+        _make_event(
+            PromptStreamEventType.APPEND,
+            [4],
+            source_id="append",
+            source_type=PromptSourceType.APPEND,
+        )
+    )
+
+    request.prepare_prompt_stream_execution(4)
+    view = request.prompt_stream_execution_view
+    assert view is not None
+    assert view.phase == PromptStreamExecutionPhase.UPDATE
+    # 模板 [1, 2, 3] 的物理尾部 padding 仍在；后到的 Append token 4 不可见。
+    assert list(view.token_ids) == [1, 2, 3, 3, 10, 11]
+    _finish_active_view(request)
+
+    request.prepare_prompt_stream_execution(4)
+    view = request.prompt_stream_execution_view
+    assert view is not None
+    assert view.phase == PromptStreamExecutionPhase.PREFIX_APPEND
+    assert list(view.token_ids) == [1, 2, 3, 4]
+    _finish_active_view(request)
+
+    assert request.prompt_stream is not None
+    assert request.prompt_stream.prefix_append_committed_logical_len == 4
 
 
 def test_empty_final_question_is_rejected() -> None:
@@ -303,10 +347,23 @@ def test_interleaved_append_sources_keep_global_tail_order() -> None:
         )
     )
 
+    # 三个 Append 事件分别成为 work item，并保持它们的全局到达顺序。
     request.prepare_prompt_stream_execution(4)
     view = request.prompt_stream_execution_view
     assert view is not None
     assert view.phase == PromptStreamExecutionPhase.PREFIX_APPEND
+    assert list(view.token_ids) == [1, 2, 3, 4, 10, 4, 4, 4]
+    _finish_active_view(request)
+
+    request.prepare_prompt_stream_execution(4)
+    view = request.prompt_stream_execution_view
+    assert view is not None
+    assert list(view.token_ids) == [1, 2, 3, 4, 10, 20, 4, 4]
+    _finish_active_view(request)
+
+    request.prepare_prompt_stream_execution(4)
+    view = request.prompt_stream_execution_view
+    assert view is not None
     assert list(view.token_ids) == [1, 2, 3, 4, 10, 20, 11, 4]
 
 
