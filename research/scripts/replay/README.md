@@ -165,6 +165,27 @@ P/D 节点的完整启动方式见上一级 [scripts README](../README.md)。
 建议先完成一轮流式实验，再完成一轮普通实验，避免两种负载同时干扰同一组
 GPU。
 
+## TTFT survival curve 画图
+
+`plot_ttft_survival.py` 会读取两个结果目录里的 `request_metrics.csv`，把流式
+prefill 和普通模式画在同一张图中。横坐标是 TTFT，单位 ms；纵坐标是
+`percent(TTFT > x)`，即 TTFT 大于当前横坐标的请求占比。
+
+流式 prefill 使用 `finish_to_first_token_ms` 作为 TTFT；普通模式使用
+`request_to_first_token_ms` 作为 TTFT。脚本只统计 `result_status=ok` 且 TTFT
+字段有效的请求。
+
+```shell
+.venv/bin/python research/scripts/replay/plot_ttft_survival.py \
+  --stream-result-dir research/scripts/replay/results/stream-poisson-qps-1 \
+  --normal-result-dir research/scripts/replay/results/normal-poisson-qps-1 \
+  --output research/scripts/replay/results/ttft-survival-qps-1.svg \
+  --title "TTFT survival, QPS=1"
+```
+
+脚本会同时写出一个同名 `.summary.json`，记录每条曲线的样本数、均值和分位数。
+当前实现只依赖 Python 标准库并输出 SVG，不需要额外安装 matplotlib。
+
 ## 公共参数
 
 | 参数 | 默认值 | 含义 |
