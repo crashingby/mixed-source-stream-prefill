@@ -238,19 +238,7 @@ def parse_args(mode: ReplayMode) -> argparse.Namespace:
         "--max-requests",
         type=int,
         default=1,
-        help=(
-            "Maximum requests after prompt-length filtering; "
-            "0 means all selected requests."
-        ),
-    )
-    parser.add_argument(
-        "--max-prompt-tokens",
-        type=int,
-        default=None,
-        help=(
-            "Maximum segmented prompt sequence length reported by the P-node "
-            "preflight endpoint. Omit to disable online length filtering."
-        ),
+        help="Maximum selected requests; 0 means all selected requests.",
     )
     parser.add_argument(
         "--include-partial",
@@ -699,126 +687,26 @@ async def _post_json(
     return response_json
 
 
-def _make_preflight_payload(
-    sample: SampleReplayInput,
-    args: argparse.Namespace,
-) -> dict[str, Any]:
-    """构造 P 节点按真实分段 tokenizer 语义执行的预检请求。
-
-    预检保留每个 Append chunk、Update 快照和控制事件的原始边界。不能先把
-    文本拼成一个字符串再 tokenization，否则结果会偏离 prompt-stream API
-    对每个事件分别 tokenization 的真实执行语义。
-    """
-    events = [
-        dict(record["event"])
-        for source_stream in sample.source_streams
-        for record in source_stream.event_records
-    ]
-    events.append(dict(sample.finish_event))
-    return {
-        "model": args.model,
-        "prompt": sample.start_request["prompt"],
-        "events": events,
-    }
-
-
 def _request_limit(args: argparse.Namespace) -> int | None:
-    """返回长度过滤后应保留的样本上限。
+    """返回本次应保留的样本上限。
 
     显式 ``--query-id`` 延续原有语义：回放所有指定 id，不受
-    ``--max-requests`` 默认值影响。批量扫描时，0 表示不设上限。
+    ``--max-requests`` 默认值影响。批量回放时，0 表示不设上限。
     """
     if args.query_ids or args.max_requests == 0:
         return None
     return args.max_requests
 
 
-async def _filter_samples_by_prompt_length(
+def _limit_selected_samples(
     samples: Sequence[SampleReplayInput],
     args: argparse.Namespace,
 ) -> list[SampleReplayInput]:
-    """在 QPS 计时前按 P 节点真实 prompt 长度过滤样本。
-
-    ``max_requests`` 在本函数完成长度判断后才生效。这样即使排序靠前的样本
-    超长，批量回放仍会继续扫描后续样本，直到收集到指定数量的可运行请求。
-
-    Args:
-        samples: 已完成本地格式校验、尚未限制数量的候选样本。
-        args: 当前回放参数。
-
-    Returns:
-        保持原有排序的可回放样本。
-
-    Raises:
-        ReplayHttpError: preflight 响应缺少有效 token 长度。
-        ValueError: 所有候选样本都被长度条件排除。
-    """
+    """按本地选择参数保留候选样本，不提前查看完整请求长度。"""
     request_limit = _request_limit(args)
-    if args.max_prompt_tokens is None:
-        selected_samples = list(samples)
-        if request_limit is not None:
-            selected_samples = selected_samples[:request_limit]
-        return selected_samples
-
-    preflight_url = _normalize_v1_url(
-        args.proxy_url,
-        "/v1/prompt_stream/preflight",
-    )
-    selected_samples: list[SampleReplayInput] = []
-    num_inspected = 0
-    num_too_long = 0
-    async with httpx.AsyncClient(timeout=args.http_timeout) as client:
-        for sample in samples:
-            response = await _post_json(
-                client,
-                preflight_url,
-                _make_preflight_payload(sample, args),
-            )
-            required_tokens = response.get("max_required_sequence_tokens")
-            if isinstance(required_tokens, bool) or not isinstance(
-                required_tokens, int
-            ):
-                raise ReplayHttpError(
-                    "Prompt-stream preflight response requires integer "
-                    f"max_required_sequence_tokens: {response!r}."
-                )
-
-            num_inspected += 1
-            fits_server = response.get("fits_server_max_model_len", True)
-            if not isinstance(fits_server, bool):
-                raise ReplayHttpError(
-                    "Prompt-stream preflight response field "
-                    f"fits_server_max_model_len must be boolean: {response!r}."
-                )
-            if required_tokens > args.max_prompt_tokens or not fits_server:
-                num_too_long += 1
-                logger.info(
-                    "Skipping sample=%s query_id=%s: "
-                    "max_required_sequence_tokens=%d, configured_limit=%d, "
-                    "fits_server_max_model_len=%s.",
-                    sample.sample_id,
-                    sample.query_id,
-                    required_tokens,
-                    args.max_prompt_tokens,
-                    fits_server,
-                )
-                continue
-
-            selected_samples.append(sample)
-            if request_limit is not None and len(selected_samples) >= request_limit:
-                break
-
-    if not selected_samples:
-        raise ValueError(
-            "No eligible mixed-source samples remain after "
-            f"--max-prompt-tokens={args.max_prompt_tokens} filtering."
-        )
-    logger.info(
-        "Prompt-length preflight inspected %d samples, skipped %d, retained %d.",
-        num_inspected,
-        num_too_long,
-        len(selected_samples),
-    )
+    selected_samples = list(samples)
+    if request_limit is not None:
+        selected_samples = selected_samples[:request_limit]
     return selected_samples
 
 
@@ -1168,8 +1056,6 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--http-timeout must be positive.")
     if args.max_tokens is not None and args.max_tokens <= 0:
         raise ValueError("--max-tokens must be positive when specified.")
-    if args.max_prompt_tokens is not None and args.max_prompt_tokens <= 0:
-        raise ValueError("--max-prompt-tokens must be positive when specified.")
     timing_field_names = (
         (
             "append_initial_delay",
@@ -1214,7 +1100,7 @@ async def run(
     """
     _validate_args(args)
     candidate_samples = _select_samples(args)
-    samples = await _filter_samples_by_prompt_length(candidate_samples, args)
+    samples = _limit_selected_samples(candidate_samples, args)
     run_id, run_directory = _make_run_directory(args)
     logger.info(
         "Selected %d samples; mode=%s qps=%.3f max_concurrency=%d.",

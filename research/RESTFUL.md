@@ -5,7 +5,7 @@
 当前代码里已经有这些相关入口：
 
 - `research/scripts/proxy_server.py`：当前实验用 P/D proxy，已经支持
-  `/v1/prompt_stream/preflight|start|event|finish|abort`。
+  `/v1/prompt_stream/start|event|finish|abort`。
 - `research/scripts/append_frontend.py`：最小 append-only 前端脚本，用于走通 start、append event、finish 和 D 侧 decode。
 - `vllm/entrypoints/serve/prompt_stream/`：P 节点 RESTFUL router、协议模型和 serving 逻辑。
 - `vllm/entrypoints/openai/api_server.py`：OpenAI-compatible server 的主入口。当前已经在 `build_app()` 中注册 prompt stream router。
@@ -45,8 +45,6 @@ sequenceDiagram
 - **Start**：创建 P 节点上的长期请求，保存固定 prefix/template。
 - **Event**：多次提交 Append / Update / Source Finished 事件，只返回 ack。
 - **Finish**：提交最终用户问题，P 节点完成最后 prefill，产生 `kv_transfer_params`，然后 D 节点继续 decode。
-- **Preflight**：在创建会话前，用 P 的真实 tokenizer、block size 和
-  segment padding 规则估算完整事件序列的最大物理长度。
 
 整体流程如下：
 
@@ -104,49 +102,6 @@ app.state.prompt_stream_sessions = {
 - 固定一个请求对应的 D 节点，finish 后把 KV 交给同一个 D。
 - 保存原始生成请求参数，例如 `model` 和采样参数。
 - 避免每个事件都重新 round-robin 到不同 prefiller。
-
-### `POST /v1/prompt_stream/preflight`
-
-用途：在正式回放和 QPS 计时之前检查一个完整样本是否超过 P/D 的最大序列
-长度。请求包含 start prompt 和原始分段事件：
-
-```json
-{
-  "model": "local-completions",
-  "prompt": "通用模板",
-  "events": [
-    {
-      "source_id": "anns",
-      "event_type": "append",
-      "source_type": "append",
-      "text": "chunk"
-    },
-    {
-      "source_id": "question",
-      "event_type": "prompt_finished",
-      "text": "最终问题"
-    }
-  ]
-}
-```
-
-P 节点对 start prompt 使用 `add_special_tokens=true`，对每个事件分别使用
-`add_special_tokens=false`。`max_required_sequence_tokens` 是按实际分段
-状态机得到的**最大运行序列上界**：它会比较 Update 各版本和 finish 阶段可能
-达到的峰值，并计入 `PREFIX_APPEND` 尾部 segment padding，以及为 P 首输出
-token 预留的 `+1` 位置。它不是纯逻辑 prompt token 数。响应核心字段为：
-
-```json
-{
-  "block_size": 16,
-  "server_max_model_len": 4096,
-  "final_physical_prompt_tokens": 2048,
-  "max_required_sequence_tokens": 2049,
-  "fits_server_max_model_len": true
-}
-```
-
-该接口无状态，不创建长期 Request，也不计入实验 TTFT。
 
 ### `POST /v1/prompt_stream/start`
 
@@ -775,13 +730,13 @@ POST /v1/prompt_stream/finish
 ## 当前实现同步
 
 目前 RESTFUL 链路已经有第一版实验实现，Append、Update 和混合来源均有单请求
-smoke test；大规模回放所需的长度预检与 exact KV 传输保护已经落到代码，仍需
-在真实双 GPU 环境重新验证吞吐与输出质量。
+smoke test；大规模回放依赖数据构建阶段的 chunk/token 预算控制长度，runtime
+仍保留超限 fail closed 与 exact KV 传输保护。
 
 已经完成的部分包括：
 
 - `research/scripts/proxy_server.py` 已经实现实验用代理服务器，提供
-  `/v1/prompt_stream/preflight`、`/start`、`/event`、`/finish` 和 `/abort`。
+  `/v1/prompt_stream/start`、`/event`、`/finish` 和 `/abort`。
 - `vllm/entrypoints/serve/prompt_stream/api_router.py`、`protocol.py` 和 `serving.py` 已经提供 P 节点 RESTFUL 入口。
 - `vllm/entrypoints/openai/api_server.py` 已经注册 prompt stream router，因此 P 节点和 D 节点启动同一个 OpenAI-compatible server 后都能看到 `/v1/prompt_stream/*` 路由。
 - `EngineClient` / `AsyncLLM` 已经补了 prompt stream 专用方法：

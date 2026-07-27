@@ -15,7 +15,7 @@ RESTFUL API。
 
 | 类型 | proxy 路径 | 后端 |
 | --- | --- | --- |
-| mixed-source 流式 prefill | `/v1/prompt_stream/preflight`、`/start`、`/event`、`/finish`、`/abort` | P 节点完成分段 token 预检与流式 prefill，再把 KV 交给 D 节点 |
+| mixed-source 流式 prefill | `/v1/prompt_stream/start`、`/event`、`/finish`、`/abort` | P 节点完成流式 prefill，再把 KV 交给 D 节点 |
 | 普通 completions | `/v1/completions` | 直接转发到一个 D 节点 |
 | 普通 chat completions | `/v1/chat/completions` | 直接转发到一个 D 节点 |
 | 普通 Responses API | `/v1/responses` | 直接转发到一个 D 节点 |
@@ -67,38 +67,21 @@ P/D 节点的完整启动方式见上一级 [scripts README](../README.md)。
 给 D 节点。从普通 completions 请求发出到收到第一个 D 节点 SSE token 的时间
 就是普通模式 TTFT，`ttft_origin` 为 `normal_decode`。
 
-## 最大 prompt 长度过滤
+## 样本长度控制
 
-两个入口共享 `--max-prompt-tokens`。所有在线回放示例统一显式设置为
-`4096`，与当前 P/D 节点的 `--max-model-len 4096` 保持一致。
+回放脚本不再在请求开始前请求服务端做完整 prompt 预检。这样更贴近在线 RAG
+场景：真正处理流式请求时，系统只知道已经到达的 chunk，不提前知道完整请求。
 
-设置该参数后，回放程序会在开始 QPS 计时之前，对候选样本逐个请求 proxy 的
-`POST /v1/prompt_stream/preflight`。P 节点使用真实运行时 tokenizer，并保留
-模板、每个 Append chunk、每个 Update 快照和最终问题的分段边界。筛选依据是
-响应中的 `max_required_sequence_tokens`。它表示 P 节点按实际分段状态机计算的
-**最大运行序列上界**，包含 `PREFIX_APPEND` 的 segment padding，以及为 P
-采样首 token 预留的 `+1` 位置。因此，这个值不是字符数、不是纯逻辑 prompt
-token 数，也不是把全部文本拼接后只做一次 tokenization 的近似值。
-
-长度过滤先执行，`--max-requests` 后执行。例如指定
-`--max-requests 100 --max-prompt-tokens 4096` 时，脚本会继续跳过超长样本，
-直到收集到 100 个合格样本或耗尽候选数据。普通模式和流式模式调用相同的
-preflight，因此在参数与数据范围相同时会得到一致的样本集合。
-显式重复传入 `--query-id` 时会回放所有指定 ID，`--max-requests` 不再截断
-这组显式选择；长度过滤仍然生效。
-
-当前 preflight 和 start 会分别对 P 节点池做 round-robin，因此多 P/D 实例
-必须使用相同模型、tokenizer、block size 和 `max_model_len`。当前实验部署建议
-所有 P/D 都统一为 `4096`；异构节点池尚未实现 preflight 到 start 的节点绑定。
-
-`--max-prompt-tokens` 默认不启用。只要显式设置该参数，即使同时设置
-`--dry-run`，也需要 proxy 和 P 节点在线，因为长度来自服务端真实 tokenizer
-和 block size。若希望完全离线检查，请省略该参数。
+样本长度应在数据构建阶段控制，例如使用
+`build_mixed_source_dataset.py` 的 `--max-web-chunk-tokens`、
+`--max-anns-document-tokens` 和 `--max-update-snapshot-tokens`。回放阶段如果仍然
+遇到超出 P/D `max_model_len` 的样本，该请求会沿正常 start/event/finish 链路
+失败，并按实验错误记录处理。
 
 ## 离线检查
 
 离线检查只解析数据并构造最终 prompt，不访问 proxy、P 或 D。两个入口都能
-执行，输出目录不能重名。以下命令特意不传 `--max-prompt-tokens`。
+执行，输出目录不能重名。
 
 ```shell
 .venv/bin/python research/scripts/replay/replay_prompt_stream.py \
@@ -126,7 +109,6 @@ preflight，因此在参数与数据范围相同时会得到一致的样本集�
   --query-id 0 \
   --proxy-url http://<PROXY_HOST>:8000 \
   --model <SERVED_MODEL_NAME> \
-  --max-prompt-tokens 4096 \
   --qps 0 \
   --max-concurrency 1 \
   --append-chunk-interval 0.05 \
@@ -144,7 +126,6 @@ preflight，因此在参数与数据范围相同时会得到一致的样本集�
   --max-requests 100 \
   --proxy-url http://<PROXY_HOST>:8000 \
   --model <SERVED_MODEL_NAME> \
-  --max-prompt-tokens 4096 \
   --qps 1.0 \
   --arrival-process poisson \
   --random-seed 2026 \
@@ -165,7 +146,6 @@ preflight，因此在参数与数据范围相同时会得到一致的样本集�
   --max-requests 100 \
   --proxy-url http://<PROXY_HOST>:8000 \
   --model <SERVED_MODEL_NAME> \
-  --max-prompt-tokens 4096 \
   --qps 1.0 \
   --arrival-process poisson \
   --random-seed 2026 \
@@ -177,8 +157,7 @@ preflight，因此在参数与数据范围相同时会得到一致的样本集�
 
 为了公平比较，两个脚本应使用相同的：
 
-- 样本范围：`--query-id`、`--start-index`、`--max-prompt-tokens` 和
-  `--max-requests`。
+- 样本范围：`--query-id`、`--start-index` 和 `--max-requests`。
 - 逻辑请求负载：`--qps`、`--arrival-process`、`--random-seed` 和
   `--max-concurrency`。
 - 生成参数：`--model`、`--max-tokens`、`--temperature` 和 `--seed`。
@@ -193,8 +172,7 @@ GPU。
 | `--data-dir` | `research/data/mix_source` | 包含 `requests/` 的数据目录。 |
 | `--query-id` | 无 | 指定 query id，可重复使用；显式 ID 不受 `--max-requests` 截断。 |
 | `--start-index` | `0` | 未指定 query id 时的排序后起始位置。 |
-| `--max-requests` | `1` | 长度过滤后保留的最大样本数；`0` 表示全部。 |
-| `--max-prompt-tokens` | 不过滤 | P preflight 计算的最大运行序列上界，包含 segment padding 和为 P 首 token 预留的 `+1`；在线实验示例使用 `4096`。 |
+| `--max-requests` | `1` | 批量模式保留的最大样本数；`0` 表示全部。 |
 | `--include-partial` | 关闭 | 允许使用 `status != complete` 的样本。 |
 | `--proxy-url` | `http://127.0.0.1:8000` | 两种模式共同使用的 proxy 地址。 |
 | `--model` | `qwen2.5-3b` | 必须匹配服务端的 `--served-model-name`。 |

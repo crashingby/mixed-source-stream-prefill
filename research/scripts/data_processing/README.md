@@ -154,8 +154,8 @@ token 预算。token 预算既可以用于**联网重新检索**，也可以用�
 这条命令只处理已有 `.cache/web/query_<id>.json` 的问题，不会重新联网检索，
 也不会为尚未爬完的问题刷失败日志。它会重写对应的 `requests/*.json`，把每个
 网页 Append chunk 控制在约 256 tokens，并把每个 Update 快照控制在约 1536
-tokens。之后再用 replay 的 `--max-prompt-tokens 4096` 过滤，合格样本会明显
-增多。
+tokens。回放阶段不再提前请求完整 prompt 预检，因此这里的 token 预算是控制
+样本长度的主要手段。
 
 当前本机 Qwen 复用缓存示例：
 
@@ -271,8 +271,8 @@ tokens。之后再用 replay 的 `--max-prompt-tokens 4096` 过滤，合格样�
 原始 ANNS 和网页正文可能超过实际模型的 `max_model_len`。默认行为仍然保留
 原始内容；要让更多样本适配 4096 窗口，应当在生成阶段显式启用
 `--tokenizer-model`、`--max-web-chunk-tokens`、
-`--max-anns-document-tokens` 和 `--max-update-snapshot-tokens`。正式回放时仍
-建议保留 `--max-prompt-tokens 4096`，作为服务端 tokenizer 的最终保护。
+`--max-anns-document-tokens` 和 `--max-update-snapshot-tokens`。正式回放时若
+仍遇到超长样本，会由 P/D 的正常请求路径 fail closed。
 
 ### 缓存、覆盖和失败处理
 

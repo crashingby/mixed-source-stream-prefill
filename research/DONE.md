@@ -287,7 +287,8 @@ Potentially invalid KV blocks for unrecognized request
 
 当前使用四层保护：
 
-- 回放程序通过 `/v1/prompt_stream/preflight` 在 QPS 计时前过滤超长样本。
+- 数据构建阶段通过每个网页 Append chunk、每个 ANNS 文档和每个 Update
+  快照的 token 预算控制样本长度，回放阶段不再提前查看完整请求长度。
 - P serving 为每个活跃会话维护一个无 KV 的 Request 长度镜像；事件进入
   EngineCore 前检查实际阶段的最大运行序列上界。这个上界包含 segment
   padding 和为 P 首 token 预留的 `+1`，超限时使用 EngineCore 内部 request

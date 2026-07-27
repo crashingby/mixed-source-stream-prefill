@@ -11,8 +11,6 @@ NIXL KV transfer 可以工作。
 `proxy_server.py` 是 PD 分离场景下的实验代理服务器。RAG 前端只访问这个 proxy，proxy 负责：
 
 - 接收 `/v1/prompt_stream/start`，为请求选择一个 P 节点和一个 D 节点。
-- 接收无状态的 `/v1/prompt_stream/preflight`，转给 P 节点按真实 tokenizer
-  和 block 对齐规则计算最大序列长度。
 - 把 start 请求转发给 P 节点的 `/v1/prompt_stream/start`。
 - 保存 P 节点返回的内部 `request_id`，后续 event/finish 都使用这个 id。
 - 接收 `/v1/prompt_stream/event`，把 append/update/source_finished 事件转发给同一个 P 节点。

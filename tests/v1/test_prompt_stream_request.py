@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -11,13 +10,6 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.pull_scheduler import (
     NixlPullConnectorScheduler,
     _trim_prompt_stream_local_blocks,
     _trim_prompt_stream_local_blocks_to_manifest,
-)
-from vllm.entrypoints.serve.prompt_stream.protocol import (
-    PromptStreamEventRequest,
-    PromptStreamPreflightRequest,
-)
-from vllm.entrypoints.serve.prompt_stream.serving import (
-    PromptStreamServing,
 )
 from vllm.sampling_params import SamplingParams
 from vllm.v1.core.kv_cache_manager import KVCacheManager
@@ -711,63 +703,3 @@ def test_prompt_stream_exact_transfer_uses_manifest_token_boundary() -> None:
 
     assert num_external_tokens == num_remote_tokens
     assert is_async
-
-
-def test_prompt_stream_preflight_accounts_for_segments_and_first_token() -> None:
-    """Preflight 上界必须包含 PA padding、最大 Update 快照与首 token。"""
-    engine_client = SimpleNamespace(
-        vllm_config=SimpleNamespace(
-            cache_config=SimpleNamespace(block_size=4),
-            model_config=SimpleNamespace(max_model_len=14),
-        )
-    )
-    serving = PromptStreamServing(engine_client)
-    request = PromptStreamPreflightRequest(
-        prompt=[1, 2, 3],
-        events=[
-            PromptStreamEventRequest(
-                source_id="append",
-                event_type="append",
-                source_type="append",
-                version=0,
-                sequence_no=0,
-                token_ids=[4, 5],
-            ),
-            PromptStreamEventRequest(
-                source_id="update",
-                event_type="update",
-                source_type="update",
-                version=0,
-                sequence_no=0,
-                token_ids=[10, 11, 12, 13, 14, 15],
-            ),
-            PromptStreamEventRequest(
-                source_id="update",
-                event_type="update",
-                source_type="update",
-                version=1,
-                sequence_no=1,
-                token_ids=[10, 11],
-            ),
-            PromptStreamEventRequest(
-                source_id="question",
-                event_type="prompt_finished",
-                source_type=None,
-                version=0,
-                sequence_no=0,
-                token_ids=[20, 21],
-            ),
-        ],
-    )
-
-    response = serving.preflight(request)
-
-    assert response.prefix_tokens == 3
-    assert response.append_tokens == 2
-    assert response.prefix_append_padding_tokens == 3
-    assert response.max_update_tokens == 6
-    assert response.final_update_tokens == 2
-    assert response.question_tokens == 2
-    assert response.final_physical_prompt_tokens == 12
-    assert response.max_required_sequence_tokens == 15
-    assert not response.fits_server_max_model_len

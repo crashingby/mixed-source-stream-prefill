@@ -14,8 +14,6 @@ from vllm.entrypoints.serve.prompt_stream.protocol import (
     PromptStreamEventRequest,
     PromptStreamEventResponse,
     PromptStreamFinishResponse,
-    PromptStreamPreflightRequest,
-    PromptStreamPreflightResponse,
     PromptStreamStartRequest,
     PromptStreamStartResponse,
 )
@@ -69,72 +67,6 @@ class PromptStreamServing:
     def __init__(self, engine_client: EngineClient) -> None:
         self.engine_client = engine_client
         self.sessions: dict[str, PromptStreamSession] = {}
-
-    def preflight(
-        self,
-        request: PromptStreamPreflightRequest,
-    ) -> PromptStreamPreflightResponse:
-        """使用 P 节点真实 tokenizer 估算完整事件序列的最大物理长度。
-
-        Update 事件是全量快照，所以这里记录所有有效 Update 版本中的最大
-        长度。最终上界使用“最终 PREFIX_APPEND 对齐长度 + 最大 Update
-        快照”，因此不依赖 replay 时两个来源的具体并发交错顺序。
-        """
-        prefix_token_ids = self._resolve_start_prompt_token_ids(request.prompt)
-        length_request = self._build_length_request(
-            request_id="__prompt_stream_preflight__",
-            prefix_token_ids=prefix_token_ids,
-            sampling_params=SamplingParams(max_tokens=1),
-        )
-        max_update_tokens = 0
-        prompt_finished_count = 0
-
-        for event_request in request.events:
-            event = self._build_prompt_stream_event(
-                request_id=length_request.request_id,
-                event_request=event_request,
-            )
-            length_request.apply_prompt_stream_event(event)
-            layout = length_request.get_prompt_stream_layout()
-            max_update_tokens = max(max_update_tokens, layout.update_len)
-            if event.event_type == PromptStreamEventType.PROMPT_FINISHED:
-                prompt_finished_count += 1
-
-        if prompt_finished_count != 1:
-            raise ValueError(
-                "Prompt stream preflight requires exactly one "
-                f"prompt_finished event, but got {prompt_finished_count}."
-            )
-
-        layout = length_request.get_prompt_stream_layout()
-        if layout.suffix_len == 0:
-            raise ValueError(
-                "Prompt stream preflight requires a non-empty final question."
-            )
-        prefix_append_physical_len = (
-            layout.prefix_len + layout.append_len + layout.prefix_append_padding_len
-        )
-        max_required_sequence_tokens = (
-            max(
-                prefix_append_physical_len + max_update_tokens,
-                layout.physical_total_len,
-            )
-            + 1
-        )
-        max_model_len = self._max_model_len()
-        return PromptStreamPreflightResponse(
-            block_size=self._block_size(),
-            server_max_model_len=max_model_len,
-            prefix_tokens=layout.prefix_len,
-            append_tokens=layout.append_len,
-            max_update_tokens=max_update_tokens,
-            final_update_tokens=layout.update_len,
-            question_tokens=layout.suffix_len,
-            prefix_append_padding_tokens=layout.prefix_append_padding_len,
-            final_physical_prompt_tokens=layout.physical_total_len,
-            max_required_sequence_tokens=max_required_sequence_tokens,
-            fits_server_max_model_len=(max_required_sequence_tokens <= max_model_len),
-        )
 
     async def start(
         self,

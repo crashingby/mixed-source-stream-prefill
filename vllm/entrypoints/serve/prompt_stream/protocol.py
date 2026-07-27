@@ -68,34 +68,6 @@ class PromptStreamEventEnvelope(OpenAIBaseModel):
     event: PromptStreamEventRequest
 
 
-class PromptStreamPreflightRequest(OpenAIBaseModel):
-    """在创建长期 Request 前估算完整事件序列的物理长度。
-
-    `events` 必须包含最终的 `prompt_finished`。P 节点会使用与正式请求
-    完全相同的 tokenizer 规则处理 start prompt 和每个事件。
-    """
-
-    model: str | None = None
-    prompt: str | list[int]
-    events: list[PromptStreamEventRequest]
-
-
-class PromptStreamPreflightResponse(OpenAIBaseModel):
-    """P 节点返回的 prompt stream 长度与 block 对齐结果。"""
-
-    block_size: int
-    server_max_model_len: int
-    prefix_tokens: int
-    append_tokens: int
-    max_update_tokens: int
-    final_update_tokens: int
-    question_tokens: int
-    prefix_append_padding_tokens: int
-    final_physical_prompt_tokens: int
-    max_required_sequence_tokens: int
-    fits_server_max_model_len: bool
-
-
 class PromptStreamStartResponse(OpenAIBaseModel):
     """prompt stream start 的 ack 响应。"""
 

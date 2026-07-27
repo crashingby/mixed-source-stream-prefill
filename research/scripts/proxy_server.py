@@ -972,20 +972,6 @@ async def forward_normal_responses(
     return await _forward_normal_request(request, "/responses")
 
 
-@app.post("/v1/prompt_stream/preflight")
-async def preflight_prompt_stream(request: Request):
-    """把无状态长度预检转发给一个 P 节点。"""
-    req_data = await request.json()
-    prefill_client_info = get_next_client(request.app, "prefill")
-    response_json = await _post_json(
-        prefill_client_info,
-        "/prompt_stream/preflight",
-        req_data,
-        req_data.get("request_id", "prompt-stream-preflight"),
-    )
-    return JSONResponse(content=response_json)
-
-
 @app.post("/v1/prompt_stream/start")
 async def start_prompt_stream(request: Request):
     """创建 P/D prompt stream 会话。"""
