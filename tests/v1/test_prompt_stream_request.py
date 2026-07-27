@@ -1,10 +1,23 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from types import SimpleNamespace
+from unittest.mock import patch
+
+import pytest
 import torch
 
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.pull_scheduler import (
+    NixlPullConnectorScheduler,
     _trim_prompt_stream_local_blocks,
+    _trim_prompt_stream_local_blocks_to_manifest,
+)
+from vllm.entrypoints.serve.prompt_stream.protocol import (
+    PromptStreamEventRequest,
+    PromptStreamPreflightRequest,
+)
+from vllm.entrypoints.serve.prompt_stream.serving import (
+    PromptStreamServing,
 )
 from vllm.sampling_params import SamplingParams
 from vllm.v1.core.kv_cache_manager import KVCacheManager
@@ -31,6 +44,25 @@ def _make_request(prompt_token_ids: list[int]) -> Request:
         request_id="prompt-stream-test",
         prompt_token_ids=prompt_token_ids,
         sampling_params=SamplingParams(max_tokens=2),
+        pooling_params=None,
+    )
+
+
+def _make_prompt_stream_decode_request(
+    prompt_token_ids: list[int],
+) -> Request:
+    """构造携带 P 侧精确 block manifest 标记的 D 节点请求。"""
+    return Request(
+        request_id="prompt-stream-decode-test",
+        prompt_token_ids=prompt_token_ids,
+        sampling_params=SamplingParams(
+            max_tokens=2,
+            extra_args={
+                "kv_transfer_params": {
+                    "prompt_stream_exact_transfer": True,
+                }
+            },
+        ),
         pooling_params=None,
     )
 
@@ -108,9 +140,9 @@ def _finish_active_view(request: Request) -> None:
 def _assert_token_views_consistent(request: Request) -> None:
     """保护 Request 可变 token 与只读 ConstantList 始终一致。"""
     assert list(request.all_token_ids) == request._all_token_ids
-    assert request.prompt_token_ids == request._all_token_ids[
-        : request.num_prompt_tokens
-    ]
+    assert (
+        request.prompt_token_ids == request._all_token_ids[: request.num_prompt_tokens]
+    )
 
 
 def test_rapid_events_preserve_prefill_phase_order() -> None:
@@ -270,9 +302,7 @@ def test_append_after_update_does_not_recompute_update() -> None:
     _finish_active_view(request)
     assert request.prompt_stream is not None
     assert request.prompt_stream.update_num_computed_tokens == 2
-    update_key = request.get_prompt_stream_segment_key(
-        PromptStreamKVSegment.UPDATE
-    )
+    update_key = request.get_prompt_stream_segment_key(PromptStreamKVSegment.UPDATE)
     update_block_ids_before = manager.get_blocks(update_key).get_block_ids()
 
     request.apply_prompt_stream_event(
@@ -529,8 +559,7 @@ def test_question_reuses_update_segment_and_final_block_order() -> None:
     update_ids = manager.get_blocks(update_key).get_block_ids()
     final_ids = manager.get_prompt_stream_block_ids(request)
     assert final_ids == tuple(
-        pa_group + update_group
-        for pa_group, update_group in zip(pa_ids, update_ids)
+        pa_group + update_group for pa_group, update_group in zip(pa_ids, update_ids)
     )
     assert [len(group) for group in final_ids] == [3]
     assert len(request.get_prompt_stream_physical_prompt_token_ids()) == 11
@@ -590,3 +619,155 @@ def test_update_truncation_never_frees_prefix_append_blocks() -> None:
     assert manager.get_blocks(request.request_id).get_block_ids() == pa_block_ids_before
     update_key = request.get_prompt_stream_segment_key(PromptStreamKVSegment.UPDATE)
     assert [len(group) for group in manager.get_blocks(update_key).blocks] == [1]
+
+
+def test_nixl_manifest_ignores_d_only_tail_block() -> None:
+    """D 的 16N+1 tail block 不属于 P manifest，不得参与 NIXL 读取。"""
+    local_block_ids = ([10, 11, 12],)
+    trimmed_block_ids = _trim_prompt_stream_local_blocks_to_manifest(
+        local_block_ids,
+        expected_block_counts=(2,),
+    )
+    assert trimmed_block_ids == ([10, 11],)
+
+
+def test_nixl_manifest_rejects_insufficient_local_blocks() -> None:
+    """D 本地 blocks 少于 P manifest 时必须 fail closed。"""
+    with pytest.raises(
+        ValueError,
+        match="local block count is smaller than manifest",
+    ):
+        _trim_prompt_stream_local_blocks_to_manifest(
+            ([10],),
+            expected_block_counts=(2,),
+        )
+
+
+def test_prompt_stream_decode_request_skips_normal_prefix_cache() -> None:
+    """精确 prompt-stream transfer 请求不得读普通 APC namespace。"""
+    request = _make_prompt_stream_decode_request([1, 2, 3])
+
+    assert request.uses_prompt_stream_kv_transfer()
+    assert request.skip_reading_prefix_cache
+
+
+def test_prompt_stream_decode_request_is_not_written_to_normal_cache() -> None:
+    """精确 prompt-stream transfer 的近似 KV 不得污染普通 APC。"""
+    request = _make_prompt_stream_decode_request([1, 2, 3])
+    manager = _make_kv_cache_manager()
+    manager.enable_caching = True
+
+    with patch.object(manager.coordinator, "cache_blocks") as cache_blocks:
+        manager.cache_blocks(request, num_computed_tokens=3)
+
+    cache_blocks.assert_not_called()
+
+
+def test_prompt_stream_decode_forward_is_not_cached_during_allocation() -> None:
+    """D 后续本地 forward 分配 slots 时仍不得写入普通 APC。"""
+    request = _make_prompt_stream_decode_request([1, 2, 3, 4, 5])
+    manager = _make_kv_cache_manager()
+    manager.enable_caching = True
+
+    initial_blocks = manager.allocate_slots(
+        request,
+        num_new_tokens=1,
+        num_external_computed_tokens=4,
+        delay_cache_blocks=True,
+    )
+    assert initial_blocks is not None
+
+    request.num_computed_tokens = 5
+    request.append_output_token_ids(6)
+    with patch.object(manager.coordinator, "cache_blocks") as cache_blocks:
+        next_blocks = manager.allocate_slots(
+            request,
+            num_new_tokens=1,
+            delay_cache_blocks=False,
+        )
+
+    assert next_blocks is not None
+    cache_blocks.assert_not_called()
+
+
+def test_prompt_stream_exact_transfer_uses_manifest_token_boundary() -> None:
+    """16N+1 D prompt 只加载 16N remote tokens，并忽略重算阈值。"""
+    num_remote_tokens = 32
+    request = _make_prompt_stream_decode_request(list(range(num_remote_tokens + 1)))
+    assert request.kv_transfer_params is not None
+    request.kv_transfer_params.update(
+        {
+            "do_remote_prefill": True,
+            "remote_num_tokens": num_remote_tokens,
+        }
+    )
+    scheduler = object.__new__(NixlPullConnectorScheduler)
+    scheduler.kv_recompute_threshold = num_remote_tokens + 1
+
+    num_external_tokens, is_async = scheduler.get_num_new_matched_tokens(
+        request,
+        num_computed_tokens=0,
+    )
+
+    assert num_external_tokens == num_remote_tokens
+    assert is_async
+
+
+def test_prompt_stream_preflight_accounts_for_segments_and_first_token() -> None:
+    """Preflight 上界必须包含 PA padding、最大 Update 快照与首 token。"""
+    engine_client = SimpleNamespace(
+        vllm_config=SimpleNamespace(
+            cache_config=SimpleNamespace(block_size=4),
+            model_config=SimpleNamespace(max_model_len=14),
+        )
+    )
+    serving = PromptStreamServing(engine_client)
+    request = PromptStreamPreflightRequest(
+        prompt=[1, 2, 3],
+        events=[
+            PromptStreamEventRequest(
+                source_id="append",
+                event_type="append",
+                source_type="append",
+                version=0,
+                sequence_no=0,
+                token_ids=[4, 5],
+            ),
+            PromptStreamEventRequest(
+                source_id="update",
+                event_type="update",
+                source_type="update",
+                version=0,
+                sequence_no=0,
+                token_ids=[10, 11, 12, 13, 14, 15],
+            ),
+            PromptStreamEventRequest(
+                source_id="update",
+                event_type="update",
+                source_type="update",
+                version=1,
+                sequence_no=1,
+                token_ids=[10, 11],
+            ),
+            PromptStreamEventRequest(
+                source_id="question",
+                event_type="prompt_finished",
+                source_type=None,
+                version=0,
+                sequence_no=0,
+                token_ids=[20, 21],
+            ),
+        ],
+    )
+
+    response = serving.preflight(request)
+
+    assert response.prefix_tokens == 3
+    assert response.append_tokens == 2
+    assert response.prefix_append_padding_tokens == 3
+    assert response.max_update_tokens == 6
+    assert response.final_update_tokens == 2
+    assert response.question_tokens == 2
+    assert response.final_physical_prompt_tokens == 12
+    assert response.max_required_sequence_tokens == 15
+    assert not response.fits_server_max_model_len

@@ -11,6 +11,8 @@ NIXL KV transfer 可以工作。
 `proxy_server.py` 是 PD 分离场景下的实验代理服务器。RAG 前端只访问这个 proxy，proxy 负责：
 
 - 接收 `/v1/prompt_stream/start`，为请求选择一个 P 节点和一个 D 节点。
+- 接收无状态的 `/v1/prompt_stream/preflight`，转给 P 节点按真实 tokenizer
+  和 block 对齐规则计算最大序列长度。
 - 把 start 请求转发给 P 节点的 `/v1/prompt_stream/start`。
 - 保存 P 节点返回的内部 `request_id`，后续 event/finish 都使用这个 id。
 - 接收 `/v1/prompt_stream/event`，把 append/update/source_finished 事件转发给同一个 P 节点。
@@ -18,6 +20,11 @@ NIXL KV transfer 可以工作。
   校验物理 token/KV 覆盖范围，再把 `kv_transfer_params` 放进普通 OpenAI
   decode 请求转发给 D 节点。
 - 把 P 节点采样出的首 token 接到 D prompt，并在 D 返回后合并回最终响应。
+- 对 P 返回的 exact block manifest 做校验；D 只拉取物理 prompt KV，P 的
+  首 token 在 D 本地 forward。
+
+本轮修改提升了 NIXL connector 兼容版本。更新源码后必须同时重启 P、D 和
+proxy，不能让新旧进程混跑。
 
 ### `append_frontend.py`
 
@@ -145,7 +152,7 @@ D 节点最多继续生成 63 个 token
 CUDA_VISIBLE_DEVICES=0 \
 UCX_NET_DEVICES=all \
 VLLM_NIXL_SIDE_CHANNEL_PORT=<P_NIXL_PORT> \
-python -m vllm.entrypoints.openai.api_server \
+.venv/bin/python -m vllm.entrypoints.openai.api_server \
   --model <MODEL_PATH> \
   --served-model-name <SERVED_MODEL_NAME> \
   --trust-remote-code \
@@ -166,7 +173,7 @@ python -m vllm.entrypoints.openai.api_server \
 CUDA_VISIBLE_DEVICES=1 \
 UCX_NET_DEVICES=all \
 VLLM_NIXL_SIDE_CHANNEL_PORT=<D_NIXL_PORT> \
-python -m vllm.entrypoints.openai.api_server \
+.venv/bin/python -m vllm.entrypoints.openai.api_server \
   --model <MODEL_PATH> \
   --served-model-name <SERVED_MODEL_NAME> \
   --trust-remote-code \
@@ -611,9 +618,9 @@ update 事件的 `text` 是该来源当前版本的完整快照。P 节点内部
 - `append_frontend.py` 覆盖 append-only 文本模式。
 - `update_frontend.py` 覆盖单 update source 的文本快照模式。
 - `mixed_frontend.py` 覆盖单 append source + 单 update source 的文本混合模式；多 update source、source_finished 和 token_ids 双模式之后可以继续补测试脚本。
-- proxy 当前只接受 `api=completions` 和 `stream=false`。chat renderer 的物理
-  token 镜像与流式响应中的 P 首 token 合并尚未实现，因此这两种请求会在
-  start 阶段返回 400。
+- proxy 当前只接受 `api=completions`，支持 `stream=false` 和 `stream=true`。
+  chat renderer 的物理 token 镜像尚未实现，因此 chat 请求会在 start 阶段
+  返回 400。
 - `prompt_finished` 必须携带至少一个最终问题 token。
 - P 节点当前要求同步调度、pipeline parallel size 1、无 speculative decoding、
   NIXL direct-device transfer，并且 KV groups 必须是 block size
@@ -621,9 +628,12 @@ update 事件的 `text` 是该来源当前版本的完整快照。P 节点内部
 - proxy 强制要求 P 节点在 finish 后返回物理 `prompt_token_ids`、
   `kv_transfer_params` 和合法的 `remote_num_tokens`；缺失或长度不一致时会
   fail closed 返回 502，不会继续请求 D。
-- 启用 KV transfer 时，proxy 会检查
-  `physical_prompt_len <= remote_num_tokens <= D_prompt_len`。如果不满足会返回
-  502，不会让 D 静默加载错位 KV。
+- 启用 exact prompt-stream KV transfer 时，proxy 强制
+  `remote_num_tokens == physical_prompt_len`。D prompt 只允许在物理 prompt
+  后附加 P 产生的 `0/1` 个首 token；该 token 不属于远端 KV。
+- proxy 还会严格检查 manifest 的字段类型、KV group 数、每组 block count、
+  block size、block id 和 token 长度。异常时返回 502；D scheduler/worker
+  也会把异常限制在单个请求，不让错位 KV 进入 NIXL read。
 - Slurm 节点显示 `idle` 不代表 GPU 显存一定空闲；以 sbatch 日志中的 `nvidia-smi`
   输出为准。
 - 这个目录里的脚本是研究原型工具，不是生产服务入口。

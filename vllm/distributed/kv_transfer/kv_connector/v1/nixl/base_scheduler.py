@@ -406,6 +406,21 @@ class NixlBaseConnectorScheduler:
         if self.use_host_buffer:
             self._build_save_meta(meta, scheduler_output)
 
+        # 成功完成并等待发送的请求可以覆盖旧生命周期留下的 terminal
+        # 标记；仅仅“本 step 进过 batch”不能覆盖 not_processed，因为同一
+        # 生命周期可能在 update_state_after_alloc 后立即 abort。
+        active_request_ids = self._reqs_need_send.keys()
+        conflicting_request_ids = self._reqs_not_processed & active_request_ids
+        if conflicting_request_ids:
+            # 旧失败生命周期的 terminal 标记不能覆盖同一步里已经完成并准备
+            # 发送的有效请求。正常 prompt-stream REST 路径还会在更上层阻止
+            # 同 ID 复活；这里是 connector 元数据的 fail-safe。
+            logger.error(
+                "Dropping stale NIXL not-processed markers for active request IDs: %s",
+                sorted(conflicting_request_ids),
+            )
+            self._reqs_not_processed.difference_update(conflicting_request_ids)
+
         meta.reqs_to_send = self._reqs_need_send
         meta.reqs_in_batch = self._reqs_in_batch
         meta.reqs_not_processed = self._reqs_not_processed

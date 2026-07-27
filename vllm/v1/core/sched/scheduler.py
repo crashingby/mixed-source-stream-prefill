@@ -169,6 +169,11 @@ class Scheduler(SchedulerInterface):
 
         # req_id -> Request
         self.requests: dict[str, Request] = {}
+        # EngineCore 侧最后一道防线：超长流式请求结束后，同 ID 的 core-only
+        # 事件不得把它重新创建。正常 REST 路径会更早在 serving 层拒绝。
+        self._terminal_prompt_stream_request_ids: set[str] = set()
+        self._terminal_prompt_stream_request_order: deque[str] = deque()
+        self._max_prompt_stream_tombstones = 65536
         # Scheduling policy
         try:
             self.policy = SchedulingPolicy(self.scheduler_config.policy)
@@ -439,6 +444,7 @@ class Scheduler(SchedulerInterface):
                 layout.total_len,
                 self.max_model_len,
             )
+            self._mark_prompt_stream_request_terminal(existing.request_id)
             self.finish_requests(
                 existing.request_id,
                 RequestStatus.FINISHED_ERROR,
@@ -783,7 +789,14 @@ class Scheduler(SchedulerInterface):
                 # Get already-cached tokens.
                 if request.num_computed_tokens == 0:
                     # Get locally-cached tokens.
-                    if (
+                    if request.uses_prompt_stream_kv_transfer():
+                        # P 导出的分段近似 KV 使用独立语义，D 不能从普通
+                        # prefix-cache namespace 读取任何 block。
+                        new_computed_blocks = (
+                            self.kv_cache_manager.empty_kv_cache_blocks
+                        )
+                        num_new_local_computed_tokens = 0
+                    elif (
                         self.connector is not None
                         and self.has_mamba_layers
                         and isinstance(
@@ -1647,15 +1660,37 @@ class Scheduler(SchedulerInterface):
         outputs: dict[int, list[EngineCoreOutput]] = defaultdict(list)
         spec_decoding_stats: SpecDecodingStats | None = None
 
-        failed_kv_load_req_ids = None
+        failed_kv_load_req_ids = set[str]()
         if kv_connector_output and kv_connector_output.invalid_block_ids:
             # These blocks contain externally computed tokens that failed to
             # load. Identify affected requests and adjust their computed token
             # count to trigger recomputation of the invalid blocks.
-            failed_kv_load_req_ids = self._handle_invalid_blocks(
+            failed_kv_load_req_ids |= self._handle_invalid_blocks(
                 kv_connector_output.invalid_block_ids,
                 num_scheduled_tokens,
             )
+
+        if kv_connector_output and kv_connector_output.failed_recving:
+            # HMA/multi-group block IDs cannot be mapped back safely without
+            # group identity. The worker therefore reports the owning request.
+            failed_req_ids = {
+                req_id
+                for req_id in kv_connector_output.failed_recving
+                if (request := self.requests.get(req_id)) is not None
+                and not request.is_finished()
+            }
+            if self.recompute_kv_load_failures:
+                for req_id in failed_req_ids:
+                    # Request-level failure cannot identify a valid prefix.
+                    self.requests[req_id].num_computed_tokens = 0
+                self.failed_recving_kv_req_ids |= failed_req_ids
+                logger.warning(
+                    "Recovered %d request(s) from request-level KV load "
+                    "failure by scheduling full recomputation.",
+                    len(failed_req_ids),
+                )
+            else:
+                failed_kv_load_req_ids |= failed_req_ids
 
         # Persist per-step routed experts into the scheduler-side slot
         # buffer (CPU->CPU fancy-index assign; ~few MB per step).
@@ -2140,6 +2175,13 @@ class Scheduler(SchedulerInterface):
                 self.finish_requests(request.request_id, RequestStatus.FINISHED_ABORTED)
         else:
             if request.prompt_stream_event is not None:
+                if request.request_id in self._terminal_prompt_stream_request_ids:
+                    logger.error(
+                        "Ignoring prompt stream event for terminal request_id=%s; "
+                        "the request must not be resurrected.",
+                        request.request_id,
+                    )
+                    return
                 request.apply_prompt_stream_event(request.prompt_stream_event)
                 request.prompt_stream_event = None
             if request.resumable:
@@ -2169,10 +2211,24 @@ class Scheduler(SchedulerInterface):
                         layout.total_len,
                         self.max_model_len,
                     )
+                    self._mark_prompt_stream_request_terminal(request.request_id)
                     self.finish_requests(
                         request.request_id,
                         RequestStatus.FINISHED_ERROR,
                     )
+
+    def _mark_prompt_stream_request_terminal(self, request_id: str) -> None:
+        """有界记录不能被 core-only 事件复活的内部 request id。"""
+        if request_id in self._terminal_prompt_stream_request_ids:
+            return
+        if (
+            len(self._terminal_prompt_stream_request_order)
+            >= self._max_prompt_stream_tombstones
+        ):
+            expired_request_id = self._terminal_prompt_stream_request_order.popleft()
+            self._terminal_prompt_stream_request_ids.discard(expired_request_id)
+        self._terminal_prompt_stream_request_order.append(request_id)
+        self._terminal_prompt_stream_request_ids.add(request_id)
 
     def finish_requests(
         self, request_ids: str | Iterable[str] | None, finished_status: RequestStatus
@@ -2232,6 +2288,13 @@ class Scheduler(SchedulerInterface):
                 self.finished_recving_kv_req_ids.discard(request.request_id)
                 self.failed_recving_kv_req_ids.discard(request.request_id)
 
+            if request.is_prompt_streaming() and finished_status in (
+                RequestStatus.FINISHED_ABORTED,
+                RequestStatus.FINISHED_ERROR,
+            ):
+                # serving 侧长度闸门通过 abort 结束 core Request。已经在途的
+                # core-only event 即使稍后到达，也不能复活同一个内部 ID。
+                self._mark_prompt_stream_request_terminal(request.request_id)
             request.status = finished_status
             self._free_request(request, delay_free_blocks=delay_free_blocks)
 
@@ -2513,21 +2576,21 @@ class Scheduler(SchedulerInterface):
                 RequestStatus.FINISHED_STOPPED,
             ):
                 layout = request.get_prompt_stream_layout()
+                physical_prompt_len = layout.physical_total_len
                 block_counts = [len(group) for group in block_ids]
                 for group_id, (group, kv_cache_group) in enumerate(
                     zip(block_ids, self.kv_cache_config.kv_cache_groups)
                 ):
                     block_size = kv_cache_group.kv_cache_spec.block_size
                     expected_num_blocks = (
-                        request.num_computed_tokens + block_size - 1
+                        physical_prompt_len + block_size - 1
                     ) // block_size
                     if len(group) != expected_num_blocks:
                         raise RuntimeError(
                             "Prompt stream transfer block table is not contiguous: "
                             f"request_id={request.request_id}, "
                             f"group_id={group_id}, "
-                            "num_computed_tokens="
-                            f"{request.num_computed_tokens}, "
+                            f"physical_prompt_len={physical_prompt_len}, "
                             f"block_size={block_size}, "
                             f"expected_blocks={expected_num_blocks}, "
                             f"actual_blocks={len(group)}."
@@ -2590,6 +2653,27 @@ class Scheduler(SchedulerInterface):
             # D connector 必须据此裁剪本地 load block table。
             kv_transfer_params["prompt_stream_physical_prompt_len"] = (
                 physical_prompt_len
+            )
+            # prompt-stream 的 P block table 是 D load 的权威 manifest。
+            # remote_num_tokens 只覆盖已经 forward 的物理 prompt；P 采样的
+            # 首 token 会作为 D 的本地 tail token 再执行一次 forward。
+            remote_block_ids = kv_transfer_params.get("remote_block_ids")
+            if not isinstance(remote_block_ids, (list, tuple)):
+                raise RuntimeError(
+                    "Prompt stream connector did not return remote block ids: "
+                    f"request_id={request.request_id}."
+                )
+            block_counts = [len(group) for group in remote_block_ids]
+            block_sizes = [
+                group.kv_cache_spec.block_size
+                for group in self.kv_cache_config.kv_cache_groups
+            ]
+            kv_transfer_params.update(
+                prompt_stream_exact_transfer=True,
+                prompt_stream_remote_block_counts=block_counts,
+                prompt_stream_remote_block_sizes=block_sizes,
+                prompt_stream_prefill_output_tokens=request.num_output_tokens,
+                remote_num_tokens=physical_prompt_len,
             )
         return delay_free_blocks, kv_transfer_params
 

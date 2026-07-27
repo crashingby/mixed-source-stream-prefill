@@ -39,8 +39,9 @@ PUSH_REG_NOTIF_PREFIX = b"PUSH_REG:"
 #   2: Add remote_request_id to kv_transfer_params
 #   3: Add physical_blocks_per_logical_kv_block to NixlAgentMetadata
 #   4: Add KV block lease renewal through heartbeats
+#   5: Add exact prompt-stream KV block manifests
 #
-NIXL_CONNECTOR_VERSION: int = 4
+NIXL_CONNECTOR_VERSION: int = 5
 
 
 @dataclass
@@ -167,6 +168,11 @@ class ReqMeta:
     remote: RemoteMeta | None = None
     # Remote block size, discovered during NIXL handshake (push mode).
     remote_block_size: int | None = None
+    # Prompt-stream transfer must preserve the P segment block table exactly.
+    prompt_stream_exact_transfer: bool = False
+    prompt_stream_expected_block_counts: tuple[int, ...] = ()
+    prompt_stream_expected_block_sizes: tuple[int, ...] = ()
+    prompt_stream_manifest_error: str | None = None
 
 
 class NixlConnectorMetadata(KVConnectorMetadata):
@@ -190,12 +196,40 @@ class NixlConnectorMetadata(KVConnectorMetadata):
         local_block_ids: BlockIds,
         kv_transfer_params: dict[str, Any],
     ) -> ReqMeta:
+        manifest_error = kv_transfer_params.get("prompt_stream_manifest_error")
+        if manifest_error is not None and not isinstance(manifest_error, str):
+            manifest_error = repr(manifest_error)
+
+        def safe_int_tuple(value: Any, field_name: str) -> tuple[int, ...]:
+            nonlocal manifest_error
+            if not isinstance(value, (list, tuple)) or not all(
+                type(item) is int for item in value
+            ):
+                error = f"{field_name} is not a valid integer sequence"
+                manifest_error = (
+                    f"{manifest_error}; {error}" if manifest_error else error
+                )
+                return ()
+            return tuple(value)
+
         return ReqMeta(
             local_block_ids=local_block_ids,
             local_physical_block_ids=local_block_ids,
             # P workers don't need to receive tp_size from proxy here.
             tp_size=kv_transfer_params.get("tp_size", 1),
             remote_block_size=kv_transfer_params.get("remote_block_size"),
+            prompt_stream_exact_transfer=bool(
+                kv_transfer_params.get("prompt_stream_exact_transfer")
+            ),
+            prompt_stream_expected_block_counts=safe_int_tuple(
+                kv_transfer_params.get("prompt_stream_remote_block_counts", ()),
+                "prompt_stream_remote_block_counts",
+            ),
+            prompt_stream_expected_block_sizes=safe_int_tuple(
+                kv_transfer_params.get("prompt_stream_remote_block_sizes", ()),
+                "prompt_stream_remote_block_sizes",
+            ),
+            prompt_stream_manifest_error=manifest_error,
         )
 
     def add_new_req_to_save(
@@ -215,11 +249,58 @@ class NixlConnectorMetadata(KVConnectorMetadata):
         kv_transfer_params: dict[str, Any],
     ):
         req = self._add_new_req(local_block_ids, kv_transfer_params)
-        req.remote = RemoteMeta(
-            block_ids=kv_transfer_params["remote_block_ids"],
-            engine_id=kv_transfer_params["remote_engine_id"],
-            request_id=kv_transfer_params["remote_request_id"],
-            host=kv_transfer_params["remote_host"],
-            port=kv_transfer_params["remote_port"],
+        remote_fields = (
+            "remote_block_ids",
+            "remote_engine_id",
+            "remote_request_id",
+            "remote_host",
+            "remote_port",
         )
+        exact_remote_error: str | None = None
+        if req.prompt_stream_exact_transfer:
+            missing = [
+                field_name
+                for field_name in remote_fields
+                if field_name not in kv_transfer_params
+            ]
+            if missing:
+                exact_remote_error = f"missing exact-transfer remote fields: {missing}"
+            else:
+                remote_block_ids = kv_transfer_params["remote_block_ids"]
+                if not isinstance(remote_block_ids, (list, tuple)) or not all(
+                    isinstance(group, (list, tuple))
+                    and all(type(block_id) is int for block_id in group)
+                    for group in remote_block_ids
+                ):
+                    exact_remote_error = "invalid exact-transfer remote_block_ids"
+                elif not all(
+                    isinstance(kv_transfer_params[field_name], str)
+                    and kv_transfer_params[field_name]
+                    for field_name in (
+                        "remote_engine_id",
+                        "remote_request_id",
+                        "remote_host",
+                    )
+                ):
+                    exact_remote_error = "invalid exact-transfer remote identity"
+                elif (
+                    type(kv_transfer_params["remote_port"]) is not int
+                    or kv_transfer_params["remote_port"] <= 0
+                ):
+                    exact_remote_error = "invalid exact-transfer remote_port"
+
+        if exact_remote_error is not None:
+            req.prompt_stream_manifest_error = (
+                f"{req.prompt_stream_manifest_error}; {exact_remote_error}"
+                if req.prompt_stream_manifest_error
+                else exact_remote_error
+            )
+        else:
+            req.remote = RemoteMeta(
+                block_ids=kv_transfer_params["remote_block_ids"],
+                engine_id=kv_transfer_params["remote_engine_id"],
+                request_id=kv_transfer_params["remote_request_id"],
+                host=kv_transfer_params["remote_host"],
+                port=kv_transfer_params["remote_port"],
+            )
         self.reqs_to_recv[request_id] = req

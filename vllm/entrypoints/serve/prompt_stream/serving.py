@@ -1,12 +1,24 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import asyncio
+import copy
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from inspect import signature
 from typing import Any
 
 from vllm.engine.protocol import EngineClient
+from vllm.entrypoints.serve.prompt_stream.protocol import (
+    PromptStreamEventEnvelope,
+    PromptStreamEventRequest,
+    PromptStreamEventResponse,
+    PromptStreamFinishResponse,
+    PromptStreamPreflightRequest,
+    PromptStreamPreflightResponse,
+    PromptStreamStartRequest,
+    PromptStreamStartResponse,
+)
 from vllm.outputs import RequestOutput
 from vllm.sampling_params import SamplingParams
 from vllm.v1.engine import EngineCoreRequest
@@ -16,14 +28,7 @@ from vllm.v1.engine.prompt_stream import (
     PromptStreamEvent,
     PromptStreamEventType,
 )
-from vllm.entrypoints.serve.prompt_stream.protocol import (
-    PromptStreamEventEnvelope,
-    PromptStreamEventRequest,
-    PromptStreamEventResponse,
-    PromptStreamFinishResponse,
-    PromptStreamStartRequest,
-    PromptStreamStartResponse,
-)
+from vllm.v1.request import Request
 
 
 @dataclass
@@ -33,8 +38,14 @@ class PromptStreamSession:
     request_id: str
     collector: RequestOutputCollector
     sampling_params: SamplingParams
+    length_request: Request
     created_time: float
     last_event_time: float
+    finishing: bool = False
+    aborting: bool = False
+    # Append 与 Update 来源可以并发调用 REST endpoint。长度镜像和 EngineCore
+    # 入队必须使用同一串行顺序，避免两个 handler 从同一个旧快照同时提交。
+    event_lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
 
 
 @dataclass(frozen=True)
@@ -59,6 +70,72 @@ class PromptStreamServing:
         self.engine_client = engine_client
         self.sessions: dict[str, PromptStreamSession] = {}
 
+    def preflight(
+        self,
+        request: PromptStreamPreflightRequest,
+    ) -> PromptStreamPreflightResponse:
+        """使用 P 节点真实 tokenizer 估算完整事件序列的最大物理长度。
+
+        Update 事件是全量快照，所以这里记录所有有效 Update 版本中的最大
+        长度。最终上界使用“最终 PREFIX_APPEND 对齐长度 + 最大 Update
+        快照”，因此不依赖 replay 时两个来源的具体并发交错顺序。
+        """
+        prefix_token_ids = self._resolve_start_prompt_token_ids(request.prompt)
+        length_request = self._build_length_request(
+            request_id="__prompt_stream_preflight__",
+            prefix_token_ids=prefix_token_ids,
+            sampling_params=SamplingParams(max_tokens=1),
+        )
+        max_update_tokens = 0
+        prompt_finished_count = 0
+
+        for event_request in request.events:
+            event = self._build_prompt_stream_event(
+                request_id=length_request.request_id,
+                event_request=event_request,
+            )
+            length_request.apply_prompt_stream_event(event)
+            layout = length_request.get_prompt_stream_layout()
+            max_update_tokens = max(max_update_tokens, layout.update_len)
+            if event.event_type == PromptStreamEventType.PROMPT_FINISHED:
+                prompt_finished_count += 1
+
+        if prompt_finished_count != 1:
+            raise ValueError(
+                "Prompt stream preflight requires exactly one "
+                f"prompt_finished event, but got {prompt_finished_count}."
+            )
+
+        layout = length_request.get_prompt_stream_layout()
+        if layout.suffix_len == 0:
+            raise ValueError(
+                "Prompt stream preflight requires a non-empty final question."
+            )
+        prefix_append_physical_len = (
+            layout.prefix_len + layout.append_len + layout.prefix_append_padding_len
+        )
+        max_required_sequence_tokens = (
+            max(
+                prefix_append_physical_len + max_update_tokens,
+                layout.physical_total_len,
+            )
+            + 1
+        )
+        max_model_len = self._max_model_len()
+        return PromptStreamPreflightResponse(
+            block_size=self._block_size(),
+            server_max_model_len=max_model_len,
+            prefix_tokens=layout.prefix_len,
+            append_tokens=layout.append_len,
+            max_update_tokens=max_update_tokens,
+            final_update_tokens=layout.update_len,
+            question_tokens=layout.suffix_len,
+            prefix_append_padding_tokens=layout.prefix_append_padding_len,
+            final_physical_prompt_tokens=layout.physical_total_len,
+            max_required_sequence_tokens=max_required_sequence_tokens,
+            fits_server_max_model_len=(max_required_sequence_tokens <= max_model_len),
+        )
+
     async def start(
         self,
         request: PromptStreamStartRequest,
@@ -72,6 +149,15 @@ class PromptStreamServing:
         # start 阶段使用普通输入处理链路，确保 prefix/template 按模型 tokenizer
         # 和现有 vLLM prompt 规则处理。
         prefix_token_ids = self._resolve_start_prompt_token_ids(request.prompt)
+        start_required_len = self._align_to_block_size(len(prefix_token_ids)) + 1
+        if start_required_len > self._max_model_len():
+            raise ValueError(
+                "Prompt stream start exceeds the P node model limit after "
+                "segment alignment and reserving the P output token: "
+                f"prefix_tokens={len(prefix_token_ids)}, "
+                f"required_sequence_tokens={start_required_len}, "
+                f"max_model_len={self._max_model_len()}."
+            )
         collector = await self.engine_client.add_prompt_stream_request(
             request_id=request_id,
             prompt=request.prompt,
@@ -83,10 +169,16 @@ class PromptStreamServing:
         # prompt stream 事件必须使用内部 id 才能命中 scheduler 中的长期 Request。
         internal_request_id = collector.request_id
         now = time.time()
+        length_request = self._build_length_request(
+            request_id=internal_request_id,
+            prefix_token_ids=prefix_token_ids,
+            sampling_params=sampling_params,
+        )
         self.sessions[internal_request_id] = PromptStreamSession(
             request_id=internal_request_id,
             collector=collector,
             sampling_params=sampling_params,
+            length_request=length_request,
             created_time=now,
             last_event_time=now,
         )
@@ -101,23 +193,33 @@ class PromptStreamServing:
     ) -> PromptStreamEventResponse:
         """应用 Append / Update / Source Finished 事件并返回 ack。"""
         session = self._get_session(envelope.request_id)
-        event_request = envelope.event
-        if event_request.event_type == PromptStreamEventType.PROMPT_FINISHED.value:
-            raise ValueError(
-                "prompt_finished must use /v1/prompt_stream/finish."
+        async with session.event_lock:
+            if session.finishing:
+                raise ValueError(
+                    "Prompt stream finish is already in progress for "
+                    f"request_id={session.request_id}."
+                )
+            event_request = envelope.event
+            if event_request.event_type == PromptStreamEventType.PROMPT_FINISHED.value:
+                raise ValueError("prompt_finished must use /v1/prompt_stream/finish.")
+            prompt_stream_event = self._build_prompt_stream_event(
+                request_id=session.request_id,
+                event_request=event_request,
             )
-        prompt_stream_event = self._build_prompt_stream_event(
-            request_id=session.request_id,
-            event_request=event_request,
-        )
-        engine_core_request = self._build_event_engine_core_request(
-            session=session,
-            prompt_stream_event=prompt_stream_event,
-        )
+            length_request = await self._validate_length_event(
+                session,
+                prompt_stream_event,
+            )
+            engine_core_request = self._build_event_engine_core_request(
+                session=session,
+                prompt_stream_event=prompt_stream_event,
+            )
 
-        # event 只进入 EngineCore，不注册新的 output collector。
-        await self.engine_client.add_prompt_stream_event(engine_core_request)
-        session.last_event_time = time.time()
+            # event 只进入 EngineCore，不注册新的 output collector。只有入队
+            # 成功后才提交长度镜像，失败时仍可安全重试同一个事件。
+            await self.engine_client.add_prompt_stream_event(engine_core_request)
+            session.length_request = length_request
+            session.last_event_time = time.time()
         return PromptStreamEventResponse(
             request_id=session.request_id,
             event_type=event_request.event_type,
@@ -130,63 +232,129 @@ class PromptStreamServing:
     ) -> PromptStreamFinishResponse:
         """提交 PROMPT_FINISHED，并等待 P 节点返回 kv_transfer_params。"""
         session = self._get_session(envelope.request_id)
-        if envelope.event.event_type != PromptStreamEventType.PROMPT_FINISHED.value:
-            raise ValueError(
-                "prompt_stream finish endpoint requires event_type=prompt_finished, "
-                f"but got {envelope.event.event_type}."
+        async with session.event_lock:
+            if session.finishing:
+                raise ValueError(
+                    "Prompt stream finish is already in progress for "
+                    f"request_id={session.request_id}."
+                )
+            session.finishing = True
+            try:
+                if (
+                    envelope.event.event_type
+                    != PromptStreamEventType.PROMPT_FINISHED.value
+                ):
+                    raise ValueError(
+                        "prompt_stream finish endpoint requires "
+                        "event_type=prompt_finished, "
+                        f"but got {envelope.event.event_type}."
+                    )
+                event_request = envelope.event
+                prompt_stream_event = self._build_prompt_stream_event(
+                    request_id=session.request_id,
+                    event_request=event_request,
+                )
+                if not prompt_stream_event.token_ids:
+                    raise ValueError(
+                        "prompt_stream finish requires a non-empty final question."
+                    )
+                length_request = await self._validate_length_event(
+                    session,
+                    prompt_stream_event,
+                )
+                engine_core_request = self._build_event_engine_core_request(
+                    session=session,
+                    prompt_stream_event=prompt_stream_event,
+                )
+
+                # finish 仍然是 core-only 入队；输出从 start 阶段保存的
+                # collector 读取。入队完成后不能重试 PROMPT_FINISHED。
+                await self.engine_client.add_prompt_stream_event(engine_core_request)
+                session.length_request = length_request
+                session.last_event_time = time.time()
+            except Exception:
+                if session.request_id in self.sessions and not session.aborting:
+                    session.finishing = False
+                raise
+
+        try:
+            prefill_output = await self._wait_for_finish_output(session)
+            physical_prompt_token_ids = prefill_output.kv_transfer_params.pop(
+                "prompt_stream_prompt_token_ids",
+                None,
             )
-
-        event_request = envelope.event
-        prompt_stream_event = self._build_prompt_stream_event(
-            request_id=session.request_id,
-            event_request=event_request,
-        )
-        if not prompt_stream_event.token_ids:
-            raise ValueError(
-                "prompt_stream finish requires a non-empty final question."
+            response = PromptStreamFinishResponse(
+                request_id=session.request_id,
+                kv_transfer_params=prefill_output.kv_transfer_params,
+                token_ids=prompt_stream_event.token_ids,
+                prompt_token_ids=physical_prompt_token_ids,
+                output_token_ids=prefill_output.token_ids,
+                output_text=prefill_output.text,
+                output_finish_reason=prefill_output.finish_reason,
+                output_stop_reason=prefill_output.stop_reason,
             )
-        engine_core_request = self._build_event_engine_core_request(
-            session=session,
-            prompt_stream_event=prompt_stream_event,
-        )
-
-        # finish 仍然是 core-only 入队；输出从 start 阶段保存的 collector 读取。
-        await self.engine_client.add_prompt_stream_event(engine_core_request)
-        session.last_event_time = time.time()
-
-        prefill_output = await self._wait_for_finish_output(session)
-        physical_prompt_token_ids = prefill_output.kv_transfer_params.pop(
-            "prompt_stream_prompt_token_ids",
-            None,
-        )
-        response = PromptStreamFinishResponse(
-            request_id=session.request_id,
-            kv_transfer_params=prefill_output.kv_transfer_params,
-            token_ids=prompt_stream_event.token_ids,
-            prompt_token_ids=physical_prompt_token_ids,
-            output_token_ids=prefill_output.token_ids,
-            output_text=prefill_output.text,
-            output_finish_reason=prefill_output.finish_reason,
-            output_stop_reason=prefill_output.stop_reason,
-        )
-        self.sessions.pop(session.request_id, None)
-        return response
+            self.sessions.pop(session.request_id, None)
+            return response
+        except Exception:
+            # PROMPT_FINISHED 已经入队，不能通过第二次 finish 重试。保留
+            # finishing 状态和 session，调用方仍可走幂等 abort 做最终清理。
+            raise
 
     async def abort(self, request_id: str) -> None:
         """取消 prompt stream 会话并释放本地 session 状态。"""
-        session = self.sessions.pop(request_id, None)
+        session = self.sessions.get(request_id)
         if session is not None:
-            session.collector.close()
-        await self.engine_client.abort(request_id)
+            async with session.event_lock:
+                session.finishing = True
+                session.aborting = True
+                session.collector.close()
+                # Session key comes from collector.request_id and is already
+                # the EngineCore internal ID. External-ID abort would be a no-op.
+                await self.engine_client.abort(request_id, internal=True)
+                self.sessions.pop(request_id, None)
+            return
+        await self.engine_client.abort(request_id, internal=True)
+
+    async def _validate_length_event(
+        self,
+        session: PromptStreamSession,
+        event: PromptStreamEvent,
+    ) -> Request:
+        """构造并验证事件应用后的候选长度镜像。
+
+        REST ack 只表示事件已进入 EngineCore 队列，并不表示 scheduler 已经
+        应用它。因此长度检查必须放在 serving 层，避免超长 Request 被 core
+        终止后，同 ID 的后续事件再次创建一个新的 Request。候选镜像仅在
+        EngineCore 入队成功后由调用方提交，入队异常不会污染长期状态。
+        """
+        length_request = copy.deepcopy(session.length_request)
+        length_request.apply_prompt_stream_event(event)
+        layout = length_request.get_prompt_stream_layout()
+        required_sequence_len = layout.physical_total_len + 1
+        max_model_len = self._max_model_len()
+        if required_sequence_len <= max_model_len:
+            return length_request
+
+        session.finishing = True
+        session.aborting = True
+        session.collector.close()
+        await self.engine_client.abort(session.request_id, internal=True)
+        self.sessions.pop(session.request_id, None)
+        raise ValueError(
+            "Prompt stream event exceeds the P node model limit after segment "
+            "alignment and reserving the P output token; the session was "
+            f"aborted: request_id={session.request_id}, "
+            f"physical_prompt_tokens={layout.physical_total_len}, "
+            f"required_sequence_tokens={required_sequence_len}, "
+            f"max_model_len={max_model_len}."
+        )
 
     def _get_session(self, request_id: str) -> PromptStreamSession:
         """读取 P 节点本地 prompt stream 会话。"""
         try:
             return self.sessions[request_id]
         except KeyError as err:
-            raise ValueError(
-                f"Unknown prompt stream request_id={request_id}."
-            ) from err
+            raise ValueError(f"Unknown prompt stream request_id={request_id}.") from err
 
     def _build_prefill_sampling_params(
         self,
@@ -219,6 +387,49 @@ class PromptStreamServing:
             sampling_kwargs["extra_args"] = extra_args
         return SamplingParams(**sampling_kwargs, skip_clone=True)
 
+    def _build_length_request(
+        self,
+        request_id: str,
+        prefix_token_ids: list[int],
+        sampling_params: SamplingParams,
+    ) -> Request:
+        """构造只在 REST 进程中维护的无 KV Request 长度镜像。"""
+        request = Request(
+            request_id=request_id,
+            prompt_token_ids=list(prefix_token_ids),
+            sampling_params=sampling_params.clone(),
+            pooling_params=None,
+        )
+        request.apply_prompt_stream_event(
+            PromptStreamEvent(
+                request_id=request_id,
+                source_id="__prompt_stream_start__",
+                event_type=PromptStreamEventType.APPEND,
+                source_type=PromptSourceType.APPEND,
+                chunk_id="__prompt_stream_start__",
+                version=0,
+                sequence_no=0,
+                token_ids=[],
+                arrival_time=time.time(),
+            )
+        )
+        assert request.prompt_stream is not None
+        request.prompt_stream.block_size = self._block_size()
+        return request
+
+    def _block_size(self) -> int:
+        """返回 P 节点 scheduler 使用的逻辑 KV block size。"""
+        return int(self.engine_client.vllm_config.cache_config.block_size)
+
+    def _max_model_len(self) -> int:
+        """返回 P 节点实际配置的最大序列长度。"""
+        return int(self.engine_client.vllm_config.model_config.max_model_len)
+
+    def _align_to_block_size(self, num_tokens: int) -> int:
+        """把 token 数向上对齐到 P 节点 KV block 边界。"""
+        block_size = self._block_size()
+        return (num_tokens + block_size - 1) // block_size * block_size
+
     def _resolve_start_prompt_token_ids(self, prompt: str | list[int]) -> list[int]:
         """把 start 阶段 prefix/template 归一化为 P 节点实际 token ids。
 
@@ -247,16 +458,16 @@ class PromptStreamServing:
         if event_request.text is None:
             if event_request.event_type == PromptStreamEventType.SOURCE_FINISHED.value:
                 return None
-            raise ValueError(
-                "Prompt stream event must carry either token_ids or text."
-            )
+            raise ValueError("Prompt stream event must carry either token_ids or text.")
 
         tokenizer = self.engine_client.input_processor.get_tokenizer()
         try:
-            return list(tokenizer.encode(
-                event_request.text,
-                add_special_tokens=False,
-            ))
+            return list(
+                tokenizer.encode(
+                    event_request.text,
+                    add_special_tokens=False,
+                )
+            )
         except TypeError:
             return list(tokenizer.encode(event_request.text))
 

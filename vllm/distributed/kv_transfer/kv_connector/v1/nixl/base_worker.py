@@ -433,6 +433,8 @@ class NixlBaseConnectorWorker:
         # Uses Queue for thread-safe cross-thread coordination with the
         # background handshake thread, matching the _ready_requests pattern.
         self._failed_recv_reqs: queue.Queue[ReqId] = queue.Queue()
+        # 独立保存失败请求，供 worker output 在 TP 聚合后按 request 恢复。
+        self._failed_load_req_ids: queue.Queue[ReqId] = queue.Queue()
 
         # Handshake metadata of this worker for NIXL transfers.
         self.xfer_handshake_metadata: NixlHandshakePayload | None = None
@@ -1963,6 +1965,7 @@ class NixlBaseConnectorWorker:
         if (meta := self._recving_metadata.get(req_id)) and not self._is_hma_required:
             self._invalid_block_ids.put(set(meta.local_block_ids[0]))
         self._failed_recv_reqs.put(req_id)
+        self._failed_load_req_ids.put(req_id)
         if handle is not None:
             self.nixl_wrapper.release_xfer_handle(handle)
         self.xfer_stats.record_failed_transfer()
@@ -2212,6 +2215,16 @@ class NixlBaseConnectorWorker:
         while not self._invalid_block_ids.empty():
             try:
                 result.update(self._invalid_block_ids.get_nowait())
+            except queue.Empty:
+                break
+        return result
+
+    def get_request_ids_with_load_errors(self) -> set[str]:
+        """返回并清空本 worker 检测到加载失败的请求 ID。"""
+        result: set[str] = set()
+        while not self._failed_load_req_ids.empty():
+            try:
+                result.add(self._failed_load_req_ids.get_nowait())
             except queue.Empty:
                 break
         return result

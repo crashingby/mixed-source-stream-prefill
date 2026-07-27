@@ -21,6 +21,56 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
+def _normalize_prompt_stream_manifest_ints(
+    value: Any,
+    field_name: str,
+    *,
+    minimum: int,
+) -> list[int]:
+    """严格解析 prompt-stream manifest 的整数数组。"""
+    if not isinstance(value, (list, tuple)):
+        raise ValueError(f"{field_name} must be a list or tuple")
+    normalized: list[int] = []
+    for index, item in enumerate(value):
+        if type(item) is not int or item < minimum:
+            raise ValueError(
+                f"{field_name}[{index}] must be an integer >= {minimum}, "
+                f"but got {item!r}"
+            )
+        normalized.append(item)
+    return normalized
+
+
+def _normalize_prompt_stream_remote_block_ids(value: Any) -> BlockIds:
+    """严格解析 prompt-stream manifest 中按 KV group 排列的 block IDs。"""
+    if not isinstance(value, (list, tuple)):
+        raise ValueError("remote_block_ids must be a list or tuple")
+    normalized: list[list[int]] = []
+    for group_id, group in enumerate(value):
+        if not isinstance(group, (list, tuple)):
+            raise ValueError(f"remote_block_ids[{group_id}] must be a list or tuple")
+        normalized_group: list[int] = []
+        for block_index, block_id in enumerate(group):
+            if type(block_id) is not int or block_id < 0:
+                raise ValueError(
+                    "remote_block_ids"
+                    f"[{group_id}][{block_index}] must be a non-negative "
+                    f"integer, but got {block_id!r}"
+                )
+            normalized_group.append(block_id)
+        normalized.append(normalized_group)
+    return tuple(normalized)
+
+
+def _prompt_stream_block_counts(value: Any) -> list[int] | None:
+    """仅用于错误日志，安全读取可能畸形的 block groups。"""
+    if not isinstance(value, (list, tuple)):
+        return None
+    if not all(isinstance(group, (list, tuple)) for group in value):
+        return None
+    return [len(group) for group in value]
+
+
 def _trim_prompt_stream_local_blocks(
     block_ids: BlockIds,
     kv_cache_config: "KVCacheConfig",
@@ -40,6 +90,36 @@ def _trim_prompt_stream_local_blocks(
             kv_cache_config.kv_cache_groups,
         )
     )
+
+
+def _trim_prompt_stream_local_blocks_to_manifest(
+    block_ids: BlockIds,
+    expected_block_counts: list[int] | tuple[int, ...],
+) -> BlockIds:
+    """按 P 侧权威 manifest 裁剪 D 的逻辑 block table。
+
+    D prompt 会额外包含 P 采样出的首 token，所以它最终可能比 remote KV
+    多一个 tail block。manifest 只描述需要从 P 读取的物理 prompt blocks。
+    """
+    if len(block_ids) != len(expected_block_counts):
+        raise ValueError(
+            "Prompt stream local block groups do not match manifest: "
+            f"local_groups={len(block_ids)}, "
+            f"manifest_groups={len(expected_block_counts)}."
+        )
+
+    trimmed_groups: list[list[int]] = []
+    for group_id, (group, expected_count) in enumerate(
+        zip(block_ids, expected_block_counts)
+    ):
+        if expected_count < 0 or len(group) < expected_count:
+            raise ValueError(
+                "Prompt stream local block count is smaller than manifest: "
+                f"group_id={group_id}, local_blocks={len(group)}, "
+                f"expected_blocks={expected_count}."
+            )
+        trimmed_groups.append(group[:expected_count])
+    return tuple(trimmed_groups)
 
 
 class NixlPullConnectorScheduler(NixlBaseConnectorScheduler):
@@ -78,6 +158,33 @@ class NixlPullConnectorScheduler(NixlBaseConnectorScheduler):
             num_computed_tokens,
             params,
         )
+
+        if (
+            params is not None
+            and params.get("prompt_stream_exact_transfer")
+            and params.get("do_remote_prefill")
+            and not params.get("_remote_blocks_processed")
+        ):
+            # P 首 token 已追加到 D prompt，但它没有 remote KV。必须先于
+            # 通用 do_remote_prefill 分支按 manifest 覆盖范围计算，否则会把
+            # D-only tail token 错算成外部 token，并多申请一个 block。
+            remote_num_tokens = params.get("remote_num_tokens")
+            if not isinstance(remote_num_tokens, int):
+                logger.error(
+                    "Prompt stream exact transfer has invalid remote token "
+                    "count: request_id=%s, remote_num_tokens=%r",
+                    request.request_id,
+                    remote_num_tokens,
+                )
+                return 0, False
+            count = (
+                min(remote_num_tokens, request.num_prompt_tokens) - num_computed_tokens
+            )
+            if count > 0:
+                # 短 prompt-stream 也必须实际读取 P KV，不能套用通用的
+                # kv_recompute_threshold 后退化成 D 本地 full prefill。
+                return count, True
+            return 0, False
 
         if params is not None and params.get("do_remote_prefill"):
             # Remote prefill: get all prompt blocks from remote.
@@ -158,7 +265,161 @@ class NixlPullConnectorScheduler(NixlBaseConnectorScheduler):
             and self.is_bidirectional_kv_xfer_enabled
             and not params.get("_remote_blocks_processed")
         ):
-            if params.get("remote_block_ids"):
+            if params.get("prompt_stream_exact_transfer"):
+                # Exact prompt-stream requests never use the generic
+                # prefix-caching alignment path. Validate the P manifest before
+                # the worker sees it, then register even invalid requests so the
+                # worker can report a request-scoped transfer failure.
+                unhashed_local_block_ids: BlockIds = (
+                    blocks.get_unhashed_block_ids_all_groups()
+                    if num_external_tokens > 0
+                    else tuple([] for _ in self.kv_cache_config.kv_cache_groups)
+                )
+                remote_block_ids: Any = params.get("remote_block_ids")
+                expected_counts: list[int] = []
+                expected_sizes: list[int] = []
+                manifest_error: str | None = None
+                try:
+                    expected_counts = _normalize_prompt_stream_manifest_ints(
+                        params.get("prompt_stream_remote_block_counts"),
+                        "prompt_stream_remote_block_counts",
+                        minimum=0,
+                    )
+                    expected_sizes = _normalize_prompt_stream_manifest_ints(
+                        params.get("prompt_stream_remote_block_sizes"),
+                        "prompt_stream_remote_block_sizes",
+                        minimum=1,
+                    )
+                    local_sizes = [
+                        group.kv_cache_spec.block_size
+                        for group in self.kv_cache_config.kv_cache_groups
+                    ]
+                    num_groups = len(local_sizes)
+                    if len(expected_counts) != num_groups:
+                        raise ValueError(
+                            "manifest block-count groups differ from D KV groups: "
+                            f"manifest={len(expected_counts)}, local={num_groups}"
+                        )
+                    if expected_sizes != local_sizes:
+                        raise ValueError(
+                            "P/D block sizes differ: "
+                            f"remote={expected_sizes}, local={local_sizes}"
+                        )
+
+                    physical_prompt_len = params.get(
+                        "prompt_stream_physical_prompt_len"
+                    )
+                    if type(physical_prompt_len) is not int or physical_prompt_len < 0:
+                        raise ValueError(
+                            "prompt_stream_physical_prompt_len must be a "
+                            "non-negative integer"
+                        )
+                    prefill_output_tokens = params.get(
+                        "prompt_stream_prefill_output_tokens"
+                    )
+                    if (
+                        type(prefill_output_tokens) is not int
+                        or prefill_output_tokens < 0
+                        or prefill_output_tokens > 1
+                    ):
+                        raise ValueError(
+                            "prompt_stream_prefill_output_tokens must be 0 or 1"
+                        )
+                    if request.num_prompt_tokens != (
+                        physical_prompt_len + prefill_output_tokens
+                    ):
+                        raise ValueError(
+                            "D prompt length differs from P physical prompt plus "
+                            "prefill output: "
+                            f"decode={request.num_prompt_tokens}, "
+                            f"physical={physical_prompt_len}, "
+                            f"prefill_output={prefill_output_tokens}"
+                        )
+                    if num_external_tokens != physical_prompt_len:
+                        raise ValueError(
+                            "external token count differs from physical prompt: "
+                            f"external={num_external_tokens}, "
+                            f"physical={physical_prompt_len}"
+                        )
+                    derived_counts = [
+                        cdiv(physical_prompt_len, block_size)
+                        for block_size in expected_sizes
+                    ]
+                    if expected_counts != derived_counts:
+                        raise ValueError(
+                            "manifest block counts do not cover the physical "
+                            f"prompt exactly: manifest={expected_counts}, "
+                            f"derived={derived_counts}"
+                        )
+
+                    normalized_remote_block_ids = (
+                        _normalize_prompt_stream_remote_block_ids(remote_block_ids)
+                    )
+                    if len(normalized_remote_block_ids) != num_groups:
+                        raise ValueError(
+                            "remote block groups differ from D KV groups: "
+                            f"remote={len(normalized_remote_block_ids)}, "
+                            f"local={num_groups}"
+                        )
+                    remote_counts = [
+                        len(group) for group in normalized_remote_block_ids
+                    ]
+                    if remote_counts != expected_counts:
+                        raise ValueError(
+                            "remote block ids differ from manifest: "
+                            f"remote={remote_counts}, manifest={expected_counts}"
+                        )
+                    for field_name in (
+                        "remote_engine_id",
+                        "remote_request_id",
+                        "remote_host",
+                    ):
+                        if not isinstance(
+                            params.get(field_name), str
+                        ) or not params.get(field_name):
+                            raise ValueError(f"missing or invalid {field_name}")
+                    remote_port = params.get("remote_port")
+                    if type(remote_port) is not int or remote_port <= 0:
+                        raise ValueError("remote_port must be a positive integer")
+                    tp_size = params.get("tp_size", 1)
+                    if type(tp_size) is not int or tp_size <= 0:
+                        raise ValueError("tp_size must be a positive integer")
+
+                    params["remote_block_ids"] = normalized_remote_block_ids
+                    unhashed_local_block_ids = (
+                        _trim_prompt_stream_local_blocks_to_manifest(
+                            unhashed_local_block_ids,
+                            expected_counts,
+                        )
+                    )
+                except (TypeError, ValueError) as err:
+                    manifest_error = str(err)
+
+                # Keep metadata construction safe even if the incoming JSON had
+                # None or another non-iterable value.
+                params["prompt_stream_remote_block_counts"] = expected_counts
+                params["prompt_stream_remote_block_sizes"] = expected_sizes
+                if manifest_error is None:
+                    params.pop("prompt_stream_manifest_error", None)
+                else:
+                    params["prompt_stream_manifest_error"] = manifest_error
+                    logger.error(
+                        "Prompt stream KV manifest mismatch before transfer: "
+                        "request_id=%s, error=%s, num_external_tokens=%s, "
+                        "local_block_counts=%s, remote_block_counts=%s",
+                        request.request_id,
+                        manifest_error,
+                        num_external_tokens,
+                        _prompt_stream_block_counts(unhashed_local_block_ids),
+                        _prompt_stream_block_counts(remote_block_ids),
+                    )
+
+                local_block_ids = self.get_sw_clipped_blocks(unhashed_local_block_ids)
+                self._reqs_need_recv[request.request_id] = (
+                    request,
+                    local_block_ids,
+                )
+            elif params.get("remote_block_ids"):
                 if all(
                     p in params
                     for p in (
@@ -185,12 +446,10 @@ class NixlPullConnectorScheduler(NixlBaseConnectorScheduler):
                         # 当 remote prefix 恰好 block 对齐时，D 会为这个本地
                         # token 多申请一块；NIXL 只能加载覆盖 external tokens 的
                         # 前缀 blocks，尾块留给 D 本地 forward。
-                        unhashed_local_block_ids = (
-                            _trim_prompt_stream_local_blocks(
-                                unhashed_local_block_ids,
-                                self.kv_cache_config,
-                                num_external_tokens,
-                            )
+                        unhashed_local_block_ids = _trim_prompt_stream_local_blocks(
+                            unhashed_local_block_ids,
+                            self.kv_cache_config,
+                            num_external_tokens,
                         )
                     local_block_ids = self.get_sw_clipped_blocks(
                         unhashed_local_block_ids
@@ -270,6 +529,10 @@ class NixlPullConnectorScheduler(NixlBaseConnectorScheduler):
             # Clear _reqs_need_save if a request is aborted as partial prefill.
             self._reqs_need_save.pop(request.request_id, None)
             return False, None
+
+        # 同一个业务 request_id 曾经失败过时，成功的新生命周期不能继续携带
+        # stale not-processed 标记，否则 worker 会先登记、随后又删除该请求。
+        self._reqs_not_processed.discard(request.request_id)
 
         # TODO: check whether block_ids actually ever be 0. If not we could
         # remove the conditional below

@@ -4,14 +4,16 @@
 
 当前代码里已经有这些相关入口：
 
-- `research/scripts/proxy_server.py`：当前实验用 P/D proxy，已经支持 `/v1/prompt_stream/start|event|finish|abort`。
+- `research/scripts/proxy_server.py`：当前实验用 P/D proxy，已经支持
+  `/v1/prompt_stream/preflight|start|event|finish|abort`。
 - `research/scripts/append_frontend.py`：最小 append-only 前端脚本，用于走通 start、append event、finish 和 D 侧 decode。
 - `vllm/entrypoints/serve/prompt_stream/`：P 节点 RESTFUL router、协议模型和 serving 逻辑。
 - `vllm/entrypoints/openai/api_server.py`：OpenAI-compatible server 的主入口。当前已经在 `build_app()` 中注册 prompt stream router。
 
-当前实验 proxy 已明确收窄为 `api=completions`、`stream=false`、`n=1`。chat
-renderer 的物理 token 镜像和 streaming response 的 P 首 token 合并尚未完成，
-因此这两类请求会 fail closed，不会继续发送可能错位的 KV。
+当前实验 prompt-stream proxy 已明确收窄为 `api=completions`、`n=1`。
+`stream=true` 时 proxy 先发送 P 的首 token SSE，再转发 D 的后续 SSE；
+`stream=false` 时合并 P/D 的非流式结果。chat renderer 的物理 token 镜像
+尚未完成，因此 prompt-stream chat 请求仍会 fail closed。
 
 当前流式 prefill 的核心矛盾是：**Append / Update 事件不是生成请求，不应该等待 completion response；它们应该是 ack 型状态更新接口。** 因此不能直接把所有事件都塞进现有 `/v1/completions`。
 
@@ -43,6 +45,8 @@ sequenceDiagram
 - **Start**：创建 P 节点上的长期请求，保存固定 prefix/template。
 - **Event**：多次提交 Append / Update / Source Finished 事件，只返回 ack。
 - **Finish**：提交最终用户问题，P 节点完成最后 prefill，产生 `kv_transfer_params`，然后 D 节点继续 decode。
+- **Preflight**：在创建会话前，用 P 的真实 tokenizer、block size 和
+  segment padding 规则估算完整事件序列的最大物理长度。
 
 整体流程如下：
 
@@ -69,8 +73,8 @@ sequenceDiagram
     Proxy->>P: "POST /v1/prompt_stream/finish"
     P-->>Proxy: "kv_transfer_params"
     Proxy->>D: "POST /v1/completions<br>携带 kv_transfer_params"
-    D-->>Proxy: "非流式 decode 输出"
-    Proxy-->>C: "合并 P 首 token 后的输出"
+    D-->>Proxy: "剩余 decode 输出"
+    Proxy-->>C: "先发或合并 P 首 token 后的输出"
 ```
 
 这个设计保持一个原则：**P 节点负责流式 prefill 状态，D 节点只接收最终 KV 后继续 decode。**
@@ -101,6 +105,49 @@ app.state.prompt_stream_sessions = {
 - 保存原始生成请求参数，例如 `model` 和采样参数。
 - 避免每个事件都重新 round-robin 到不同 prefiller。
 
+### `POST /v1/prompt_stream/preflight`
+
+用途：在正式回放和 QPS 计时之前检查一个完整样本是否超过 P/D 的最大序列
+长度。请求包含 start prompt 和原始分段事件：
+
+```json
+{
+  "model": "local-completions",
+  "prompt": "通用模板",
+  "events": [
+    {
+      "source_id": "anns",
+      "event_type": "append",
+      "source_type": "append",
+      "text": "chunk"
+    },
+    {
+      "source_id": "question",
+      "event_type": "prompt_finished",
+      "text": "最终问题"
+    }
+  ]
+}
+```
+
+P 节点对 start prompt 使用 `add_special_tokens=true`，对每个事件分别使用
+`add_special_tokens=false`。`max_required_sequence_tokens` 是按实际分段
+状态机得到的**最大运行序列上界**：它会比较 Update 各版本和 finish 阶段可能
+达到的峰值，并计入 `PREFIX_APPEND` 尾部 segment padding，以及为 P 首输出
+token 预留的 `+1` 位置。它不是纯逻辑 prompt token 数。响应核心字段为：
+
+```json
+{
+  "block_size": 16,
+  "server_max_model_len": 4096,
+  "final_physical_prompt_tokens": 2048,
+  "max_required_sequence_tokens": 2049,
+  "fits_server_max_model_len": true
+}
+```
+
+该接口无状态，不创建长期 Request，也不计入实验 TTFT。
+
 ### `POST /v1/prompt_stream/start`
 
 用途：创建一个流式 prefill 会话，并在 P 节点创建长期 Request。
@@ -112,7 +159,7 @@ app.state.prompt_stream_sessions = {
   "api": "completions",
   "model": "local-completions",
   "prompt": "通用模板或 system prefix",
-  "stream": false,
+  "stream": true,
   "max_tokens": 128,
   "temperature": 0,
   "request_id": "optional-user-request-id"
@@ -126,7 +173,7 @@ app.state.prompt_stream_sessions = {
 | `api` | 当前必须是 `completions`。 |
 | `model` | 传给 vLLM 的模型名。 |
 | `prompt` | 固定 prefix/template。Start 阶段可以继续使用普通 prompt 文本，由 P 节点走现有输入处理链路完成 tokenize。 |
-| `stream` | 当前必须是 `false`。 |
+| `stream` | 客户端可使用 `false` 获取 JSON，或使用 `true` 获取 SSE。proxy 发往 P 的内部 start 固定为非流式 collector；该字段只决定 proxy 返回结果及 D decode 的响应模式。 |
 | `max_tokens` | D 节点 decode 的最大 token 数；P 节点 start 阶段不会真正 decode。 |
 | `request_id` | 可选。没有提供时由 proxy 生成稳定 request id。 |
 
@@ -267,7 +314,8 @@ app.state.prompt_stream_sessions = {
 - proxy 调用绑定的 D 节点 `/v1/completions`。
 - proxy 把 P 首 token 合并进 D 节点输出，再返回给 RAG 测试客户端。
 
-当前只返回普通 JSON response。`stream=true` 和 chat 请求在 start 时返回 400。
+`stream=false` 返回合并后的 JSON；`stream=true` 先发送 P 首 token 的
+completions SSE chunk，再转发 D 的剩余流。prompt-stream chat 请求仍返回 400。
 
 ### `POST /v1/prompt_stream/abort`
 
@@ -283,11 +331,15 @@ app.state.prompt_stream_sessions = {
 
 行为：
 
-- proxy 转发 abort 给绑定的 P 节点。
-- 清理 proxy 会话表。
+- 活跃会话：proxy 先把 abort 转发给绑定的 P 节点；只有 P 确认 abort 后，
+  才删除本地 session 并返回 `status=aborted`。若上游请求失败，proxy 保留
+  session，使客户端可以重试，不会把仍存活的 P 请求伪装成已清理。
+- 已 finish 或已经 abort 的会话：不再访问上游，幂等返回 200 和
+  `status=already_finished_or_aborted`。
 
-当前 abort 已实现 P 节点转发和 proxy session 清理。若 finish 已经同步发往 D，
-当前实验 proxy 还没有独立的 D request id 用来取消在途 decode，这是后续事项。
+因此 replay 在 D/NIXL 失败后的 finally 清理不会再把正常的“session 已经结束”
+误报为 404。若 finish 已经发往 D，当前实验 proxy 仍没有独立 D request id
+来取消在途 decode，这是后续事项。
 
 ## Stream2LLM 的参考结论
 
@@ -713,18 +765,23 @@ POST /v1/prompt_stream/finish
 - **collector 生命周期**：start 后如果长时间没有 finish，需要 session TTL 或 abort 清理 collector、Request 和 KV。
 - **请求超时与清理**：Append / Update 接口 ack 后，如果客户端不 finish，需要靠 abort 或 session TTL 清理 P 侧 Request 和 KV。
 - **chat completions 支持**：第一版实现仍建议只用 completions；chat 需要处理 template、messages 和最终用户问题的位置。
-- **streaming response 支持**：需要先把 P 首 token 编码成兼容的 OpenAI SSE
-  chunk，再统一 D 的 response id 和 usage；当前 proxy 明确拒绝 `stream=true`。
-- **Update 事件的 RESTFUL 测试**：当前前端脚本先验证 append-only 路径，Update source 的源内 LCP、KV 截断和重新 prefill 还没有通过 RESTFUL 集成测试覆盖。
+- **streaming response 边界**：completions 的 `stream=true` 已能先发送 P 首 token
+  并继续转发 D SSE；chat completions 的模板渲染与流式合并仍未实现。
+- **Update 事件的 RESTFUL 测试**：`update_frontend.py` 和
+  `mixed_frontend.py` 已完成单请求 smoke test；大规模并发回放仍需在本轮 exact
+  manifest 修复后重新验证。
 - **多 P/D 节点一致性**：proxy 会话表是内存状态，测试足够；生产需要外部 session store 或 sticky routing。
 
 ## 当前实现同步
 
-目前 RESTFUL 链路已经有第一版实验实现，重点是先让 append-only 场景能端到端跑起来。
+目前 RESTFUL 链路已经有第一版实验实现，Append、Update 和混合来源均有单请求
+smoke test；大规模回放所需的长度预检与 exact KV 传输保护已经落到代码，仍需
+在真实双 GPU 环境重新验证吞吐与输出质量。
 
 已经完成的部分包括：
 
-- `research/scripts/proxy_server.py` 已经实现实验用代理服务器，提供 `/v1/prompt_stream/start`、`/v1/prompt_stream/event`、`/v1/prompt_stream/finish` 和 `/v1/prompt_stream/abort`。
+- `research/scripts/proxy_server.py` 已经实现实验用代理服务器，提供
+  `/v1/prompt_stream/preflight`、`/start`、`/event`、`/finish` 和 `/abort`。
 - `vllm/entrypoints/serve/prompt_stream/api_router.py`、`protocol.py` 和 `serving.py` 已经提供 P 节点 RESTFUL 入口。
 - `vllm/entrypoints/openai/api_server.py` 已经注册 prompt stream router，因此 P 节点和 D 节点启动同一个 OpenAI-compatible server 后都能看到 `/v1/prompt_stream/*` 路由。
 - `EngineClient` / `AsyncLLM` 已经补了 prompt stream 专用方法：
@@ -782,28 +839,34 @@ PREFIX_APPEND = prefix + append + block 对齐 padding
 UPDATE        = update + final question + 后续 decode token
 ```
 
-P 节点 finish 时按 `PREFIX_APPEND block ids + UPDATE block ids` 导出，并逐 group
-验证 block 数等于 `ceil(num_computed_tokens / block_size)`。P 同时把包含 padding
-的完整物理 prompt token ids 返回给 proxy，proxy 不再根据逻辑事件自行猜测最终
-位置。
-
-P 采样的首 token 可能尚未拥有 KV，因此允许：
+P 节点 finish 时按 `PREFIX_APPEND block ids + UPDATE block ids` 导出。exact
+prompt-stream transfer 只允许一种远端覆盖范围：
 
 ```text
-physical_prompt_len <= remote_num_tokens <= D_prompt_len
-D_prompt_len = physical_prompt_len + len(P sampled token ids)
+remote_num_tokens = physical_prompt_len
+D_prompt_len = physical_prompt_len + prefill_output_tokens
+prefill_output_tokens in {0, 1}
+block_count[group] = ceil(physical_prompt_len / block_size[group])
 ```
 
-当远端前缀恰好 block 对齐、而 D 因首 token 多申请一个尾块时，D 侧 NIXL
-scheduler 只把覆盖 `num_external_tokens` 的本地 blocks 交给 load；尾块由 D 本地
-forward，不再要求 P 提供远端不存在的额外尾块。
+P 采样的首 token 是本轮 forward 的输出，尚未作为输入写入 KV，因此不属于
+远端 manifest。D 先拉取完整物理 prompt KV，再在本地 forward 这个可选的
+`0/1` 个 tail token。即使物理 prompt 恰好 block 对齐，D 为 tail token 申请的
+额外 block 也不会被误算为远端 block。
 
-proxy 还会执行以下 fail-closed 校验：
+proxy、D scheduler 和 NIXL worker 会逐层执行 fail-closed 校验：
 
-- P 必须返回物理 `prompt_token_ids` 和整数 `remote_num_tokens`。
-- P 首 token 最多一个。
-- proxy 构造的 D token 数必须严格等于物理 prompt 加 P 首 token。
-- `remote_num_tokens` 不得小于物理 prompt，也不得超过 D prompt。
+- exact 标志和 manifest 字段类型必须正确，计数、block size 和 block id
+  必须是有效整数。
+- `remote_block_ids`、manifest 和 D KV 配置的 group 数必须一致。
+- 每个 group 的远端、D 本地和 manifest block 数必须一致，P/D block size
+  必须一致。
+- `remote_num_tokens` 必须严格等于 `physical_prompt_len`。
+- D prompt token 数必须严格等于物理 prompt 加 manifest 声明的 `0/1` 个
+  P 输出 token。
+
+任一条件不满足时，只把当前请求标记为 KV load 失败，不启动错误的 NIXL
+复制，也不通过断言结束整个 EngineCore。
 
 D 返回后，proxy 会把 P 首 token 的文本和 token id 合并回最终 completions
 响应，并调整 usage。finish 成功后，P 和 proxy 都会清理长期 session。

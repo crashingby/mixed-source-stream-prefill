@@ -166,16 +166,13 @@ class KVCacheManager:
             KVCacheSpecKind.MLA_ATTENTION,
         }
         prompt_stream_block_sizes = {
-            group.kv_cache_spec.block_size
-            for group in kv_cache_config.kv_cache_groups
+            group.kv_cache_spec.block_size for group in kv_cache_config.kv_cache_groups
         }
-        self.prompt_stream_segments_supported = (
-            prompt_stream_block_sizes == {scheduler_block_size}
-            and all(
-                get_kv_cache_spec_kind(group.kv_cache_spec)
-                in prompt_stream_supported_kinds
-                for group in kv_cache_config.kv_cache_groups
-            )
+        self.prompt_stream_segments_supported = prompt_stream_block_sizes == {
+            scheduler_block_size
+        } and all(
+            get_kv_cache_spec_kind(group.kv_cache_spec) in prompt_stream_supported_kinds
+            for group in kv_cache_config.kv_cache_groups
         )
 
         # Watermark: minimum number of KV cache blocks to keep free when
@@ -443,9 +440,8 @@ class KVCacheManager:
             A list of new allocated blocks.
         """
         if request.is_prompt_streaming():
-            has_new_computed_blocks = (
-                new_computed_blocks is not None
-                and any(new_computed_blocks.blocks)
+            has_new_computed_blocks = new_computed_blocks is not None and any(
+                new_computed_blocks.blocks
             )
             if (
                 num_new_computed_tokens
@@ -570,7 +566,11 @@ class KVCacheManager:
 
         # P/D: delay caching blocks if we have to recv from
         # remote. Update state for locally cached blocks.
-        if not self.enable_caching or delay_cache_blocks:
+        if (
+            not self.enable_caching
+            or delay_cache_blocks
+            or request.uses_prompt_stream_kv_transfer()
+        ):
             return self.create_kv_cache_blocks(new_blocks)
 
         # NOTE(woosuk): We want to commit (cache) up to num_local_computed_tokens
@@ -833,7 +833,11 @@ class KVCacheManager:
             num_computed_tokens: The number of computed tokens, including tokens
                 that are already cached and tokens to be cached.
         """
-        if self.enable_caching and not request.is_prompt_streaming():
+        if (
+            self.enable_caching
+            and not request.is_prompt_streaming()
+            and not request.uses_prompt_stream_kv_transfer()
+        ):
             self.coordinator.cache_blocks(request, num_computed_tokens)
 
     def create_kv_cache_blocks(

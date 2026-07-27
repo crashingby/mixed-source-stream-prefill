@@ -9,8 +9,8 @@ prompt stream 模式，它就必须走 segment-aware 路径。
 
 ## 阶段性联调结果
 
-截至目前，`research/scripts` 下三个最小前端脚本都已经在真实 P/D 分离链路上
-完成 smoke test：
+`research/scripts` 下三个最小前端脚本曾在真实 P/D 分离链路上完成 smoke
+test：
 
 | 测试脚本 | 覆盖场景 | 当前结果 | 说明 |
 | --- | --- | --- | --- |
@@ -38,7 +38,12 @@ frontend script
 - proxy 能拿到 P 返回的物理 prompt token ids 和 `kv_transfer_params`，再请求 D 节点 decode。
 - append-only、update-only 和混合模式都已经能返回非错误 completion。
 
-这仍然是 smoke test，不等价于完整正确性证明。当前仍保留这些近似和限制：
+这些结果来自本轮 exact manifest、长度保护和 connector 生命周期修复之前，
+只能说明基础 REST/P/D 链路曾经跑通，不能替代对当前代码的重新联调。本轮修改
+已通过定向单元测试，但尚未在实时双 GPU 集群上重新验证。
+
+即使重新联调通过，也仍然只是 smoke test，不等价于完整正确性证明。当前仍
+保留这些近似和限制：
 
 - `PREFIX_APPEND` 末尾 padding 会参与 attention。
 - Append-after-Update 不强制重算已有 update KV，属于当前论文原型的近似语义。
@@ -161,13 +166,16 @@ write segment      = UPDATE
 ```
 
 Question prefill 完成后，P 节点会采样出唯一的首 token。这个 token 属于后续
-decode 序列；如果它已经在 P 侧经过下一轮 forward，`remote_num_tokens` 可以覆盖
-它的 KV。如果还没有，D 节点会把这个 token 放在自己的 prompt 尾部并本地 forward。
-proxy 当前允许这两种合法范围：
+decode 序列，但它只是当前 forward 产生的输出，还没有作为输入经过下一轮
+forward，因此 P 侧并没有它的 KV。当前实现只允许一种精确范围：
 
 ```text
-physical_prompt_len <= remote_num_tokens <= physical_prompt_len + 1
+remote_num_tokens = physical_prompt_len
+D prompt len = physical_prompt_len + 1
 ```
+
+D 先为 `physical_prompt_len` 个外部 token 申请和读取 blocks；KV load 完成后，
+再在 D 本地 forward P 采样的首 token，并从它的 logits 继续生成第二个输出 token。
 
 ### finish 时交给 D 的 block 顺序
 
@@ -180,17 +188,116 @@ remote_block_ids = PREFIX_APPEND block ids + UPDATE block ids
 此时 `UPDATE blocks` 已经包含：
 
 ```text
-当前 Update 快照 + Question + 可能已经 forward 的 P 首 token KV
+当前 Update 快照 + Question
 ```
 
 scheduler 会在调用 connector 前校验：
 
 ```text
-len(remote_block_ids[group]) == ceil(num_computed_tokens / block_size)
+len(remote_block_ids[group]) == ceil(physical_prompt_len / block_size)
 ```
 
 如果两个 segment 拼起来不能形成 D 侧可解释的连续物理 block table，会直接失败，
 不会把错位 block ids 交给 NIXL。
+
+P 还会随 `kv_transfer_params` 导出权威 manifest：
+
+```text
+prompt_stream_exact_transfer = true
+prompt_stream_physical_prompt_len
+prompt_stream_remote_block_counts
+prompt_stream_remote_block_sizes
+prompt_stream_prefill_output_tokens
+```
+
+proxy、D scheduler 和 NIXL worker 会逐层校验同一份 manifest。worker 发现
+local / remote / manifest 三方计数不一致时，只把当前请求标记为 KV load
+失败并打印 request id，不再通过 `assert` 结束整个 EngineCore。exact 模式的
+完整不变量是：
+
+```text
+remote_num_tokens = physical_prompt_len
+D_prompt_len = physical_prompt_len + prefill_output_tokens
+prefill_output_tokens in {0, 1}
+block_count[group] = ceil(physical_prompt_len / block_size[group])
+```
+
+校验不只比较总 block 数，还会严格检查字段类型、KV group 数、每组 block
+count、P/D block size、远端 block id，以及 physical / remote / D prompt
+三种 token 长度。任何一项异常都按单请求 fail closed，不让错误 manifest
+进入 NIXL read。
+
+## 大规模回放暴露的问题与修复
+
+### D 为什么会出现 prefix cache
+
+D 收到的是普通 completion `Request`，并不带 P 侧的
+`PromptStreamState`。原来的通用 NIXL 路径会先调用
+`get_computed_blocks()` 查询 D 本地 APC，再调用
+`get_num_new_matched_tokens()` 查询 P 的外部 KV；加载成功后还会把收到的
+blocks 写回普通 APC。
+
+这会造成两个问题：
+
+- Update 的 KV 是本项目分段 attention 近似结果，不能和普通全量 prefill
+  共用 token hash namespace。
+- D 本地 prefix hit 会改变本次需要加载的 local block 数，而 P 的分段
+  block table 是固定的，二者不能继续套用通用的尾部裁剪推断。
+
+当前通过 `prompt_stream_exact_transfer` 识别 D 侧请求，并做了完整隔离：
+
+- **Local Prefix cache** 是 D 自己的自动前缀缓存（APC）命中。exact
+  prompt-stream 请求既不读取也不写入这个缓存，因此这类请求的 local hit
+  固定为 0，也不会用分段近似 KV 污染普通 token hash namespace。
+- prompt-stream 请求不受 NIXL `kv_recompute_threshold` 影响；短请求也会
+  真正读取 P 的 KV。
+- 加载后的近似 KV 不写入普通 APC，Request 结束时按普通私有 blocks 释放。
+- **External prefix cache** 是通过 NIXL 从 P 加载的外部 KV 命中。该指标仍会
+  增长，而且一次 exact transfer 可以接近 100%；它不表示 D 本地 APC 命中，
+  也不和禁用 Local Prefix cache 矛盾。
+
+### block 数不匹配的边界根因
+
+失败样本曾出现：
+
+```text
+physical_prompt_len = 3664 = 229 * 16
+P remote blocks     = 229
+D prompt len        = 3665
+```
+
+旧代码把 P 采样的首 token 计入 `remote_num_tokens`，D 因而按 3665 个外部
+token 申请 230 个 blocks，再和 P 的 229 个 blocks 进入
+`_apply_prefix_caching()`，最终触发断言。
+
+现在 `remote_num_tokens` 被强制覆盖为物理 prompt 长度 3664。D 的第一次
+异步 load 只申请 229 个 blocks；首 token 留到 load 完成后本地 forward，
+届时才按需要申请第 230 个 tail block。
+
+### 超长请求和 unrecognized request
+
+此前 REST event ack 只表示事件已经入队。超长事件在 scheduler 中结束长期
+Request 后，随后到达的同 ID 事件会走 `add_request(existing is None)`，
+错误地创建一个新 Request。旧失败生命周期的 `reqs_not_processed` 与新
+生命周期的 `reqs_in_batch/reqs_to_send` 随后发生冲突，D 通知 P 时就会出现：
+
+```text
+Potentially invalid KV blocks for unrecognized request
+```
+
+当前使用四层保护：
+
+- 回放程序通过 `/v1/prompt_stream/preflight` 在 QPS 计时前过滤超长样本。
+- P serving 为每个活跃会话维护一个无 KV 的 Request 长度镜像；事件进入
+  EngineCore 前检查实际阶段的最大运行序列上界。这个上界包含 segment
+  padding 和为 P 首 token 预留的 `+1`，超限时使用 EngineCore 内部 request
+  id 真正 abort 长期请求。
+- Scheduler 为已经因超长结束的 request id 保存 terminal tombstone，拒绝
+  core-only 后续事件复活。
+- NIXL lifecycle 以当前待发送请求为准，丢弃同 id 的 stale
+  `not_processed` 标记，避免旧失败生命周期覆盖新状态。
+
+这里的 `+1` 是给 P 采样并交给 D 本地 forward 的首 token 预留序列位置。
 
 ## 逻辑状态和执行状态已经分离
 
@@ -492,27 +599,25 @@ PREFIX_APPEND block ids + UPDATE block ids
 connector 调用前会逐 KV group 校验：
 
 ```text
-actual block count == ceil(num_computed_tokens / block_size)
+actual block count == ceil(physical_prompt_len / block_size)
 ```
 
 如果拼接结果不是普通 D 请求能够解释的连续物理布局，会直接抛出错误，不再把
 错误 block ids 交给 NIXL。
 
-`remote_num_tokens` 仍由 connector 根据 P 侧实际 `num_computed_tokens` 生成。
-只有真正经过 forward 并写入 KV 的位置才应计入这个值。
-
-P 在 final Question forward 后采样出的首 token 不一定已经拥有 KV。正常情况下：
+P 在 final Question forward 后采样出的首 token 尚未作为输入经过下一轮
+forward，因此不在远端 KV manifest 中。exact prompt-stream transfer 只允许：
 
 ```text
 remote_num_tokens = len(PA_physical + Update + Question)
-D prompt tokens   = PA_physical + Update + Question + P sampled token
+D prompt tokens   = PA_physical + Update + Question
+                  + 0/1 个 P sampled token
 ```
 
-D 为 sampled token 可能额外申请一个本地 block，尤其是 `remote_num_tokens` 恰好
-block 对齐时。NIXL D 侧现在会把 local load block ids 裁剪到
-`ceil(num_external_tokens / block_size)`，只从 P 拉取远端真正覆盖的前缀；最后
-一个 sampled token 由 D 本地 forward。若某种执行路径已经在 P 上计算该 token，
-`remote_num_tokens` 也可以覆盖它，proxy 的区间校验同样成立。
+D 为 sampled token 可能额外申请一个本地 block，尤其是物理 prompt 恰好 block
+对齐时。NIXL D 侧严格按 manifest 把 local load block ids 裁剪到
+`ceil(physical_prompt_len / block_size)`，只从 P 拉取物理 prompt；可选的首
+token 由 D 本地 forward。当前实现不允许用 `remote_num_tokens` 覆盖这个 token。
 
 ## proxy 如何和物理布局对齐
 
@@ -529,12 +634,14 @@ PA_physical + Update + Question + P 侧已返回的 output tokens
 发往 D 之前会强制验证：
 
 ```text
-physical_prompt_len <= remote_num_tokens <= D_prompt_len
+remote_num_tokens = physical_prompt_len
 D_prompt_len = physical_prompt_len + len(P sampled tokens)
+len(P sampled tokens) in {0, 1}
 ```
 
 此外，`kv_transfer_params.prompt_stream_physical_prompt_len` 必须和 P 返回的
-`prompt_token_ids` 长度一致；不一致时 proxy 返回 502。
+`prompt_token_ids` 长度一致；manifest 的类型、group、count 和 block size
+也必须一致。不一致时 proxy 返回 502，不会继续请求 D。
 
 P 当前只允许 `n=1`，所以 sampled token 最多一个。D 返回非流式 completion 后，
 proxy 会把这个 P 首 token 的文本和 token id 合并回最终响应，并修正 usage；若首
@@ -555,9 +662,10 @@ frontend
 
 P 节点接口仍支持 text / token ids 双模式；进入 `PromptStreamEvent` 前统一完成
 tokenization。start 保存一个长期 output collector，event 只返回 ack，finish
-等待最终输出和 `kv_transfer_params`。当前 proxy MVP 只接受 completions API 和
-`stream=false`；chat prompt 的 renderer 镜像及流式响应首 token 合并尚未实现，
-因此会在 start 入口直接返回 400，而不是发送错位 KV。
+等待最终输出和 `kv_transfer_params`。当前 proxy MVP 只接受 completions API，
+但已经同时支持 `stream=false` 和 `stream=true`：流式路径先发送 P 首 token，
+再转发 D 的后续 SSE。chat prompt 的 renderer 镜像尚未实现，因此会在 start
+入口直接返回 400，而不是发送错位 KV。
 
 P 和 proxy 在 finish 成功后都会删除各自的长期 session，避免已完成 request id
 被错误复用。

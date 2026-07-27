@@ -9,6 +9,7 @@ from fastapi.responses import JSONResponse
 from vllm.engine.protocol import EngineClient
 from vllm.entrypoints.serve.prompt_stream.protocol import (
     PromptStreamEventEnvelope,
+    PromptStreamPreflightRequest,
     PromptStreamStartRequest,
 )
 from vllm.entrypoints.serve.prompt_stream.serving import PromptStreamServing
@@ -31,6 +32,22 @@ def prompt_stream_serving(request: Request) -> PromptStreamServing:
         serving = PromptStreamServing(engine_client(request))
         request.app.state.prompt_stream_serving = serving
     return serving
+
+
+@router.post("/v1/prompt_stream/preflight")
+async def preflight_prompt_stream(
+    request: PromptStreamPreflightRequest,
+    raw_request: Request,
+):
+    """使用 P 节点 tokenizer 和 block size 预检完整流式 prompt 长度。"""
+    try:
+        response = prompt_stream_serving(raw_request).preflight(request)
+    except ValueError as err:
+        raise HTTPException(
+            status_code=HTTPStatus.BAD_REQUEST,
+            detail=str(err),
+        ) from err
+    return JSONResponse(content=response.model_dump())
 
 
 @router.post("/v1/prompt_stream/start")

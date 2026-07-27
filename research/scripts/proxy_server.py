@@ -3,16 +3,18 @@
 
 import argparse
 import itertools
+import json
 import logging
 import os
 import time
+from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import Any
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
@@ -405,16 +407,19 @@ def _validate_prompt_stream_transfer(
             status_code=502,
             detail="P node did not return physical prompt token ids.",
         )
-    if not isinstance(remote_num_tokens, int):
+    if type(remote_num_tokens) is not int or remote_num_tokens < 0:
         raise HTTPException(
             status_code=502,
-            detail="P node did not return an integer remote_num_tokens.",
+            detail=("P node did not return a non-negative integer remote_num_tokens."),
         )
     physical_prompt_len = len(physical_prompt_token_ids)
     reported_physical_prompt_len = kv_transfer_params.get(
         "prompt_stream_physical_prompt_len"
     )
-    if reported_physical_prompt_len != physical_prompt_len:
+    if (
+        type(reported_physical_prompt_len) is not int
+        or reported_physical_prompt_len != physical_prompt_len
+    ):
         raise HTTPException(
             status_code=502,
             detail=(
@@ -424,7 +429,12 @@ def _validate_prompt_stream_transfer(
             ),
         )
     decode_prompt_len = physical_prompt_len + num_prefill_output_tokens
-    if not physical_prompt_len <= remote_num_tokens <= decode_prompt_len:
+    if kv_transfer_params.get("prompt_stream_exact_transfer") is not True:
+        raise HTTPException(
+            status_code=502,
+            detail="P node did not mark prompt stream KV as exact transfer.",
+        )
+    if remote_num_tokens != physical_prompt_len:
         raise HTTPException(
             status_code=502,
             detail=(
@@ -432,6 +442,93 @@ def _validate_prompt_stream_transfer(
                 f"physical_prompt_len={physical_prompt_len}, "
                 f"remote_num_tokens={remote_num_tokens}, "
                 f"decode_prompt_len={decode_prompt_len}."
+            ),
+        )
+    reported_output_tokens = kv_transfer_params.get(
+        "prompt_stream_prefill_output_tokens"
+    )
+    if (
+        type(reported_output_tokens) is not int
+        or reported_output_tokens != num_prefill_output_tokens
+    ):
+        raise HTTPException(
+            status_code=502,
+            detail=(
+                "P node returned inconsistent prefill output-token metadata: "
+                f"response={num_prefill_output_tokens}, "
+                f"manifest={reported_output_tokens}."
+            ),
+        )
+    remote_block_ids = kv_transfer_params.get("remote_block_ids")
+    manifest_block_counts = kv_transfer_params.get("prompt_stream_remote_block_counts")
+    manifest_block_sizes = kv_transfer_params.get("prompt_stream_remote_block_sizes")
+    if (
+        not isinstance(remote_block_ids, (list, tuple))
+        or not isinstance(manifest_block_counts, (list, tuple))
+        or not isinstance(manifest_block_sizes, (list, tuple))
+    ):
+        raise HTTPException(
+            status_code=502,
+            detail="P node returned an incomplete prompt stream block manifest.",
+        )
+    if not (
+        len(remote_block_ids) == len(manifest_block_counts) == len(manifest_block_sizes)
+    ):
+        raise HTTPException(
+            status_code=502,
+            detail=(
+                "P node returned inconsistent prompt stream KV-group counts: "
+                f"remote={len(remote_block_ids)}, "
+                f"block_counts={len(manifest_block_counts)}, "
+                f"block_sizes={len(manifest_block_sizes)}."
+            ),
+        )
+    if not all(
+        type(block_count) is int and block_count >= 0
+        for block_count in manifest_block_counts
+    ) or not all(
+        type(block_size) is int and block_size > 0
+        for block_size in manifest_block_sizes
+    ):
+        raise HTTPException(
+            status_code=502,
+            detail="P node returned invalid prompt stream block counts or sizes.",
+        )
+    if not all(isinstance(group, (list, tuple)) for group in remote_block_ids):
+        raise HTTPException(
+            status_code=502,
+            detail="P node returned invalid prompt stream remote block groups.",
+        )
+    if not all(
+        type(block_id) is int and block_id >= 0
+        for group in remote_block_ids
+        for block_id in group
+    ):
+        raise HTTPException(
+            status_code=502,
+            detail="P node returned invalid prompt stream remote block IDs.",
+        )
+    remote_block_counts = [len(group) for group in remote_block_ids]
+    if remote_block_counts != list(manifest_block_counts):
+        raise HTTPException(
+            status_code=502,
+            detail=(
+                "P node returned inconsistent prompt stream block counts: "
+                f"remote={remote_block_counts}, "
+                f"manifest={list(manifest_block_counts)}."
+            ),
+        )
+    derived_block_counts = [
+        (physical_prompt_len + block_size - 1) // block_size
+        for block_size in manifest_block_sizes
+    ]
+    if list(manifest_block_counts) != derived_block_counts:
+        raise HTTPException(
+            status_code=502,
+            detail=(
+                "P node block manifest does not cover the physical prompt "
+                f"exactly: manifest={list(manifest_block_counts)}, "
+                f"derived={derived_block_counts}."
             ),
         )
     if (
@@ -462,10 +559,7 @@ def _should_finish_without_decode(
     if response_json.get("output_finish_reason") == "stop":
         return True
     max_tokens = decode_request.get("max_tokens")
-    return (
-        isinstance(max_tokens, int)
-        and max_tokens <= num_prefill_output_tokens
-    )
+    return isinstance(max_tokens, int) and max_tokens <= num_prefill_output_tokens
 
 
 def _build_prefill_only_response(
@@ -518,14 +612,12 @@ def _merge_prefill_output(
             detail="D node must return exactly one completion choice.",
         )
     choice = choices[0]
-    choice["text"] = prefill_response.get("output_text", "") + choice.get(
-        "text", ""
-    )
+    choice["text"] = prefill_response.get("output_text", "") + choice.get("text", "")
     token_ids = choice.get("token_ids")
     if isinstance(token_ids, list):
-        choice["token_ids"] = list(
-            prefill_response.get("output_token_ids") or []
-        ) + token_ids
+        choice["token_ids"] = (
+            list(prefill_response.get("output_token_ids") or []) + token_ids
+        )
 
     usage = response_json.get("usage")
     if isinstance(usage, dict):
@@ -537,9 +629,7 @@ def _merge_prefill_output(
                 prompt_tokens - num_prefill_output_tokens,
             )
         if isinstance(completion_tokens, int):
-            usage["completion_tokens"] = (
-                completion_tokens + num_prefill_output_tokens
-            )
+            usage["completion_tokens"] = completion_tokens + num_prefill_output_tokens
     return response_json
 
 
@@ -622,6 +712,280 @@ async def _post_json(
     return response.json()
 
 
+def _encode_sse_payload(payload: dict[str, Any]) -> bytes:
+    """把一个 OpenAI 风格 JSON chunk 编码成 SSE data frame。
+
+    Args:
+        payload: 可 JSON 序列化的单个响应 chunk。
+
+    Returns:
+        以 UTF-8 编码的 ``data: ...\\n\\n`` SSE frame。
+    """
+    serialized_payload = json.dumps(payload, ensure_ascii=False)
+    return f"data: {serialized_payload}\n\n".encode()
+
+
+def _build_prefill_stream_chunk(
+    session: PromptStreamProxySession,
+    prefill_response: dict[str, Any],
+    is_final_chunk: bool,
+) -> dict[str, Any]:
+    """把 P 节点 finish 的首个生成 token 构造成 completions SSE chunk。
+
+    P 节点在 ``prompt_stream/finish`` 成功时已经完成最终问题的 prefill 并
+    产生一个输出 token。stream 模式必须立即把它发送给客户端，不能等待 D
+    节点完成剩余 decode，否则 finish-to-first-token 不再是实际 TTFT。
+
+    Args:
+        session: 绑定 P/D 节点与请求参数的 proxy 会话。
+        prefill_response: P 节点 finish 返回的首 token 和 KV 元数据。
+        is_final_chunk: P 的首 token 是否已经满足停止条件。
+
+    Returns:
+        OpenAI completions SSE 使用的单个 JSON payload。
+    """
+    output_token_ids = prefill_response.get("output_token_ids") or []
+    finish_reason = prefill_response.get("output_finish_reason")
+    if is_final_chunk and finish_reason != "stop":
+        finish_reason = "length"
+    return {
+        "id": f"cmpl-{session.request_id}",
+        "object": "text_completion",
+        "created": int(time.time()),
+        "model": session.base_request.get("model"),
+        "choices": [
+            {
+                "index": 0,
+                "text": prefill_response.get("output_text", ""),
+                "logprobs": None,
+                "finish_reason": finish_reason if is_final_chunk else None,
+                "stop_reason": prefill_response.get("output_stop_reason"),
+                # token_ids 让客户端能够把空文本的特殊 token 也算作首 token。
+                "token_ids": output_token_ids,
+            }
+        ],
+    }
+
+
+async def _stream_decode_completion(
+    session: PromptStreamProxySession,
+    prefill_response: dict[str, Any],
+    decode_request: dict[str, Any],
+    num_prefill_output_tokens: int,
+    finish_without_decode: bool,
+) -> AsyncIterator[bytes]:
+    """先发 P 首 token，再透明转发 D 的剩余 SSE decode 流。
+
+    该 generator 仅在外层 HTTP headers 已经开始发送后运行，因此 D 侧错误
+    以 SSE ``error`` chunk 表示。这样客户端至少可以区分“TTFT 已产生”与
+    “后续 decode 失败”。
+
+    Args:
+        session: 当前 prompt stream 会话。
+        prefill_response: P 节点 finish 响应。
+        decode_request: 已写入精确 token view 和 KV transfer 参数的 D 请求。
+        num_prefill_output_tokens: P 已生成并将要合并进输出的 token 数。
+        finish_without_decode: P 首 token 已完成整个请求时为 True。
+
+    Yields:
+        OpenAI completions 兼容的 SSE bytes。
+    """
+    if num_prefill_output_tokens > 0:
+        # 这是流式路径的真实首 token：TTFT 应以此 frame 的到达时刻计量。
+        yield _encode_sse_payload(
+            _build_prefill_stream_chunk(
+                session,
+                prefill_response,
+                is_final_chunk=finish_without_decode,
+            )
+        )
+
+    if finish_without_decode:
+        yield b"data: [DONE]\n\n"
+        return
+
+    try:
+        async with session.decode_client_info["client"].stream(
+            "POST",
+            session.api_endpoint,
+            json=decode_request,
+            headers=_authorization_headers(session.request_id),
+        ) as response:
+            if response.is_error:
+                # StreamingResponse 不能再改 HTTP status；将上游错误编码为 SSE。
+                error_body = await response.aread()
+                try:
+                    decoded_body: Any = json.loads(error_body)
+                except (TypeError, ValueError):
+                    decoded_body = error_body.decode("utf-8", errors="replace")
+                yield _encode_sse_payload(
+                    {
+                        "error": {
+                            "service": "decode",
+                            "endpoint": session.api_endpoint,
+                            "status_code": response.status_code,
+                            "body": decoded_body,
+                        }
+                    }
+                )
+                yield b"data: [DONE]\n\n"
+                return
+
+            # D 已经被扣除了 P 的首 token budget；其 chunk 可原样转发。
+            async for chunk in response.aiter_raw():
+                if chunk:
+                    yield chunk
+    except httpx.RequestError as exc:
+        yield _encode_sse_payload(
+            {
+                "error": {
+                    "service": "decode",
+                    "endpoint": session.api_endpoint,
+                    "error": str(exc),
+                }
+            }
+        )
+        yield b"data: [DONE]\n\n"
+
+
+async def _forward_upstream_stream(
+    response: httpx.Response,
+) -> AsyncIterator[bytes]:
+    """透明转发 D 节点的流式响应，并保证连接最终关闭。
+
+    Args:
+        response: 已建立且状态码成功的 D 节点 streaming response。
+
+    Yields:
+        D 节点返回的原始 SSE 字节。
+    """
+    try:
+        async for chunk in response.aiter_raw():
+            if chunk:
+                yield chunk
+    finally:
+        await response.aclose()
+
+
+async def _forward_normal_request(
+    request: Request,
+    endpoint: str,
+) -> StreamingResponse | JSONResponse:
+    """把普通 OpenAI REST 请求转发到一个 D 节点。
+
+    普通模式不经过 P 节点，也不附加 KV transfer 参数。stream=true 时保留
+    上游 SSE；stream=false 时返回普通 JSON。这个接口让实验客户端只需要
+    配置一个 proxy 地址。
+
+    Args:
+        request: 客户端发送给 proxy 的 FastAPI 请求。
+        endpoint: D 节点上的 OpenAI endpoint，例如 /completions。
+
+    Returns:
+        StreamingResponse 或 JSONResponse。
+    """
+    req_data = await request.json()
+    decode_client_info = get_next_client(request.app, "decode")
+    request_id = request.headers.get("X-Request-Id")
+    if not request_id:
+        request_id = f"normal-{time.time_ns()}"
+
+    if not req_data.get("stream", False):
+        response_json = await _post_json(
+            decode_client_info,
+            endpoint,
+            req_data,
+            request_id,
+            service_name="decode",
+        )
+        return JSONResponse(content=response_json)
+
+    upstream_request = decode_client_info["client"].build_request(
+        "POST",
+        endpoint,
+        json=req_data,
+        headers=_authorization_headers(request_id),
+    )
+    try:
+        upstream_response = await decode_client_info["client"].send(
+            upstream_request,
+            stream=True,
+        )
+    except httpx.RequestError as exc:
+        upstream = (
+            f"{decode_client_info['host']}:{decode_client_info['port']}{endpoint}"
+        )
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "service": "decode",
+                "endpoint": endpoint,
+                "upstream": upstream,
+                "error": str(exc),
+            },
+        ) from exc
+
+    if upstream_response.is_error:
+        await upstream_response.aread()
+        detail = _format_upstream_error(
+            "decode",
+            endpoint,
+            upstream_response,
+        )
+        await upstream_response.aclose()
+        raise HTTPException(
+            status_code=upstream_response.status_code,
+            detail=detail,
+        )
+
+    return StreamingResponse(
+        _forward_upstream_stream(upstream_response),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+@app.post("/v1/completions", response_model=None)
+async def forward_normal_completions(
+    request: Request,
+) -> StreamingResponse | JSONResponse:
+    """转发普通 completions 请求到 D 节点。"""
+    return await _forward_normal_request(request, "/completions")
+
+
+@app.post("/v1/chat/completions", response_model=None)
+async def forward_normal_chat_completions(
+    request: Request,
+) -> StreamingResponse | JSONResponse:
+    """转发普通 chat completions 请求到 D 节点。"""
+    return await _forward_normal_request(request, "/chat/completions")
+
+
+@app.post("/v1/responses", response_model=None)
+async def forward_normal_responses(
+    request: Request,
+) -> StreamingResponse | JSONResponse:
+    """转发普通 Responses API 请求到 D 节点。"""
+    return await _forward_normal_request(request, "/responses")
+
+
+@app.post("/v1/prompt_stream/preflight")
+async def preflight_prompt_stream(request: Request):
+    """把无状态长度预检转发给一个 P 节点。"""
+    req_data = await request.json()
+    prefill_client_info = get_next_client(request.app, "prefill")
+    response_json = await _post_json(
+        prefill_client_info,
+        "/prompt_stream/preflight",
+        req_data,
+        req_data.get("request_id", "prompt-stream-preflight"),
+    )
+    return JSONResponse(content=response_json)
+
+
 @app.post("/v1/prompt_stream/start")
 async def start_prompt_stream(request: Request):
     """创建 P/D prompt stream 会话。"""
@@ -631,15 +995,11 @@ async def start_prompt_stream(request: Request):
         raise HTTPException(
             status_code=400,
             detail=(
-                "Prompt stream segment KV currently supports only "
-                "the completions API."
+                "Prompt stream segment KV currently supports only the completions API."
             ),
         )
-    if req_data.get("stream", False):
-        raise HTTPException(
-            status_code=400,
-            detail="Prompt stream proxy currently supports stream=false only.",
-        )
+    # stream=true 使用 P 首 token + D 后续 token 的 SSE 路径；P 节点自身
+    # 的 start 仍由 _build_prefill_start_request 强制为非流式 collector。
     prefill_client_info = get_next_client(request.app, "prefill")
     decode_client_info = get_next_client(request.app, "decode")
 
@@ -736,15 +1096,14 @@ async def finish_prompt_stream(request: Request):
         )
 
     decode_request = dict(session.base_request)
-    if not global_args.disable_kv_transfer and _should_finish_without_decode(
-        decode_request,
-        prefill_response,
-        num_prefill_output_tokens,
-    ):
-        response_json = _build_prefill_only_response(session, prefill_response)
-        return JSONResponse(
-            content=response_json,
+    finish_without_decode = (
+        not global_args.disable_kv_transfer
+        and _should_finish_without_decode(
+            decode_request,
+            prefill_response,
+            num_prefill_output_tokens,
         )
+    )
     _shrink_decode_max_tokens(decode_request, num_prefill_output_tokens)
     _apply_decode_prompt_to_request(session, decode_request)
     if not global_args.disable_kv_transfer:
@@ -755,14 +1114,35 @@ async def finish_prompt_stream(request: Request):
     logger.info(
         "Proxy finish decode request: request_id=%s prompt_token_len=%s "
         "remote_num_tokens=%s remote_block_counts=%s "
-        "num_prefill_output_tokens=%s disable_kv_transfer=%s",
+        "num_prefill_output_tokens=%s disable_kv_transfer=%s stream=%s",
         session.request_id,
         prompt_len,
         kv_transfer_params.get("remote_num_tokens"),
         [len(group) for group in kv_transfer_params.get("remote_block_ids", [])],
         num_prefill_output_tokens,
         global_args.disable_kv_transfer,
+        bool(decode_request.get("stream", False)),
     )
+
+    if decode_request.get("stream", False):
+        return StreamingResponse(
+            _stream_decode_completion(
+                session=session,
+                prefill_response=prefill_response,
+                decode_request=decode_request,
+                num_prefill_output_tokens=num_prefill_output_tokens,
+                finish_without_decode=finish_without_decode,
+            ),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "X-Accel-Buffering": "no",
+            },
+        )
+
+    if finish_without_decode:
+        response_json = _build_prefill_only_response(session, prefill_response)
+        return JSONResponse(content=response_json)
 
     decode_response = await _post_json(
         session.decode_client_info,
@@ -781,14 +1161,26 @@ async def finish_prompt_stream(request: Request):
 
 @app.post("/v1/prompt_stream/abort")
 async def abort_prompt_stream(request: Request):
-    """取消 proxy、P 节点和 D 节点上的 prompt stream 会话。"""
+    """幂等地取消 proxy 和 P 节点上的 prompt stream 会话。
+
+    P finish 成功后 proxy 会立即移除本地 session。此后即使 D decode 或
+    NIXL 传输失败，replay 的 finally 清理仍应收到成功响应，而不是把已结束
+    的会话误报成 REST 路由不存在。
+    """
     req_data = await request.json()
     request_id = req_data.get("request_id")
-    session = request.app.state.prompt_stream_sessions.pop(request_id, None)
-    if session is None:
+    if not isinstance(request_id, str):
         raise HTTPException(
-            status_code=404,
-            detail=f"Unknown prompt stream request_id={request_id}",
+            status_code=400,
+            detail="prompt_stream abort requires string request_id.",
+        )
+    session = request.app.state.prompt_stream_sessions.get(request_id)
+    if session is None:
+        return JSONResponse(
+            content={
+                "request_id": request_id,
+                "status": "already_finished_or_aborted",
+            }
         )
 
     await _post_json(
@@ -797,6 +1189,9 @@ async def abort_prompt_stream(request: Request):
         {"request_id": session.request_id},
         session.request_id,
     )
+    # Only forget the binding after P confirms the abort. On a network error,
+    # keep it so the caller can retry instead of leaking an orphan P request.
+    request.app.state.prompt_stream_sessions.pop(request_id, None)
     return JSONResponse(content={"request_id": request_id, "status": "aborted"})
 
 

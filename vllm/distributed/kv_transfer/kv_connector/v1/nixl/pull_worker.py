@@ -43,10 +43,31 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
         We check for these trnxs to complete in each step().
         """
         for req_id, meta in metadata.reqs_to_recv.items():
+            # always store metadata for failure recovery
+            self._recving_metadata[req_id] = meta
+            if meta.prompt_stream_manifest_error is not None:
+                self._log_failure(
+                    failure_type="prompt_stream_manifest_mismatch",
+                    msg=meta.prompt_stream_manifest_error,
+                    req_id=req_id,
+                    dst_engine_id=(
+                        meta.remote.engine_id if meta.remote is not None else None
+                    ),
+                )
+                self._handle_failed_transfer(req_id, None)
+                continue
+            if meta.remote is None:
+                self._log_failure(
+                    failure_type="missing_remote_metadata",
+                    msg="NIXL receive request has no remote metadata.",
+                    req_id=req_id,
+                )
+                self._handle_failed_transfer(req_id, None)
+                continue
+
             meta.local_physical_block_ids = self._logical_to_kernel_block_ids(
                 meta.local_block_ids
             )
-            assert meta.remote is not None
             # Remote block IDs are kept logical here; expanded in
             # _read_blocks_for_req using the remote engine's phys ratio.
             remote_engine_id = meta.remote.engine_id
@@ -58,8 +79,6 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
                 len(meta.local_physical_block_ids),
                 len(meta.remote.block_ids),
             )
-            # always store metadata for failure recovery
-            self._recving_metadata[req_id] = meta
             if remote_engine_id not in self._remote_agents:
                 # Initiate handshake with remote engine to exchange metadata.
                 with self._handshake_lock:
@@ -107,6 +126,37 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
         plan = self.tp_mappings[engine_id]
         remote_info = self.transfer_topo.get_engine_info(engine_id)
         tp_ratio = self.transfer_topo.tp_ratio(remote_info.remote_tp_size)
+
+        if meta.prompt_stream_exact_transfer:
+            local_counts = [len(group) for group in meta.local_block_ids]
+            remote_counts = [len(group) for group in meta.remote.block_ids]
+            expected_counts = list(meta.prompt_stream_expected_block_counts)
+            local_sizes = [
+                group.kv_cache_spec.block_size
+                for group in self.kv_cache_config.kv_cache_groups
+            ]
+            expected_sizes = list(meta.prompt_stream_expected_block_sizes)
+            if (
+                local_counts != expected_counts
+                or remote_counts != expected_counts
+                or local_sizes != expected_sizes
+            ):
+                error = (
+                    "Exact prompt-stream block manifest differs at worker: "
+                    f"request_id={req_id}, local_counts={local_counts}, "
+                    f"remote_counts={remote_counts}, "
+                    f"expected_counts={expected_counts}, "
+                    f"local_sizes={local_sizes}, "
+                    f"expected_sizes={expected_sizes}."
+                )
+                self._log_failure(
+                    failure_type="prompt_stream_manifest_mismatch",
+                    msg=error,
+                    req_id=req_id,
+                    dst_engine_id=engine_id,
+                )
+                self._handle_failed_transfer(req_id, None)
+                return
 
         meta.remote.block_ids = self._logical_to_remote_kernel_block_ids(
             meta.remote.block_ids,
@@ -168,14 +218,17 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
                 spec.remote_rank
             ]
 
-            self._read_blocks(
+            transfer_started = self._read_blocks(
                 read_spec=spec,
                 request_id=req_id,
                 dst_engine_id=meta.remote.engine_id,
                 remote_request_id=meta.remote.request_id,
                 local_xfer_side_handle=local_xfer_side_handle,
                 remote_xfer_side_handle=remote_xfer_side_handle,
+                exact_transfer=meta.prompt_stream_exact_transfer,
             )
+            if not transfer_started:
+                break
 
         if self.use_mla and tp_ratio < 0 and read_specs:
             # ..but we still need to notify the other remote ranks that we
@@ -194,7 +247,8 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
         remote_request_id: str,
         local_xfer_side_handle: int,
         remote_xfer_side_handle: int,
-    ):
+        exact_transfer: bool = False,
+    ) -> bool:
         """
         Post a READ point-to-point xfer request from a single local worker to
         a single remote worker.
@@ -265,17 +319,70 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
                     remote_agent_name=agent_name,
                 )
                 self.xfer_stats.record_failed_notification()
-            return
+            return True
 
-        assert (
+        if not (
             len(remote_block_ids)
             == len(local_block_ids)
             == len(self.kv_cache_config.kv_cache_groups)
-        )
+        ):
+            error = ValueError(
+                "KV group count mismatch before NIXL read: "
+                f"request_id={request_id}, "
+                f"local_groups={len(local_block_ids)}, "
+                f"remote_groups={len(remote_block_ids)}, "
+                f"expected_groups={len(self.kv_cache_config.kv_cache_groups)}."
+            )
+            self._log_failure(
+                failure_type="block_manifest_mismatch",
+                msg="Marking this request's blocks as invalid.",
+                req_id=request_id,
+                error=error,
+                dst_engine_id=dst_engine_id,
+                remote_rank=remote_rank,
+            )
+            self._handle_failed_transfer(request_id, None)
+            return False
+
         remote_physical_per_logical = remote_info.remote_physical_blocks_per_logical
-        local_block_ids, remote_block_ids = self._apply_prefix_caching(
-            local_block_ids, remote_block_ids, remote_physical_per_logical
-        )
+        if exact_transfer:
+            local_counts = [len(group) for group in local_block_ids]
+            remote_counts = [len(group) for group in remote_block_ids]
+            if local_counts != remote_counts:
+                error = ValueError(
+                    "Exact prompt-stream physical block counts differ before "
+                    f"NIXL read: request_id={request_id}, "
+                    f"local_counts={local_counts}, "
+                    f"remote_counts={remote_counts}."
+                )
+                self._log_failure(
+                    failure_type="prompt_stream_manifest_mismatch",
+                    msg="Marking this request's blocks as invalid.",
+                    req_id=request_id,
+                    error=error,
+                    dst_engine_id=dst_engine_id,
+                    remote_rank=remote_rank,
+                )
+                self._handle_failed_transfer(request_id, None)
+                return False
+        else:
+            try:
+                local_block_ids, remote_block_ids = self._apply_prefix_caching(
+                    local_block_ids,
+                    remote_block_ids,
+                    remote_physical_per_logical,
+                )
+            except (AssertionError, IndexError, ValueError) as error:
+                self._log_failure(
+                    failure_type="block_alignment_mismatch",
+                    msg="Marking this request's blocks as invalid.",
+                    req_id=request_id,
+                    error=error,
+                    dst_engine_id=dst_engine_id,
+                    remote_rank=remote_rank,
+                )
+                self._handle_failed_transfer(request_id, None)
+                return False
 
         # NOTE (nicolo) With homogeneous TP, each TP worker loads KV from
         # corresponding rank. With heterogeneous TP, fixing D>P, the D tp
@@ -295,7 +402,23 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
             physical_blocks_per_logical=self._physical_blocks_per_logical_kv_block,
         )
 
-        assert len(local_block_descs_ids) == len(remote_block_descs_ids)
+        if len(local_block_descs_ids) != len(remote_block_descs_ids):
+            error = ValueError(
+                "NIXL descriptor counts differ after block mapping: "
+                f"request_id={request_id}, "
+                f"local_descriptors={len(local_block_descs_ids)}, "
+                f"remote_descriptors={len(remote_block_descs_ids)}."
+            )
+            self._log_failure(
+                failure_type="descriptor_alignment_mismatch",
+                msg="Marking this request's blocks as invalid.",
+                req_id=request_id,
+                error=error,
+                dst_engine_id=dst_engine_id,
+                remote_rank=remote_rank,
+            )
+            self._handle_failed_transfer(request_id, None)
+            return False
 
         # Prepare transfer with Nixl.
         handle = None
@@ -325,6 +448,8 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
                 remote_rank=remote_rank,
             )
             self._handle_failed_transfer(request_id, handle)
+            return False
+        return True
 
     def _get_new_notifs(self) -> set[str]:
         """

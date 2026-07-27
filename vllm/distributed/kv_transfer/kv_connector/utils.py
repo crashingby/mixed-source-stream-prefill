@@ -57,6 +57,8 @@ class KVOutputAggregator:
         self._recv_remaining_count = dict[str, int]()
         self._send_remaining_count = dict[str, int]()
         self._expected_finished_count = expected_finished_count
+        # 某个 rank 先报告失败时暂存，直到该请求在全部 rank 完成接收。
+        self._failed_recving_req_ids = set[str]()
 
     @classmethod
     def from_connector(cls, connector: "KVConnectorBase", world_size: int):
@@ -114,6 +116,7 @@ class KVOutputAggregator:
             update_finished_set(
                 kv_output.finished_recving, self._recv_remaining_count, finished_recving
             )
+            self._failed_recving_req_ids.update(kv_output.failed_recving or ())
 
             # Aggregate kv_connector_stats from all workers.
             if aggregated_kv_connector_stats is None:
@@ -153,6 +156,10 @@ class KVOutputAggregator:
 
             invalid_block_ids |= kv_output.invalid_block_ids
 
+        # 失败只在所有 worker 都完成该请求的 receive 后交给 scheduler。
+        failed_recving = finished_recving & self._failed_recving_req_ids
+        self._failed_recving_req_ids.difference_update(failed_recving)
+
         # select output of the worker specified by output_rank
         output = outputs[output_rank]
 
@@ -160,6 +167,7 @@ class KVOutputAggregator:
         output.kv_connector_output = KVConnectorOutput(
             finished_sending=finished_sending or None,
             finished_recving=finished_recving or None,
+            failed_recving=failed_recving or None,
             kv_connector_stats=aggregated_kv_connector_stats or None,
             kv_cache_events=combined_kv_cache_events or None,
             kv_connector_worker_meta=aggregated_kv_connector_worker_meta or None,

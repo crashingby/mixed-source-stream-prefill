@@ -392,6 +392,14 @@ class KVConnectorBase_V1(ABC):
         """
         return set()
 
+    def get_request_ids_with_load_errors(self) -> set[str]:
+        """返回并清空外部 KV 加载失败的请求 ID。
+
+        请求级错误通道适用于 HMA 或多 KV group：这些布局中的裸 block ID
+        没有 group identity，不能安全地交给 scheduler 做反向映射。
+        """
+        return set()
+
     def shutdown(self):
         """
         Shutdown the connector. This is called when the worker process
