@@ -21,8 +21,8 @@ from matplotlib.ticker import PercentFormatter
 
 
 DEFAULT_OUTPUT = Path("research/scripts/replay/results/ttft_survival.png")
-STREAM_TTFT_COLUMN = "finish_to_first_token_ms"
-NORMAL_TTFT_COLUMN = "request_to_first_token_ms"
+DEFAULT_STREAM_TTFT_COLUMN = "finish_to_first_token_ms"
+DEFAULT_NORMAL_TTFT_COLUMN = "request_to_first_token_ms"
 
 
 @dataclass(frozen=True)
@@ -67,7 +67,22 @@ def parse_args() -> argparse.Namespace:
         "--normal-label",
         type=str,
         default="Normal prefill",
-        help="Legend label for the normal completions curve.",
+        help="Legend label for the second curve.",
+    )
+    parser.add_argument(
+        "--stream-ttft-column",
+        type=str,
+        default=DEFAULT_STREAM_TTFT_COLUMN,
+        help="TTFT column for the prompt-stream curve.",
+    )
+    parser.add_argument(
+        "--normal-ttft-column",
+        type=str,
+        default=DEFAULT_NORMAL_TTFT_COLUMN,
+        help=(
+            "TTFT column for the second curve. Use "
+            "finish_to_first_token_ms when comparing merged_update."
+        ),
     )
     parser.add_argument(
         "--output",
@@ -284,12 +299,12 @@ def main() -> None:
     stream_series = load_ttft_series(
         args.stream_result_dir,
         args.stream_label,
-        STREAM_TTFT_COLUMN,
+        args.stream_ttft_column,
     )
     normal_series = load_ttft_series(
         args.normal_result_dir,
         args.normal_label,
-        NORMAL_TTFT_COLUMN,
+        args.normal_ttft_column,
     )
     plot_survival_curves(
         stream_series=stream_series,

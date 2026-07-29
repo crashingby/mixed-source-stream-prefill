@@ -15,10 +15,10 @@ from replay_common import (
     RequestMetric,
     SampleReplayInput,
     _build_normal_prompt,
-    _consume_sse_response,
     _get_data_events,
     _normalize_v1_url,
     _override_sampling_params,
+    consume_sse_response,
     main,
 )
 
@@ -91,10 +91,12 @@ async def _replay_normal_sample(
                     f"HTTP {normal_response.status_code} from normal: "
                     f"{error_body.decode('utf-8', errors='replace')}"
                 )
-            sse_measurement = await _consume_sse_response(
+            sse_measurement = await consume_sse_response(
                 normal_response,
                 request_start_time,
                 args.save_responses,
+                args.ttft_only,
+                args.sse_timeout,
             )
 
         metric.finish_to_first_token_ms = (

@@ -3,9 +3,10 @@
 
 """mixed-source REST 回放的共享实现。
 
-两个对外入口 replay_prompt_stream.py 和 replay_normal.py 共用本模块的数据
-解析、SSE TTFT 计时和结果写入能力。前者使用 prompt-stream API，后者把完整
-逻辑 prompt 交给同一个 proxy 的普通 /v1/completions 路径。
+三个对外入口 replay_prompt_stream.py、replay_merged_update.py 和
+replay_normal.py 共用本模块的数据解析、SSE TTFT 计时和结果写入能力。
+前两个使用 prompt-stream API，最后一个把完整逻辑 prompt 交给同一个 proxy
+的普通 /v1/completions 路径。
 """
 
 from __future__ import annotations
@@ -35,8 +36,9 @@ DEFAULT_DATA_DIR = Path("research/data/mix_source")
 DEFAULT_OUTPUT_DIR = Path("research/scripts/replay/results")
 DEFAULT_PROXY_URL = "http://127.0.0.1:8000"
 
-ReplayMode = Literal["stream", "normal"]
+ReplayMode = Literal["stream", "normal", "merged_update"]
 ArrivalProcess = Literal["fixed", "poisson"]
+STREAM_TIMING_MODES = frozenset(("stream", "merged_update"))
 
 REQUEST_METRIC_FIELDS = (
     "run_id",
@@ -138,9 +140,9 @@ class EventMetric:
 class RequestMetric:
     """一个样本的一次 stream 或 normal 回放结果。
 
-    ``finish_to_first_token_ms`` 是本实验的主指标。stream 模式从 finish
-    HTTP 请求提交到 proxy SSE 的首 token；normal 模式从普通 completions
-    请求提交到其首个 SSE token。
+    ``finish_to_first_token_ms`` 是本实验的主指标。prompt-stream 类模式从
+    finish HTTP 请求提交到 proxy SSE 的首 token；normal 模式从普通
+    completions 请求提交到其首个 SSE token。
     """
 
     run_id: str
@@ -205,7 +207,7 @@ def parse_args(mode: ReplayMode) -> argparse.Namespace:
     """解析一个指定模式的 mixed-source REST 回放参数。
 
     Args:
-        mode: stream 或 normal，决定暴露的 CLI 参数及请求路径。
+        mode: 回放模式，决定暴露的 CLI 参数及请求路径。
 
     Returns:
         命令行参数命名空间。
@@ -277,7 +279,7 @@ def parse_args(mode: ReplayMode) -> argparse.Namespace:
         default=1,
         help="Maximum in-flight logical requests within one replay mode.",
     )
-    if mode == "stream":
+    if mode in STREAM_TIMING_MODES:
         parser.add_argument(
             "--append-initial-delay",
             type=float,
@@ -354,6 +356,25 @@ def parse_args(mode: ReplayMode) -> argparse.Namespace:
         "--save-responses",
         action="store_true",
         help="Save parsed SSE response payloads per request for debugging.",
+    )
+    parser.add_argument(
+        "--ttft-only",
+        action="store_true",
+        help=(
+            "Stop consuming each SSE response immediately after the first "
+            "completion token. This records TTFT only and avoids waiting for "
+            "the full decode stream."
+        ),
+    )
+    parser.add_argument(
+        "--sse-timeout",
+        type=float,
+        default=None,
+        help=(
+            "Optional maximum seconds spent consuming one successful SSE "
+            "response. The regular --http-timeout still controls connection "
+            "and request-level timeouts."
+        ),
     )
     parser.add_argument(
         "--dry-run",
@@ -435,6 +456,18 @@ def _normalize_v1_url(base_url: str, endpoint: str) -> str:
     if normalized_base_url.endswith("/v1") and normalized_endpoint.startswith("/v1/"):
         normalized_endpoint = normalized_endpoint[3:]
     return f"{normalized_base_url}{normalized_endpoint}"
+
+
+def _prompt_stream_finish_endpoint(args: argparse.Namespace) -> str:
+    """返回当前 prompt-stream replay 应使用的 finish 路径。
+
+    TTFT-only 实验只需要 P 节点 finish 后的首 token。此时走 proxy 的
+    `/v1/prompt_stream/finish_ttft`，避免 proxy 再启动 D 节点 decode 并触发
+    不必要的 KV transfer。完整生成或非 TTFT-only 调试仍走原 `/finish`。
+    """
+    if getattr(args, "ttft_only", False):
+        return "/v1/prompt_stream/finish_ttft"
+    return "/v1/prompt_stream/finish"
 
 
 def _load_json(path: Path) -> dict[str, Any]:
@@ -738,6 +771,7 @@ async def _consume_sse_response(
     response: httpx.Response,
     first_token_start_time: float,
     save_payloads: bool,
+    ttft_only: bool,
 ) -> SseMeasurement:
     """读取一个 OpenAI SSE 响应并定位第一个生成 token。
 
@@ -745,6 +779,7 @@ async def _consume_sse_response(
         response: 已打开且 HTTP status 成功的流式 HTTP 响应。
         first_token_start_time: TTFT 的起点；stream 模式为 finish 发送时刻。
         save_payloads: 是否把每个 JSON payload 保存到结果目录。
+        ttft_only: 首 token 出现后是否立即停止消费 SSE body。
 
     Returns:
         首 token、结束时间和输出规模统计。
@@ -798,6 +833,16 @@ async def _consume_sse_response(
                     )
                 completion_chunks += 1
                 completion_chars += len(_chunk_text(choice))
+                if ttft_only:
+                    completed_time = time.perf_counter()
+                    return SseMeasurement(
+                        first_token_time=first_token_time,
+                        first_token_origin=first_token_origin,
+                        completed_time=completed_time,
+                        completion_chars=completion_chars,
+                        completion_chunks=completion_chunks,
+                        payloads=tuple(payloads),
+                    )
 
     completed_time = time.perf_counter()
     if first_token_time is None:
@@ -812,6 +857,35 @@ async def _consume_sse_response(
         completion_chunks=completion_chunks,
         payloads=tuple(payloads),
     )
+
+
+async def consume_sse_response(
+    response: httpx.Response,
+    first_token_start_time: float,
+    save_payloads: bool,
+    ttft_only: bool,
+    timeout_seconds: float | None,
+) -> SseMeasurement:
+    """带可选整体超时的 SSE 消费包装。"""
+    try:
+        if timeout_seconds is None:
+            return await _consume_sse_response(
+                response,
+                first_token_start_time,
+                save_payloads,
+                ttft_only,
+            )
+        async with asyncio.timeout(timeout_seconds):
+            return await _consume_sse_response(
+                response,
+                first_token_start_time,
+                save_payloads,
+                ttft_only,
+            )
+    except TimeoutError as exc:
+        raise ReplayHttpError(
+            f"Timed out after {timeout_seconds:.3f}s while consuming SSE response."
+        ) from exc
 
 
 def _planned_arrival_offsets(
@@ -1022,7 +1096,7 @@ def _write_run_outputs(
             "ttft_definition": (
                 "Milliseconds from POST /v1/prompt_stream/finish to the first "
                 "proxy SSE completion token."
-                if args.replay_mode == "stream"
+                if args.replay_mode in STREAM_TIMING_MODES
                 else (
                     "Milliseconds from POST /v1/completions to the first "
                     "proxy-forwarded D-node SSE completion token."
@@ -1054,6 +1128,8 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--max-concurrency must be positive.")
     if args.http_timeout <= 0:
         raise ValueError("--http-timeout must be positive.")
+    if args.sse_timeout is not None and args.sse_timeout <= 0:
+        raise ValueError("--sse-timeout must be positive when specified.")
     if args.max_tokens is not None and args.max_tokens <= 0:
         raise ValueError("--max-tokens must be positive when specified.")
     timing_field_names = (
@@ -1064,7 +1140,7 @@ def _validate_args(args: argparse.Namespace) -> None:
             "update_chunk_interval",
             "source_finish_delay",
         )
-        if args.replay_mode == "stream"
+        if args.replay_mode in STREAM_TIMING_MODES
         else ()
     )
     for field_name in timing_field_names:
@@ -1162,7 +1238,7 @@ def main(
     """运行一个指定模式的回放 CLI。
 
     Args:
-        mode: stream 或 normal，用于选择 CLI 参数及结果标签。
+        mode: 回放模式，用于选择 CLI 参数及结果标签。
         replay_sample: 由对应入口提供的单请求 REST 回放函数。
     """
     args = parse_args(mode)

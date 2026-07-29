@@ -19,11 +19,12 @@ from replay_common import (
     RequestMetric,
     SampleReplayInput,
     SourceEventStream,
-    _consume_sse_response,
     _normalize_v1_url,
     _override_sampling_params,
     _post_json,
+    _prompt_stream_finish_endpoint,
     _sleep_until,
+    consume_sse_response,
     main,
 )
 
@@ -268,7 +269,7 @@ async def _replay_stream_sample(
         finish_sent_time = time.perf_counter()
         async with client.stream(
             "POST",
-            _normalize_v1_url(args.proxy_url, "/v1/prompt_stream/finish"),
+            _normalize_v1_url(args.proxy_url, _prompt_stream_finish_endpoint(args)),
             json=finish_payload,
         ) as finish_response:
             if finish_response.is_error:
@@ -277,10 +278,12 @@ async def _replay_stream_sample(
                     f"HTTP {finish_response.status_code} from prompt-stream finish: "
                     f"{error_body.decode('utf-8', errors='replace')}"
                 )
-            sse_measurement = await _consume_sse_response(
+            sse_measurement = await consume_sse_response(
                 finish_response,
                 finish_sent_time,
                 args.save_responses,
+                args.ttft_only,
+                args.sse_timeout,
             )
 
         metric.finish_to_first_token_ms = (

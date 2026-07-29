@@ -1,21 +1,20 @@
 # Mixed-source REST 回放脚本
 
-本目录提供两个相互独立的实验入口。它们读取同一批
+本目录提供三个相互独立的实验入口。它们读取同一批
 `research/data/mix_source/requests/*.json`，但使用不同的 REST 请求链路：
 
-- `replay_prompt_stream.py`：使用 mixed-source 流式 prefill API。
+- `replay_prompt_stream.py`：使用 mixed-source 流式 prefill API，是我们的优化方案。
+- `replay_merged_update.py`：把已经到达的 Append 与 Update 内容合并成单个 Update 快照，是朴素流式 baseline。
 - `replay_normal.py`：把最终完整 prompt 一次性发送给普通 completions API。
-- `replay_common.py`：两个入口共用的内部实现，不直接运行。
+- `replay_common.py`：三个入口共用的内部实现，不直接运行。
 
-两个脚本都只配置 `--proxy-url`。普通模式不再使用 `--baseline-url`，因为
-`research/scripts/proxy_server.py` 现在同时支持 prompt-stream 和普通 OpenAI
-RESTFUL API。
+三个脚本都只配置 `--proxy-url`。
 
 ## proxy 支持的路径
 
 | 类型 | proxy 路径 | 后端 |
 | --- | --- | --- |
-| mixed-source 流式 prefill | `/v1/prompt_stream/start`、`/event`、`/finish`、`/abort` | P 节点完成流式 prefill，再把 KV 交给 D 节点 |
+| mixed-source 流式 prefill | `/v1/prompt_stream/start`、`/event`、`/finish`、`/finish_ttft`、`/abort` | P 节点完成流式 prefill；完整生成走 D，TTFT-only 不启动 D |
 | 普通 completions | `/v1/completions` | 直接转发到一个 D 节点 |
 | 普通 chat completions | `/v1/chat/completions` | 直接转发到一个 D 节点 |
 | 普通 Responses API | `/v1/responses` | 直接转发到一个 D 节点 |
@@ -37,7 +36,7 @@ RESTFUL API。
 
 P/D 节点的完整启动方式见上一级 [scripts README](../README.md)。
 
-## 两种模式的数据语义
+## 三种模式的数据语义
 
 ### 流式 prefill
 
@@ -50,10 +49,33 @@ P/D 节点的完整启动方式见上一级 [scripts README](../README.md)。
 5. 同一来源等待上一条 event 的 ack；不同来源之间并发竞争。
 6. 所有来源的 `source_finished` 都收到 ack 后，才发送全局
    `prompt_finished`。
-7. 从 `/finish` 请求发出到收到第一个 SSE token 的时间记为 TTFT。
+7. 从 finish 请求发出到收到第一个 SSE token 的时间记为 TTFT；开启
+   `--ttft-only` 时使用 `/finish_ttft`，否则使用 `/finish`。
 
 正常启用 KV transfer 时，第一个 SSE token 来自 P 节点完成最终 prefill 后
 生成的那个 token，结果中的 `ttft_origin` 通常为 `prefill`。
+
+### 合并 Update baseline
+
+`replay_merged_update.py` 也走 prompt-stream API，但它不把 Append 和
+Update 分开暴露给服务端。客户端本地维护两个状态：
+
+- Append store：每个 Append chunk 到达时追加到末尾。
+- Update store：每个 Update snapshot 到达时替换为最新完整快照。
+
+只要任意一个来源的 interval 到达，脚本就先更新本地 store，然后按：
+
+```text
+当前所有 Append chunk + 当前最新 Update snapshot
+```
+
+拼成一个完整文本，并作为同一个 `update` 来源发送给
+`/v1/prompt_stream/event`。如果 Append 和 Update 在同一计划时刻到达，脚本
+会在本地先处理 Append、再处理 Update，并只发送一次合并快照。
+
+这个模式用于衡量“朴素整段 Update”相对于我们分段 KV 管理方案的 TTFT
+差距。开启 `--ttft-only` 时，它从 `/prompt_stream/finish_ttft` 到首个
+SSE token 计 TTFT，不会启动 D 节点。
 
 ### 普通整段 prompt
 
@@ -80,7 +102,7 @@ P/D 节点的完整启动方式见上一级 [scripts README](../README.md)。
 
 ## 离线检查
 
-离线检查只解析数据并构造最终 prompt，不访问 proxy、P 或 D。两个入口都能
+离线检查只解析数据并构造最终 prompt，不访问 proxy、P 或 D。三个入口都能
 执行，输出目录不能重名。
 
 ```shell
@@ -99,6 +121,14 @@ P/D 节点的完整启动方式见上一级 [scripts README](../README.md)。
   --run-name dry-normal-query-0
 ```
 
+```shell
+.venv/bin/python research/scripts/replay/replay_merged_update.py \
+  --data-dir research/data/mix_source \
+  --query-id 0 \
+  --dry-run \
+  --run-name dry-merged-update-query-0
+```
+
 ## 流式 prefill 回放
 
 ### 单请求闭环
@@ -115,6 +145,8 @@ P/D 节点的完整启动方式见上一级 [scripts README](../README.md)。
   --update-chunk-interval 0.20 \
   --max-tokens 64 \
   --temperature 0 \
+  --ttft-only \
+  --sse-timeout 120 \
   --run-name stream-query-0
 ```
 
@@ -135,7 +167,36 @@ P/D 节点的完整启动方式见上一级 [scripts README](../README.md)。
   --append-chunk-interval 0.05 \
   --update-chunk-interval 0.20 \
   --source-finish-delay 0.0 \
+  --ttft-only \
+  --sse-timeout 120 \
   --run-name stream-poisson-qps-1
+```
+
+## 合并 Update baseline 回放
+
+这个入口使用与流式 prefill 相同的到达参数，但服务端只看到一个 Update
+来源。
+
+```shell
+.venv/bin/python research/scripts/replay/replay_merged_update.py \
+  --data-dir research/data/mix_source \
+  --max-requests 100 \
+  --proxy-url http://<PROXY_HOST>:8000 \
+  --model <SERVED_MODEL_NAME> \
+  --qps 1.0 \
+  --arrival-process poisson \
+  --random-seed 2026 \
+  --max-concurrency 8 \
+  --append-initial-delay 0.0 \
+  --update-initial-delay 0.0 \
+  --append-chunk-interval 0.05 \
+  --update-chunk-interval 0.20 \
+  --source-finish-delay 0.0 \
+  --max-tokens 64 \
+  --temperature 0 \
+  --ttft-only \
+  --sse-timeout 120 \
+  --run-name merged-update-poisson-qps-1
 ```
 
 ## 普通模式回放
@@ -152,28 +213,33 @@ P/D 节点的完整启动方式见上一级 [scripts README](../README.md)。
   --max-concurrency 8 \
   --max-tokens 64 \
   --temperature 0 \
+  --ttft-only \
+  --sse-timeout 120 \
   --run-name normal-poisson-qps-1
 ```
 
-为了公平比较，两个脚本应使用相同的：
+为了公平比较，多个脚本应使用相同的：
 
 - 样本范围：`--query-id`、`--start-index` 和 `--max-requests`。
 - 逻辑请求负载：`--qps`、`--arrival-process`、`--random-seed` 和
   `--max-concurrency`。
 - 生成参数：`--model`、`--max-tokens`、`--temperature` 和 `--seed`。
+- SSE 消费策略：若只比较 TTFT，建议所有对比模式都开启 `--ttft-only`，并
+  使用相同的 `--sse-timeout`。
 
-建议先完成一轮流式实验，再完成一轮普通实验，避免两种负载同时干扰同一组
-GPU。
+建议逐个完成不同模式的实验，避免多种负载同时干扰同一组 GPU。
 
 ## TTFT survival curve 画图
 
-`plot_ttft_survival.py` 会读取两个结果目录里的 `request_metrics.csv`，把流式
-prefill 和普通模式画在同一张图中。横坐标是 TTFT，单位 ms；纵坐标是
+`plot_ttft_survival.py` 会读取两个结果目录里的 `request_metrics.csv`，把两条
+TTFT 曲线画在同一张图中。横坐标是 TTFT，单位 ms；纵坐标是
 `percent(TTFT > x)`，即 TTFT 大于当前横坐标的请求占比。
 
-流式 prefill 使用 `finish_to_first_token_ms` 作为 TTFT；普通模式使用
-`request_to_first_token_ms` 作为 TTFT。脚本只统计 `result_status=ok` 且 TTFT
-字段有效的请求。
+默认配置用于比较流式 prefill 和普通模式：前者使用
+`finish_to_first_token_ms`，后者使用 `request_to_first_token_ms`。如果比较
+流式 prefill 和合并 Update baseline，两条曲线都应该使用
+`finish_to_first_token_ms`。脚本只统计 `result_status=ok` 且 TTFT 字段有效的
+请求。
 
 ```shell
 .venv/bin/python research/scripts/replay/plot_ttft_survival.py \
@@ -183,8 +249,22 @@ prefill 和普通模式画在同一张图中。横坐标是 TTFT，单位 ms；�
   --title "TTFT survival, QPS=1"
 ```
 
+如果要比较我们的优化方案和合并 Update baseline：
+
+```shell
+.venv/bin/python research/scripts/replay/plot_ttft_survival.py \
+  --stream-result-dir research/scripts/replay/results/stream-poisson-qps-1 \
+  --normal-result-dir research/scripts/replay/results/merged-update-poisson-qps-1 \
+  --stream-label "Segmented stream prefill" \
+  --normal-label "Merged update baseline" \
+  --normal-ttft-column finish_to_first_token_ms \
+  --output research/scripts/replay/results/ttft-survival-stream-vs-merged.svg \
+  --title "TTFT survival, stream vs merged update"
+```
+
 脚本会同时写出一个同名 `.summary.json`，记录每条曲线的样本数、均值和分位数。
-当前实现只依赖 Python 标准库并输出 SVG，不需要额外安装 matplotlib。
+当前实现使用 matplotlib，输出格式由 `--output` 的扩展名决定，常用 `.png`、
+`.svg` 或 `.pdf`。
 
 ## 公共参数
 
@@ -195,7 +275,7 @@ prefill 和普通模式画在同一张图中。横坐标是 TTFT，单位 ms；�
 | `--start-index` | `0` | 未指定 query id 时的排序后起始位置。 |
 | `--max-requests` | `1` | 批量模式保留的最大样本数；`0` 表示全部。 |
 | `--include-partial` | 关闭 | 允许使用 `status != complete` 的样本。 |
-| `--proxy-url` | `http://127.0.0.1:8000` | 两种模式共同使用的 proxy 地址。 |
+| `--proxy-url` | `http://127.0.0.1:8000` | 三种模式共同使用的 proxy 地址。 |
 | `--model` | `qwen2.5-3b` | 必须匹配服务端的 `--served-model-name`。 |
 | `--qps` | `1.0` | 逻辑请求启动速率；`0` 表示闭环串行。 |
 | `--arrival-process` | `fixed` | 使用固定间隔或 `poisson` 泊松到达。 |
@@ -205,6 +285,8 @@ prefill 和普通模式画在同一张图中。横坐标是 TTFT，单位 ms；�
 | `--seed` | 无 | 发送给 vLLM 的采样 seed。 |
 | `--random-seed` | `0` | 只控制 Poisson 到达间隔。 |
 | `--http-timeout` | `600` | HTTP 超时，单位秒。 |
+| `--ttft-only` | 关闭 | 只记录 TTFT。prompt-stream 类模式会调用 `/v1/prompt_stream/finish_ttft`，P 返回首 token 后立即 `[DONE]`，不启动 D；普通模式仍然是收到 D 首 token 后停止消费 SSE。 |
+| `--sse-timeout` | 不限制 | 单个成功 SSE 响应的消费超时，单位秒；用于避免 HTTP 200 后一直等不到 `[DONE]`。 |
 | `--output-dir` | `research/scripts/replay/results` | 实验结果根目录。 |
 | `--run-name` | 时间戳与模式 | 指定本次结果子目录名称。 |
 | `--save-responses` | 关闭 | 保存解析后的 SSE payload。 |
@@ -214,10 +296,11 @@ prefill 和普通模式画在同一张图中。横坐标是 TTFT，单位 ms；�
 正 QPS 下，请求先按计划时间到达，再等待并发 semaphore。并发限制引入的等待
 时间记录在 `queue_delay_ms`。`--qps 0` 时，前一个请求完整结束后才开始下一个。
 
-## 流式模式专用时序参数
+## prompt-stream 类模式专用时序参数
 
-这些参数只存在于 `replay_prompt_stream.py`，单位都是秒。它们属于实验负载，
-不会写回 `mix_source` 数据。
+这些参数存在于 `replay_prompt_stream.py` 和
+`replay_merged_update.py`，单位都是秒。它们属于实验负载，不会写回
+`mix_source` 数据。
 
 | 参数 | 默认值 | 含义 |
 | --- | --- | --- |
@@ -227,8 +310,10 @@ prefill 和普通模式画在同一张图中。横坐标是 TTFT，单位 ms；�
 | `--update-chunk-interval` | `0` | Update 来源内部相邻快照的目标间隔。 |
 | `--source-finish-delay` | `0` | 最后数据事件到 `source_finished` 的目标延迟。 |
 
-同一来源必须等待 event ack，所以实际间隔不会短于上游处理时间。不同来源有
-独立任务，因此 Append 与 Update 谁先抵达 scheduler 由实际时序决定。
+`replay_prompt_stream.py` 中同一来源必须等待 event ack，所以实际间隔不会短于
+上游处理时间；不同来源有独立任务，因此 Append 与 Update 谁先抵达
+scheduler 由实际时序决定。`replay_merged_update.py` 则在客户端侧合并
+同一计划时刻的来源事件，再串行发送单个 Update 来源。
 
 ## 输出文件
 
@@ -238,20 +323,23 @@ prefill 和普通模式画在同一张图中。横坐标是 TTFT，单位 ms；�
 | --- | --- |
 | `config.json` | CLI 参数、模式和选中样本。 |
 | `request_metrics.csv` | 每个请求的 TTFT、完成时延、队列时延及内容规模。 |
-| `event_metrics.csv` | 流式模式的逐 event 发送与 ack 指标；普通模式为空。 |
+| `event_metrics.csv` | prompt-stream 类模式的逐 event 发送与 ack 指标；普通模式为空。 |
 | `summary.json` | 当前模式的成功数、错误数及 mean/p50/p90/p95 等 TTFT。 |
 | `responses/*.json` | 设置 `--save-responses` 后保存 SSE payload。 |
 
 主指标列仍统一叫 `finish_to_first_token_ms`：
 
-- 流式模式表示 `/prompt_stream/finish` 到首 token。
+- 流式 prefill 和合并 Update baseline 在 `--ttft-only` 下表示
+  `/prompt_stream/finish_ttft` 到首 token；非 TTFT-only 调试时表示
+  `/prompt_stream/finish` 到首 token。
 - 普通模式没有独立 finish 阶段，因此等于 `/v1/completions` 到首 token，
   同时也等于 `request_to_first_token_ms`。
 
 ## 常见问题
 
 - **proxy 返回 404**：重启 proxy，确认日志或 OpenAPI 中存在
-  `/v1/completions` 和 `/v1/prompt_stream/finish`。
+  `/v1/completions`、`/v1/prompt_stream/finish` 和
+  `/v1/prompt_stream/finish_ttft`。
 - **Expected text/event-stream**：确认请求中的 `stream=true` 没有被中间层
   改写，并避免反向代理缓冲 SSE。
 - **Unknown request id**：确认一个流式请求的 start/event/finish 始终进入同一

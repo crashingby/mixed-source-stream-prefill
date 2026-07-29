@@ -14,7 +14,7 @@ from typing import Any
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
@@ -1143,6 +1143,83 @@ async def finish_prompt_stream(request: Request):
         num_prefill_output_tokens,
     )
     return JSONResponse(content=response_json)
+
+
+@app.post("/v1/prompt_stream/finish_ttft")
+async def finish_prompt_stream_ttft(request: Request):
+    """完成 P 节点 prefill，并只返回用于 TTFT 的首 token。
+
+    这个路由用于实验脚本的 ``--ttft-only`` 模式。P 节点 finish 成功后，
+    proxy 不会把 KV transfer 参数交给 D 节点，也不会启动后续 decode。
+    因此客户端在收到首 token 后立即断开 SSE 时，不会留下一个半启动的
+    D 侧 NIXL load 请求。
+    """
+    req_data = await request.json()
+    request_id = req_data.get("request_id")
+    session = request.app.state.prompt_stream_sessions.get(request_id)
+    if session is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Unknown prompt stream request_id={request_id}",
+        )
+
+    req_data["request_id"] = session.request_id
+    prefill_response = await _post_json(
+        session.prefill_client_info,
+        "/prompt_stream/finish",
+        req_data,
+        session.request_id,
+    )
+    # P finish 成功后长期 Request 已结束；TTFT-only 不会再访问 D 节点，
+    # 因此 proxy 会话也可以立即释放。
+    request.app.state.prompt_stream_sessions.pop(request_id, None)
+    _finish_decode_prompt_token_ids(session, prefill_response)
+    _finish_decode_prompt_text(session, req_data.get("event", {}))
+
+    output_token_ids = prefill_response.get("output_token_ids")
+    if not isinstance(output_token_ids, list) or len(output_token_ids) != 1:
+        raise HTTPException(
+            status_code=502,
+            detail=(
+                "P node TTFT finish must return exactly one output token: "
+                f"output_token_ids={output_token_ids!r}."
+            ),
+        )
+
+    # TTFT-only 的响应体只有两帧，且两帧均已在此时完全构造完毕。直接写入
+    # Response 而不是交给 StreamingResponse 的异步 generator，可避免 HTTP
+    # headers 已发出、但 generator 尚未获得调度时，replay 端无限等待 body。
+    sse_body = _encode_sse_payload(
+        _build_prefill_stream_chunk(
+            session,
+            prefill_response,
+            is_final_chunk=True,
+        )
+    ) + b"data: [DONE]\n\n"
+    logger.info(
+        "Proxy TTFT-only finish completed: request_id=%s "
+        "prompt_stream_blocks=%s output_tokens=%s sse_bytes=%s",
+        session.request_id,
+        [
+            len(group)
+            for group in (
+                prefill_response.get("kv_transfer_params", {}).get(
+                    "remote_block_ids",
+                    [],
+                )
+            )
+        ],
+        len(output_token_ids),
+        len(sse_body),
+    )
+    return Response(
+        content=sse_body,
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 @app.post("/v1/prompt_stream/abort")

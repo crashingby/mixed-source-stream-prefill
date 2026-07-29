@@ -17,6 +17,8 @@ NIXL KV transfer 可以工作。
 - 接收 `/v1/prompt_stream/finish`，先让 P 节点完成最后用户问题的 prefill，
   校验物理 token/KV 覆盖范围，再把 `kv_transfer_params` 放进普通 OpenAI
   decode 请求转发给 D 节点。
+- 接收 `/v1/prompt_stream/finish_ttft`，只返回 P 节点采样出的首 token，
+  立刻结束 SSE，不启动 D 节点；这个路径专门用于 TTFT-only 实验。
 - 把 P 节点采样出的首 token 接到 D prompt，并在 D 返回后合并回最终响应。
 - 对 P 返回的 exact block manifest 做校验；D 只拉取物理 prompt KV，P 的
   首 token 在 D 本地 forward。
