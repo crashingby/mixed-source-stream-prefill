@@ -157,13 +157,13 @@ mkdir -p research/scripts/logs
 ```
 
 ```shell
-VLLM_NIXL_SIDE_CHANNEL_HOST=g2c13 \
+VLLM_NIXL_SIDE_CHANNEL_HOST=g2c12 \
 MODEL_PATH=/workplace/home/huangxinying/Models/Qwen2.5-3B/ \
 SERVED_MODEL_NAME=qwen2.5-3b \
 GPU_MEMORY_UTILIZATION=0.6 \
 MAX_MODEL_LEN=4096 \
 MAX_NUM_SEQS=16 \
-sbatch --nodelist=g2c13 research/scripts/server/start_p_node.sbatch
+sbatch --nodelist=g2c12 research/scripts/server/start_p_node.sbatch
 ```
 
 ```shell
@@ -182,7 +182,7 @@ proxy：
 .venv/bin/python research/scripts/server/proxy_server.py \
   --host 0.0.0.0 \
   --port 8000 \
-  --prefiller-hosts g2c13 \
+  --prefiller-hosts g2c12 \
   --prefiller-ports 8100 \
   --decoder-hosts g2c12 \
   --decoder-ports 8200

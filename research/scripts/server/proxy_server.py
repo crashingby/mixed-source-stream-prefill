@@ -652,6 +652,220 @@ def _build_prefill_start_request(req_data: dict[str, Any]) -> dict[str, Any]:
     return prefill_request
 
 
+def _build_normal_pd_prefill_request(req_data: dict[str, Any]) -> dict[str, Any]:
+    """构造普通 completions 的 P 节点首 token 请求。
+
+    P 节点必须返回 prompt 与首个输出 token 的精确 token ids。D 节点随后以
+    prompt_token_ids + prefill_token_id 作为输入，从本地 tail token 继续
+    forward；因此不能依赖文本反解再重新分词。
+
+    Args:
+        req_data: 客户端发给 proxy 的原始 completions 请求体。
+
+    Returns:
+        发给 P 节点的非流式、单 token completions 请求体。
+
+    Raises:
+        HTTPException: 请求要求多个 choice，当前实验 proxy 无法一一绑定 P/D
+            KV 生命周期时抛出。
+    """
+    num_choices = req_data.get("n", 1)
+    if type(num_choices) is not int or num_choices != 1:
+        raise HTTPException(
+            status_code=400,
+            detail="Normal PD completions currently requires n=1.",
+        )
+
+    # 复用 prompt-stream P 请求的 KV 配置、非流式 collector 和单 token
+    # budget；额外要求返回 token ids，保证 D 的 token view 和 P 完全一致。
+    prefill_request = _build_prefill_start_request(req_data)
+    prefill_request["return_token_ids"] = True
+    return prefill_request
+
+
+def _get_normal_pd_prefill_choice(
+    prefill_response: dict[str, Any],
+) -> dict[str, Any]:
+    """校验并提取普通 PD P 响应中的唯一 choice。
+
+    Args:
+        prefill_response: P 节点 /completions 的 JSON 响应。
+
+    Returns:
+        已验证的唯一 choice；其中必须包含 prompt 与单个 output token ids。
+
+    Raises:
+        HTTPException: P 响应无法构成 D 节点所需的精确 token 序列时抛出。
+    """
+    choices = prefill_response.get("choices")
+    if not isinstance(choices, list) or len(choices) != 1:
+        raise HTTPException(
+            status_code=502,
+            detail="P node normal PD response must contain exactly one choice.",
+        )
+    choice = choices[0]
+    if not isinstance(choice, dict):
+        raise HTTPException(
+            status_code=502,
+            detail="P node normal PD response choice must be a JSON object.",
+        )
+
+    prompt_token_ids = choice.get("prompt_token_ids")
+    output_token_ids = choice.get("token_ids")
+    if (
+        not isinstance(prompt_token_ids, list)
+        or not all(type(token_id) is int for token_id in prompt_token_ids)
+        or not isinstance(output_token_ids, list)
+        or len(output_token_ids) != 1
+        or not all(type(token_id) is int for token_id in output_token_ids)
+    ):
+        raise HTTPException(
+            status_code=502,
+            detail=(
+                "P node normal PD response must include prompt_token_ids and "
+                "exactly one output token id."
+            ),
+        )
+    return choice
+
+
+def _build_normal_pd_decode_request(
+    req_data: dict[str, Any],
+    prefill_response: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any], int]:
+    """构造普通 PD 的 D 请求，并返回 P 首 token 的元数据。
+
+    P 的 KV 只覆盖原始 prompt；刚采样出的首 token 尚未被 P 的下一次
+    forward 写入 KV。D 因而接收 prompt + P 首 token，加载原始 prompt
+    的远端 KV，再在本地计算这个 tail token 以得到第二个输出 token。
+
+    Args:
+        req_data: 客户端原始 completions 请求体。
+        prefill_response: P 节点生成一个 token 后的 JSON 响应。
+
+    Returns:
+        (decode_request, prefill_choice, num_prefill_output_tokens)。
+
+    Raises:
+        HTTPException: KV transfer 元数据缺失时抛出。
+    """
+    prefill_choice = _get_normal_pd_prefill_choice(prefill_response)
+    prompt_token_ids = [
+        int(token_id) for token_id in prefill_choice["prompt_token_ids"]
+    ]
+    output_token_ids = [int(token_id) for token_id in prefill_choice["token_ids"]]
+
+    # D 看到的逻辑序列必须显式带上 P 首 token；add_special_tokens=False
+    # 防止 D 再次插入 BOS/EOS，破坏与 P 的 KV 对齐。
+    decode_request = _build_decode_base_request(req_data)
+    decode_request["prompt"] = prompt_token_ids + output_token_ids
+    decode_request["add_special_tokens"] = False
+    _shrink_decode_max_tokens(decode_request, len(output_token_ids))
+
+    if not global_args.disable_kv_transfer:
+        kv_transfer_params = prefill_response.get("kv_transfer_params")
+        if not isinstance(kv_transfer_params, dict):
+            raise HTTPException(
+                status_code=502,
+                detail=(
+                    "P node normal PD response did not include "
+                    "kv_transfer_params."
+                ),
+            )
+        decode_request["kv_transfer_params"] = kv_transfer_params
+
+    return decode_request, prefill_choice, len(output_token_ids)
+
+
+def _normal_pd_finish_without_decode(
+    decode_request: dict[str, Any],
+    prefill_choice: dict[str, Any],
+    num_prefill_output_tokens: int,
+) -> bool:
+    """判断普通 PD 的 P 首 token 是否已完成原始生成请求。"""
+    if prefill_choice.get("finish_reason") == "stop":
+        return True
+    max_tokens = decode_request.get("max_tokens")
+    return (
+        isinstance(max_tokens, int)
+        and max_tokens <= 0
+        and num_prefill_output_tokens > 0
+    )
+
+
+def _build_normal_pd_prefill_stream_chunk(
+    prefill_response: dict[str, Any],
+    prefill_choice: dict[str, Any],
+    is_final_chunk: bool,
+) -> dict[str, Any]:
+    """将普通 PD P 节点生成的首 token 编码为 completions SSE payload。"""
+    finish_reason = prefill_choice.get("finish_reason") if is_final_chunk else None
+    if is_final_chunk and finish_reason != "stop":
+        finish_reason = "length"
+    return {
+        "id": prefill_response.get("id", f"cmpl-normal-pd-{time.time_ns()}"),
+        "object": "text_completion",
+        "created": prefill_response.get("created", int(time.time())),
+        "model": prefill_response.get("model"),
+        "choices": [
+            {
+                "index": 0,
+                "text": prefill_choice.get("text", ""),
+                "logprobs": prefill_choice.get("logprobs"),
+                "finish_reason": finish_reason,
+                "stop_reason": prefill_choice.get("stop_reason"),
+                # 即使 token 对应空文本，replay 也能凭 token_ids 识别首 token。
+                "token_ids": list(prefill_choice["token_ids"]),
+            }
+        ],
+    }
+
+
+def _merge_normal_pd_prefill_output(
+    decode_response: dict[str, Any],
+    prefill_choice: dict[str, Any],
+    num_prefill_output_tokens: int,
+) -> dict[str, Any]:
+    """把普通 PD 的 P 首 token 合并进 D 的非流式 completions 响应。"""
+    if num_prefill_output_tokens <= 0:
+        return decode_response
+    choices = decode_response.get("choices")
+    if not isinstance(choices, list) or len(choices) != 1:
+        raise HTTPException(
+            status_code=502,
+            detail="D node normal PD response must contain exactly one choice.",
+        )
+    decode_choice = choices[0]
+    if not isinstance(decode_choice, dict):
+        raise HTTPException(
+            status_code=502,
+            detail="D node normal PD response choice must be a JSON object.",
+        )
+    decode_choice["text"] = str(prefill_choice.get("text", "")) + str(
+        decode_choice.get("text", "")
+    )
+    if isinstance(decode_choice.get("token_ids"), list):
+        decode_choice["token_ids"] = list(prefill_choice["token_ids"]) + list(
+            decode_choice["token_ids"]
+        )
+
+    usage = decode_response.get("usage")
+    if isinstance(usage, dict):
+        prompt_tokens = usage.get("prompt_tokens")
+        completion_tokens = usage.get("completion_tokens")
+        if isinstance(prompt_tokens, int):
+            # D prompt 多出的一个 token 是 P 已采样的输出，不属于用户 prompt。
+            usage["prompt_tokens"] = max(
+                0,
+                prompt_tokens - num_prefill_output_tokens,
+            )
+        if isinstance(completion_tokens, int):
+            usage["completion_tokens"] = (
+                completion_tokens + num_prefill_output_tokens
+            )
+    return decode_response
+
+
 def _format_upstream_error(
     service_name: str,
     endpoint: str,
@@ -948,12 +1162,238 @@ async def _forward_normal_request(
     )
 
 
+async def _stream_normal_pd_completion(
+    decode_client_info: dict[str, Any],
+    request_id: str,
+    prefill_response: dict[str, Any],
+    prefill_choice: dict[str, Any],
+    decode_request: dict[str, Any],
+    finish_without_decode: bool,
+) -> AsyncIterator[bytes]:
+    """先发送普通 PD 的 P 首 token，再透明转发 D 的剩余生成。
+
+    P 的首 token 已在 handler 中同步完成，因此这个 generator 的第一个
+    frame 就是普通 PD 的真实 TTFT。D 请求被放在首 frame 之后，避免其连接
+    建立时间掩盖 P 的首 token 时延。
+
+    Args:
+        decode_client_info: 绑定的 D 节点 HTTP client。
+        request_id: 同一 P/D 生命周期使用的请求标识。
+        prefill_response: P 节点的单 token completions 响应。
+        prefill_choice: P 响应中已校验的唯一 choice。
+        decode_request: 已追加 P 首 token 和 KV transfer 参数的 D 请求。
+        finish_without_decode: P 首 token 是否已经满足原始停止条件。
+
+    Yields:
+        OpenAI completions 兼容的 SSE bytes。
+    """
+    yield _encode_sse_payload(
+        _build_normal_pd_prefill_stream_chunk(
+            prefill_response,
+            prefill_choice,
+            is_final_chunk=finish_without_decode,
+        )
+    )
+    if finish_without_decode:
+        yield b"data: [DONE]\n\n"
+        return
+
+    try:
+        async with decode_client_info["client"].stream(
+            "POST",
+            "/completions",
+            json=decode_request,
+            headers=_authorization_headers(request_id),
+        ) as response:
+            if response.is_error:
+                error_body = await response.aread()
+                try:
+                    decoded_body: Any = json.loads(error_body)
+                except (TypeError, ValueError):
+                    decoded_body = error_body.decode("utf-8", errors="replace")
+                yield _encode_sse_payload(
+                    {
+                        "error": {
+                            "service": "decode",
+                            "endpoint": "/completions",
+                            "status_code": response.status_code,
+                            "body": decoded_body,
+                        }
+                    }
+                )
+                yield b"data: [DONE]\n\n"
+                return
+
+            # D 的 budget 已扣除 P 首 token，可直接转发余下 SSE frame。
+            async for chunk in response.aiter_raw():
+                if chunk:
+                    yield chunk
+    except httpx.RequestError as exc:
+        yield _encode_sse_payload(
+            {
+                "error": {
+                    "service": "decode",
+                    "endpoint": "/completions",
+                    "error": str(exc),
+                }
+            }
+        )
+        yield b"data: [DONE]\n\n"
+
+
+async def _handle_normal_pd_completions(
+    request: Request,
+    *,
+    ttft_only: bool,
+) -> StreamingResponse | JSONResponse | Response:
+    """执行标准普通请求的 P→D 分离，或仅返回 P 首 token。
+
+    ttft_only=False 是完整 PD 链路：P 先为完整 prompt 做 prefill 并采样一个
+    token，proxy 再把 P 的 KV transfer 参数和精确 token view 交给 D。
+    ttft_only=True 只执行前半段，用于与 prompt-stream 的 finish_ttft 口径
+    一致地测量 P 首 token。
+
+    Args:
+        request: 客户端发给 normal completions 路由的 OpenAI 请求。
+        ttft_only: 是否在 P 返回首 token 后立即结束，不启动 D。
+
+    Returns:
+        流式请求返回 P 首 token 加可选 D 后续 token 的 SSE；非流式完整请求
+        返回合并后的 JSON；TTFT-only 始终返回 P 首 token 的 SSE。
+    """
+    req_data = await request.json()
+    request_id = req_data.get("request_id")
+    if not isinstance(request_id, str) or not request_id:
+        request_id = request.headers.get("X-Request-Id")
+    if not request_id:
+        request_id = f"normal-pd-{time.time_ns()}"
+
+    # 常规 PD 只处理一个 choice；多 choice 的 P/D KV 绑定不在本实验范围内。
+    prefill_request = _build_normal_pd_prefill_request(req_data)
+    prefill_request["request_id"] = request_id
+    prefill_client_info = get_next_client(request.app, "prefill")
+    prefill_response = await _post_json(
+        prefill_client_info,
+        "/completions",
+        prefill_request,
+        request_id,
+        service_name="prefill",
+    )
+    prefill_choice = _get_normal_pd_prefill_choice(prefill_response)
+    num_prefill_output_tokens = len(prefill_choice["token_ids"])
+
+    # 专用 TTFT 路由绝不构造或发送 D 请求。返回完整响应体而非异步 generator，
+    # 与 prompt_stream/finish_ttft 一样避免 headers 已发送后 body 被取消。
+    if ttft_only:
+        sse_body = _encode_sse_payload(
+            _build_normal_pd_prefill_stream_chunk(
+                prefill_response,
+                prefill_choice,
+                is_final_chunk=True,
+            )
+        ) + b"data: [DONE]\n\n"
+        logger.info(
+            "Proxy normal PD TTFT-only completed: request_id=%s "
+            "prompt_tokens=%s output_tokens=%s remote_num_tokens=%s",
+            request_id,
+            len(prefill_choice["prompt_token_ids"]),
+            num_prefill_output_tokens,
+            (
+                prefill_response.get("kv_transfer_params", {}).get(
+                    "remote_num_tokens"
+                )
+                if isinstance(prefill_response.get("kv_transfer_params"), dict)
+                else None
+            ),
+        )
+        return Response(
+            content=sse_body,
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "X-Accel-Buffering": "no",
+            },
+        )
+
+    decode_request, prefill_choice, num_prefill_output_tokens = (
+        _build_normal_pd_decode_request(req_data, prefill_response)
+    )
+    finish_without_decode = _normal_pd_finish_without_decode(
+        decode_request,
+        prefill_choice,
+        num_prefill_output_tokens,
+    )
+    logger.info(
+        "Proxy normal PD request: request_id=%s prompt_tokens=%s "
+        "decode_prompt_tokens=%s remote_num_tokens=%s "
+        "num_prefill_output_tokens=%s disable_kv_transfer=%s stream=%s",
+        request_id,
+        len(prefill_choice["prompt_token_ids"]),
+        len(decode_request["prompt"]),
+        (
+            decode_request.get("kv_transfer_params", {}).get("remote_num_tokens")
+            if isinstance(decode_request.get("kv_transfer_params"), dict)
+            else None
+        ),
+        num_prefill_output_tokens,
+        global_args.disable_kv_transfer,
+        bool(decode_request.get("stream", False)),
+    )
+
+    if decode_request.get("stream", False):
+        return StreamingResponse(
+            _stream_normal_pd_completion(
+                decode_client_info=get_next_client(request.app, "decode"),
+                request_id=request_id,
+                prefill_response=prefill_response,
+                prefill_choice=prefill_choice,
+                decode_request=decode_request,
+                finish_without_decode=finish_without_decode,
+            ),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "X-Accel-Buffering": "no",
+            },
+        )
+
+    if finish_without_decode:
+        # P 按原始 max_tokens=1 完成时，它自己的 JSON 响应就是最终结果。
+        return JSONResponse(content=prefill_response)
+
+    decode_client_info = get_next_client(request.app, "decode")
+    decode_response = await _post_json(
+        decode_client_info,
+        "/completions",
+        decode_request,
+        request_id,
+        service_name="decode",
+    )
+    return JSONResponse(
+        content=_merge_normal_pd_prefill_output(
+            decode_response,
+            prefill_choice,
+            num_prefill_output_tokens,
+        )
+    )
+
+
 @app.post("/v1/completions", response_model=None)
 async def forward_normal_completions(
     request: Request,
-) -> StreamingResponse | JSONResponse:
-    """转发普通 completions 请求到 D 节点。"""
-    return await _forward_normal_request(request, "/completions")
+) -> StreamingResponse | JSONResponse | Response:
+    """通过标准 P→D 分离处理普通 completions 请求。"""
+    return await _handle_normal_pd_completions(request, ttft_only=False)
+
+
+@app.post("/v1/completions_ttft", response_model=None)
+async def forward_normal_completions_ttft(
+    request: Request,
+) -> Response:
+    """只执行普通 PD 的 P 侧首 token，用于 TTFT 实验。"""
+    response = await _handle_normal_pd_completions(request, ttft_only=True)
+    assert isinstance(response, Response)
+    return response
 
 
 @app.post("/v1/chat/completions", response_model=None)

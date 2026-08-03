@@ -26,6 +26,7 @@ from replay_common import (
     _sleep_until,
     consume_sse_response,
     main,
+    should_log_event_progress,
 )
 
 logger = logging.getLogger(__name__)
@@ -86,9 +87,15 @@ async def _send_source_events(
     num_data_events_sent = 0
     previous_data_scheduled_offset = initial_delay
 
-    for record in source_stream.event_records:
+    for event_index, record in enumerate(source_stream.event_records):
         stored_event = record["event"]
         event_type = str(stored_event["event_type"])
+        chunk_id = str(stored_event.get("chunk_id") or "")
+        sequence_no = int(stored_event.get("sequence_no", 0))
+        version = int(stored_event.get("version", 0))
+        text_chars = len(str(stored_event.get("text") or ""))
+        should_log_event = should_log_event_progress(args, event_index)
+
         if event_type in ("append", "update"):
             scheduled_offset = initial_delay + num_data_events_sent * chunk_interval
             previous_data_scheduled_offset = scheduled_offset
@@ -99,8 +106,36 @@ async def _send_source_events(
             if num_data_events_sent == 0:
                 scheduled_offset = initial_delay + args.source_finish_delay
 
-        await _sleep_until(source_dispatch_start_time + scheduled_offset)
+        scheduled_target_time = source_dispatch_start_time + scheduled_offset
+        if should_log_event:
+            wait_ms = max(0.0, scheduled_target_time - time.perf_counter()) * 1000
+            logger.info(
+                "Replay stream WAIT event: run_id=%s request_id=%s "
+                "sample_id=%s query_id=%s source_id=%s source_type=%s "
+                "event_index=%d event_type=%s chunk_id=%s sequence_no=%d "
+                "version=%d scheduled_offset_ms=%.3f wait_ms=%.3f "
+                "text_chars=%d",
+                run_id,
+                request_id,
+                sample.sample_id,
+                sample.query_id,
+                source_stream.source_id,
+                source_stream.source_type,
+                event_index,
+                event_type,
+                chunk_id,
+                sequence_no,
+                version,
+                scheduled_offset * 1000,
+                wait_ms,
+                text_chars,
+            )
+
+        await _sleep_until(scheduled_target_time)
         actual_send_time = time.perf_counter()
+        actual_send_offset_ms = (
+            actual_send_time - source_dispatch_start_time
+        ) * 1000
         outbound_event = dict(stored_event)
         # 数据集没有实验时间；每次真正发 REST 请求时才附加 arrival_time。
         outbound_event["arrival_time"] = time.time()
@@ -108,6 +143,27 @@ async def _send_source_events(
             "request_id": request_id,
             "event": outbound_event,
         }
+        if should_log_event:
+            logger.info(
+                "Replay stream SEND event: run_id=%s request_id=%s "
+                "sample_id=%s query_id=%s source_id=%s source_type=%s "
+                "event_index=%d event_type=%s chunk_id=%s sequence_no=%d "
+                "version=%d actual_send_offset_ms=%.3f text_chars=%d",
+                run_id,
+                request_id,
+                sample.sample_id,
+                sample.query_id,
+                source_stream.source_id,
+                source_stream.source_type,
+                event_index,
+                event_type,
+                chunk_id,
+                sequence_no,
+                version,
+                actual_send_offset_ms,
+                text_chars,
+            )
+
         ack_start_time = time.perf_counter()
         try:
             await _post_json(
@@ -116,6 +172,25 @@ async def _send_source_events(
                 payload,
             )
         except Exception as exc:
+            if should_log_event:
+                logger.warning(
+                    "Replay stream ERROR event: run_id=%s request_id=%s "
+                    "sample_id=%s query_id=%s source_id=%s source_type=%s "
+                    "event_index=%d event_type=%s chunk_id=%s sequence_no=%d "
+                    "version=%d error=%s",
+                    run_id,
+                    request_id,
+                    sample.sample_id,
+                    sample.query_id,
+                    source_stream.source_id,
+                    source_stream.source_type,
+                    event_index,
+                    event_type,
+                    chunk_id,
+                    sequence_no,
+                    version,
+                    exc,
+                )
             event_metrics.append(
                 EventMetric(
                     run_id=run_id,
@@ -125,20 +200,38 @@ async def _send_source_events(
                     source_id=source_stream.source_id,
                     source_type=source_stream.source_type,
                     event_type=event_type,
-                    chunk_id=str(stored_event.get("chunk_id") or ""),
-                    sequence_no=int(stored_event.get("sequence_no", 0)),
-                    version=int(stored_event.get("version", 0)),
+                    chunk_id=chunk_id,
+                    sequence_no=sequence_no,
+                    version=version,
                     scheduled_offset_ms=scheduled_offset * 1000,
-                    actual_send_offset_ms=(
-                        actual_send_time - source_dispatch_start_time
-                    )
-                    * 1000,
+                    actual_send_offset_ms=actual_send_offset_ms,
                     ack_latency_ms=None,
                     result_status="error",
                     error=str(exc),
                 )
             )
             raise
+
+        ack_latency_ms = (time.perf_counter() - ack_start_time) * 1000
+        if should_log_event:
+            logger.info(
+                "Replay stream ACK event: run_id=%s request_id=%s "
+                "sample_id=%s query_id=%s source_id=%s source_type=%s "
+                "event_index=%d event_type=%s chunk_id=%s sequence_no=%d "
+                "version=%d ack_latency_ms=%.3f",
+                run_id,
+                request_id,
+                sample.sample_id,
+                sample.query_id,
+                source_stream.source_id,
+                source_stream.source_type,
+                event_index,
+                event_type,
+                chunk_id,
+                sequence_no,
+                version,
+                ack_latency_ms,
+            )
 
         event_metrics.append(
             EventMetric(
@@ -149,13 +242,12 @@ async def _send_source_events(
                 source_id=source_stream.source_id,
                 source_type=source_stream.source_type,
                 event_type=event_type,
-                chunk_id=str(stored_event.get("chunk_id") or ""),
-                sequence_no=int(stored_event.get("sequence_no", 0)),
-                version=int(stored_event.get("version", 0)),
+                chunk_id=chunk_id,
+                sequence_no=sequence_no,
+                version=version,
                 scheduled_offset_ms=scheduled_offset * 1000,
-                actual_send_offset_ms=(actual_send_time - source_dispatch_start_time)
-                * 1000,
-                ack_latency_ms=(time.perf_counter() - ack_start_time) * 1000,
+                actual_send_offset_ms=actual_send_offset_ms,
+                ack_latency_ms=ack_latency_ms,
                 result_status="ok",
             )
         )
@@ -216,6 +308,15 @@ async def _replay_stream_sample(
         if not isinstance(request_id_value, str):
             raise ReplayHttpError("Prompt-stream start response has no request_id.")
         request_id = request_id_value
+        logger.info(
+            "Replay stream START ack: run_id=%s request_id=%s "
+            "sample_id=%s query_id=%s source_count=%d",
+            run_id,
+            request_id,
+            sample.sample_id,
+            sample.query_id,
+            len(sample.source_streams),
+        )
 
         source_dispatch_start_time = time.perf_counter()
         source_tasks = [
@@ -266,6 +367,15 @@ async def _replay_stream_sample(
             "event": finish_event,
         }
         # TTFT 的时间零点必须紧邻 finish POST 提交动作。
+        logger.info(
+            "Replay stream FINISH send: run_id=%s request_id=%s "
+            "sample_id=%s query_id=%s num_event_acks=%d",
+            run_id,
+            request_id,
+            sample.sample_id,
+            sample.query_id,
+            metric.num_event_acks,
+        )
         finish_sent_time = time.perf_counter()
         async with client.stream(
             "POST",
@@ -303,6 +413,16 @@ async def _replay_stream_sample(
         metric.completion_chunks = sse_measurement.completion_chunks
         metric.response_payloads = list(sse_measurement.payloads)
         metric.result_status = "ok"
+        logger.info(
+            "Replay stream FINISH ack: run_id=%s request_id=%s "
+            "sample_id=%s query_id=%s ttft_ms=%.3f origin=%s",
+            run_id,
+            request_id,
+            sample.sample_id,
+            sample.query_id,
+            metric.finish_to_first_token_ms,
+            metric.ttft_origin,
+        )
     except asyncio.CancelledError:
         if request_id is not None:
             # fail-fast 取消其它逻辑请求时，也要清理已经 start 的 P 长期请求。
@@ -311,6 +431,15 @@ async def _replay_stream_sample(
             )
         raise
     except Exception as exc:
+        logger.warning(
+            "Replay stream REQUEST error: run_id=%s request_id=%s "
+            "sample_id=%s query_id=%s error=%s",
+            run_id,
+            request_id,
+            sample.sample_id,
+            sample.query_id,
+            exc,
+        )
         metric.error = str(exc)
         if request_id is not None:
             await _abort_prompt_stream(client, args.proxy_url, request_id)

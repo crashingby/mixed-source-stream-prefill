@@ -34,6 +34,7 @@ from replay_common import (
     _sleep_until,
     consume_sse_response,
     main,
+    should_log_event_progress,
 )
 
 logger = logging.getLogger(__name__)
@@ -175,6 +176,20 @@ def _iter_scheduled_groups(
     return groups
 
 
+def _format_trigger_events(
+    trigger_events: tuple[ScheduledSourceEvent, ...],
+) -> str:
+    """把一次 merged snapshot 的原始触发事件压缩成日志字符串。"""
+    parts: list[str] = []
+    for trigger_event in trigger_events:
+        event = trigger_event.event
+        parts.append(
+            f"{trigger_event.source_type}:{trigger_event.source_id}:"
+            f"seq={event.get('sequence_no', 0)}:ver={event.get('version', 0)}"
+        )
+    return ",".join(parts)
+
+
 def _merged_context_text(
     append_text_parts: list[str],
     update_text_parts: list[str],
@@ -298,7 +313,27 @@ async def _dispatch_merged_update_events(
     last_scheduled_offset = 0.0
 
     for scheduled_offset, trigger_events in scheduled_groups:
-        await _sleep_until(source_dispatch_start_time + scheduled_offset)
+        should_log_event = should_log_event_progress(args, sequence_no)
+        scheduled_target_time = source_dispatch_start_time + scheduled_offset
+        trigger_summary = _format_trigger_events(trigger_events)
+        if should_log_event:
+            wait_ms = max(0.0, scheduled_target_time - time.perf_counter()) * 1000
+            logger.info(
+                "Replay merged-update WAIT event: run_id=%s request_id=%s "
+                "sample_id=%s query_id=%s event_index=%d sequence_no=%d "
+                "scheduled_offset_ms=%.3f wait_ms=%.3f triggers=%s",
+                run_id,
+                request_id,
+                sample.sample_id,
+                sample.query_id,
+                sequence_no,
+                sequence_no,
+                scheduled_offset * 1000,
+                wait_ms,
+                trigger_summary,
+            )
+
+        await _sleep_until(scheduled_target_time)
         last_scheduled_offset = scheduled_offset
 
         for trigger_event in trigger_events:
@@ -316,6 +351,28 @@ async def _dispatch_merged_update_events(
         merged_text = _merged_context_text(append_text_parts, update_text_parts)
         outbound_event = _make_merged_update_event(merged_text, sequence_no)
         actual_send_time = time.perf_counter()
+        actual_send_offset_ms = (
+            actual_send_time - source_dispatch_start_time
+        ) * 1000
+        if should_log_event:
+            logger.info(
+                "Replay merged-update SEND event: run_id=%s request_id=%s "
+                "sample_id=%s query_id=%s event_index=%d sequence_no=%d "
+                "version=%d actual_send_offset_ms=%.3f merged_text_chars=%d "
+                "logical_append_chunks=%d triggers=%s",
+                run_id,
+                request_id,
+                sample.sample_id,
+                sample.query_id,
+                sequence_no,
+                sequence_no,
+                sequence_no,
+                actual_send_offset_ms,
+                len(merged_text),
+                num_logical_append_chunks,
+                trigger_summary,
+            )
+
         ack_start_time = time.perf_counter()
         try:
             await _send_prompt_stream_event(
@@ -325,6 +382,21 @@ async def _dispatch_merged_update_events(
                 outbound_event,
             )
         except Exception as exc:
+            if should_log_event:
+                logger.warning(
+                    "Replay merged-update ERROR event: run_id=%s request_id=%s "
+                    "sample_id=%s query_id=%s event_index=%d sequence_no=%d "
+                    "version=%d triggers=%s error=%s",
+                    run_id,
+                    request_id,
+                    sample.sample_id,
+                    sample.query_id,
+                    sequence_no,
+                    sequence_no,
+                    sequence_no,
+                    trigger_summary,
+                    exc,
+                )
             event_metrics.append(
                 EventMetric(
                     run_id=run_id,
@@ -338,16 +410,29 @@ async def _dispatch_merged_update_events(
                     sequence_no=sequence_no,
                     version=sequence_no,
                     scheduled_offset_ms=scheduled_offset * 1000,
-                    actual_send_offset_ms=(
-                        actual_send_time - source_dispatch_start_time
-                    )
-                    * 1000,
+                    actual_send_offset_ms=actual_send_offset_ms,
                     ack_latency_ms=None,
                     result_status="error",
                     error=str(exc),
                 )
             )
             raise
+
+        ack_latency_ms = (time.perf_counter() - ack_start_time) * 1000
+        if should_log_event:
+            logger.info(
+                "Replay merged-update ACK event: run_id=%s request_id=%s "
+                "sample_id=%s query_id=%s event_index=%d sequence_no=%d "
+                "version=%d ack_latency_ms=%.3f",
+                run_id,
+                request_id,
+                sample.sample_id,
+                sample.query_id,
+                sequence_no,
+                sequence_no,
+                sequence_no,
+                ack_latency_ms,
+            )
 
         event_metrics.append(
             EventMetric(
@@ -362,9 +447,8 @@ async def _dispatch_merged_update_events(
                 sequence_no=sequence_no,
                 version=sequence_no,
                 scheduled_offset_ms=scheduled_offset * 1000,
-                actual_send_offset_ms=(actual_send_time - source_dispatch_start_time)
-                * 1000,
-                ack_latency_ms=(time.perf_counter() - ack_start_time) * 1000,
+                actual_send_offset_ms=actual_send_offset_ms,
+                ack_latency_ms=ack_latency_ms,
                 result_status="ok",
             )
         )
@@ -372,9 +456,44 @@ async def _dispatch_merged_update_events(
         num_merged_update_snapshots += 1
 
     finished_offset = last_scheduled_offset + args.source_finish_delay
-    await _sleep_until(source_dispatch_start_time + finished_offset)
     source_finished_event = _make_source_finished_event(sequence_no)
+    should_log_finished = should_log_event_progress(args, sequence_no)
+    finished_target_time = source_dispatch_start_time + finished_offset
+    if should_log_finished:
+        wait_ms = max(0.0, finished_target_time - time.perf_counter()) * 1000
+        logger.info(
+            "Replay merged-update WAIT source_finished: run_id=%s "
+            "request_id=%s sample_id=%s query_id=%s event_index=%d "
+            "sequence_no=%d scheduled_offset_ms=%.3f wait_ms=%.3f",
+            run_id,
+            request_id,
+            sample.sample_id,
+            sample.query_id,
+            sequence_no,
+            sequence_no,
+            finished_offset * 1000,
+            wait_ms,
+        )
+
+    await _sleep_until(finished_target_time)
     actual_send_time = time.perf_counter()
+    actual_send_offset_ms = (
+        actual_send_time - source_dispatch_start_time
+    ) * 1000
+    if should_log_finished:
+        logger.info(
+            "Replay merged-update SEND source_finished: run_id=%s "
+            "request_id=%s sample_id=%s query_id=%s event_index=%d "
+            "sequence_no=%d actual_send_offset_ms=%.3f",
+            run_id,
+            request_id,
+            sample.sample_id,
+            sample.query_id,
+            sequence_no,
+            sequence_no,
+            actual_send_offset_ms,
+        )
+
     ack_start_time = time.perf_counter()
     try:
         await _send_prompt_stream_event(
@@ -384,6 +503,19 @@ async def _dispatch_merged_update_events(
             source_finished_event,
         )
     except Exception as exc:
+        if should_log_finished:
+            logger.warning(
+                "Replay merged-update ERROR source_finished: run_id=%s "
+                "request_id=%s sample_id=%s query_id=%s event_index=%d "
+                "sequence_no=%d error=%s",
+                run_id,
+                request_id,
+                sample.sample_id,
+                sample.query_id,
+                sequence_no,
+                sequence_no,
+                exc,
+            )
         event_metrics.append(
             EventMetric(
                 run_id=run_id,
@@ -397,14 +529,28 @@ async def _dispatch_merged_update_events(
                 sequence_no=sequence_no,
                 version=int(source_finished_event["version"]),
                 scheduled_offset_ms=finished_offset * 1000,
-                actual_send_offset_ms=(actual_send_time - source_dispatch_start_time)
-                * 1000,
+                actual_send_offset_ms=actual_send_offset_ms,
                 ack_latency_ms=None,
                 result_status="error",
                 error=str(exc),
             )
         )
         raise
+
+    ack_latency_ms = (time.perf_counter() - ack_start_time) * 1000
+    if should_log_finished:
+        logger.info(
+            "Replay merged-update ACK source_finished: run_id=%s "
+            "request_id=%s sample_id=%s query_id=%s event_index=%d "
+            "sequence_no=%d ack_latency_ms=%.3f",
+            run_id,
+            request_id,
+            sample.sample_id,
+            sample.query_id,
+            sequence_no,
+            sequence_no,
+            ack_latency_ms,
+        )
 
     event_metrics.append(
         EventMetric(
@@ -419,9 +565,8 @@ async def _dispatch_merged_update_events(
             sequence_no=sequence_no,
             version=int(source_finished_event["version"]),
             scheduled_offset_ms=finished_offset * 1000,
-            actual_send_offset_ms=(actual_send_time - source_dispatch_start_time)
-            * 1000,
-            ack_latency_ms=(time.perf_counter() - ack_start_time) * 1000,
+            actual_send_offset_ms=actual_send_offset_ms,
+            ack_latency_ms=ack_latency_ms,
             result_status="ok",
         )
     )
@@ -487,6 +632,15 @@ async def _replay_merged_update_sample(
         if not isinstance(request_id_value, str):
             raise ReplayHttpError("Prompt-stream start response has no request_id.")
         request_id = request_id_value
+        logger.info(
+            "Replay merged-update START ack: run_id=%s request_id=%s "
+            "sample_id=%s query_id=%s source_count=%d",
+            run_id,
+            request_id,
+            sample.sample_id,
+            sample.query_id,
+            len(sample.source_streams),
+        )
 
         source_dispatch_start_time = time.perf_counter()
         (
@@ -521,6 +675,15 @@ async def _replay_merged_update_sample(
             "request_id": request_id,
             "event": finish_event,
         }
+        logger.info(
+            "Replay merged-update FINISH send: run_id=%s request_id=%s "
+            "sample_id=%s query_id=%s num_event_acks=%d",
+            run_id,
+            request_id,
+            sample.sample_id,
+            sample.query_id,
+            metric.num_event_acks,
+        )
         finish_sent_time = time.perf_counter()
         async with client.stream(
             "POST",
@@ -559,6 +722,16 @@ async def _replay_merged_update_sample(
         metric.completion_chunks = sse_measurement.completion_chunks
         metric.response_payloads = list(sse_measurement.payloads)
         metric.result_status = "ok"
+        logger.info(
+            "Replay merged-update FINISH ack: run_id=%s request_id=%s "
+            "sample_id=%s query_id=%s ttft_ms=%.3f origin=%s",
+            run_id,
+            request_id,
+            sample.sample_id,
+            sample.query_id,
+            metric.finish_to_first_token_ms,
+            metric.ttft_origin,
+        )
     except asyncio.CancelledError:
         if request_id is not None:
             await asyncio.shield(
@@ -566,6 +739,15 @@ async def _replay_merged_update_sample(
             )
         raise
     except Exception as exc:
+        logger.warning(
+            "Replay merged-update REQUEST error: run_id=%s request_id=%s "
+            "sample_id=%s query_id=%s error=%s",
+            run_id,
+            request_id,
+            sample.sample_id,
+            sample.query_id,
+            exc,
+        )
         metric.error = str(exc)
         if request_id is not None:
             await _abort_prompt_stream(client, args.proxy_url, request_id)

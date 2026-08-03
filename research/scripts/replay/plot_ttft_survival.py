@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-"""绘制流式 prefill 与普通模式的 TTFT survival curve。"""
+"""绘制一个或多个 replay 结果的 TTFT survival curve。"""
 
 # ruff: noqa: I001
 
@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -22,7 +23,14 @@ from matplotlib.ticker import PercentFormatter
 
 DEFAULT_OUTPUT = Path("research/scripts/replay/results/ttft_survival.png")
 DEFAULT_STREAM_TTFT_COLUMN = "finish_to_first_token_ms"
-DEFAULT_NORMAL_TTFT_COLUMN = "request_to_first_token_ms"
+DEFAULT_SERIES_COLORS = (
+    "#1f77b4",
+    "#d62728",
+    "#2ca02c",
+    "#9467bd",
+    "#ff7f0e",
+    "#17becf",
+)
 
 
 @dataclass(frozen=True)
@@ -37,51 +45,30 @@ class TtftSeries:
     num_success_rows: int
 
 
+@dataclass(frozen=True)
+class TtftSeriesSpec:
+    """命令行传入的一条曲线定义。"""
+
+    label: str
+    result_dir: Path
+    ttft_column: str
+
+
 def parse_args() -> argparse.Namespace:
     """解析画图脚本参数。"""
     parser = argparse.ArgumentParser(
         description=(
-            "Plot percent(TTFT > x) curves for prompt-stream and normal "
-            "mixed-source replay results."
+            "Plot percent(TTFT > x) curves for mixed-source replay results."
         )
     )
     parser.add_argument(
-        "--stream-result-dir",
-        type=Path,
+        "--series",
+        action="append",
         required=True,
-        help="Replay result directory produced by replay_prompt_stream.py.",
-    )
-    parser.add_argument(
-        "--normal-result-dir",
-        type=Path,
-        required=True,
-        help="Replay result directory produced by replay_normal.py.",
-    )
-    parser.add_argument(
-        "--stream-label",
-        type=str,
-        default="Streaming prefill",
-        help="Legend label for the prompt-stream curve.",
-    )
-    parser.add_argument(
-        "--normal-label",
-        type=str,
-        default="Normal prefill",
-        help="Legend label for the second curve.",
-    )
-    parser.add_argument(
-        "--stream-ttft-column",
-        type=str,
-        default=DEFAULT_STREAM_TTFT_COLUMN,
-        help="TTFT column for the prompt-stream curve.",
-    )
-    parser.add_argument(
-        "--normal-ttft-column",
-        type=str,
-        default=DEFAULT_NORMAL_TTFT_COLUMN,
         help=(
-            "TTFT column for the second curve. Use "
-            "finish_to_first_token_ms when comparing merged_update."
+            "Curve in 'label=result_dir[:ttft_column]' format. Repeat this "
+            "option to plot several modes in one figure. The default TTFT "
+            "column is finish_to_first_token_ms."
         ),
     )
     parser.add_argument(
@@ -103,6 +90,48 @@ def parse_args() -> argparse.Namespace:
         help="Output DPI for raster formats such as PNG.",
     )
     return parser.parse_args()
+
+
+def parse_series_spec(raw_spec: str) -> TtftSeriesSpec:
+    """解析 `--series` 传入的单条曲线配置。
+
+    Args:
+        raw_spec: 形如 `label=result_dir[:ttft_column]` 的原始字符串。
+
+    Returns:
+        结构化后的曲线配置。
+
+    Raises:
+        ValueError: 当字符串缺少 label、路径或列名为空时抛出。
+    """
+    label, separator, raw_path_and_column = raw_spec.partition("=")
+    if not separator or not label.strip() or not raw_path_and_column.strip():
+        raise ValueError(
+            "--series must use 'label=result_dir[:ttft_column]' format, "
+            f"but got {raw_spec!r}."
+        )
+
+    # 默认使用本实验统一主指标；normal 也会写入同名列，通常不必额外指定。
+    raw_result_dir = raw_path_and_column
+    ttft_column = DEFAULT_STREAM_TTFT_COLUMN
+    if ":" in raw_path_and_column:
+        raw_result_dir, ttft_column = raw_path_and_column.rsplit(":", 1)
+    if not raw_result_dir.strip() or not ttft_column.strip():
+        raise ValueError(
+            "--series requires non-empty result_dir and ttft_column, "
+            f"but got {raw_spec!r}."
+        )
+
+    return TtftSeriesSpec(
+        label=label.strip(),
+        result_dir=Path(raw_result_dir.strip()),
+        ttft_column=ttft_column.strip(),
+    )
+
+
+def _series_specs_from_args(args: argparse.Namespace) -> list[TtftSeriesSpec]:
+    """根据统一的 `--series` CLI 参数得到本次要绘制的曲线列表。"""
+    return [parse_series_spec(raw_spec) for raw_spec in args.series]
 
 
 def _metrics_path(result_dir: Path) -> Path:
@@ -255,30 +284,29 @@ def _legend_label(series: TtftSeries) -> str:
 
 
 def plot_survival_curves(
-    stream_series: TtftSeries,
-    normal_series: TtftSeries,
+    series_list: Sequence[TtftSeries],
     output_path: Path,
     title: str,
     dpi: int,
 ) -> None:
-    """绘制并保存两条 TTFT survival curve。"""
+    """绘制并保存多条 TTFT survival curve。"""
+    if not series_list:
+        raise ValueError("At least one TTFT series is required.")
+
     _configure_matplotlib()
     fig, ax = plt.subplots()
-    for series, color in (
-        (stream_series, "#1f77b4"),
-        (normal_series, "#d62728"),
-    ):
+    for index, series in enumerate(series_list):
         x_values, y_values = survival_curve(series.ttft_ms)
         ax.step(
             x_values,
             y_values,
             where="post",
             linewidth=2.25,
-            color=color,
+            color=DEFAULT_SERIES_COLORS[index % len(DEFAULT_SERIES_COLORS)],
             label=_legend_label(series),
         )
 
-    max_ttft = max(stream_series.ttft_ms[-1], normal_series.ttft_ms[-1])
+    max_ttft = max(series.ttft_ms[-1] for series in series_list)
     ax.set_xlim(left=0, right=max(max_ttft * 1.06, max_ttft + 1.0))
     ax.set_ylim(bottom=0, top=102)
     ax.yaxis.set_major_formatter(PercentFormatter(xmax=100, decimals=0))
@@ -294,21 +322,19 @@ def plot_survival_curves(
 
 
 def main() -> None:
-    """加载两个 replay 结果目录并输出图像和 JSON 摘要。"""
+    """加载 replay 结果目录并输出图像和 JSON 摘要。"""
     args = parse_args()
-    stream_series = load_ttft_series(
-        args.stream_result_dir,
-        args.stream_label,
-        args.stream_ttft_column,
-    )
-    normal_series = load_ttft_series(
-        args.normal_result_dir,
-        args.normal_label,
-        args.normal_ttft_column,
-    )
+    series_specs = _series_specs_from_args(args)
+    series_list = [
+        load_ttft_series(
+            spec.result_dir,
+            spec.label,
+            spec.ttft_column,
+        )
+        for spec in series_specs
+    ]
     plot_survival_curves(
-        stream_series=stream_series,
-        normal_series=normal_series,
+        series_list=series_list,
         output_path=args.output,
         title=args.title,
         dpi=args.dpi,
@@ -318,10 +344,7 @@ def main() -> None:
     summary = {
         "output": str(args.output),
         "survival_definition": "percent(TTFT > x)",
-        "series": [
-            summarize_series(stream_series),
-            summarize_series(normal_series),
-        ],
+        "series": [summarize_series(series) for series in series_list],
     }
     summary_path.write_text(
         json.dumps(summary, ensure_ascii=False, indent=2) + "\n",

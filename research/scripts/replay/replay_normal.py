@@ -40,6 +40,24 @@ def _make_normal_payload(
     return payload, append_chars, final_update_chars
 
 
+def _normal_completion_endpoint(args: argparse.Namespace) -> str:
+    """返回普通 PD replay 当前应调用的 completions 路由。
+
+    常规运行使用完整的 P→D 分离路径。TTFT-only 只需要 P 节点对完整 prompt
+    做 prefill 并产生一个输出 token，因此调用 proxy 的专用路由，避免启动 D
+    节点的 KV load 或后续 decode。
+
+    Args:
+        args: 已解析的 replay 命令行参数。
+
+    Returns:
+        proxy 上的普通 PD completions endpoint。
+    """
+    if args.ttft_only:
+        return "/v1/completions_ttft"
+    return "/v1/completions"
+
+
 async def _replay_normal_sample(
     client: httpx.AsyncClient,
     sample: SampleReplayInput,
@@ -48,7 +66,7 @@ async def _replay_normal_sample(
     planned_arrival_offset_ms: float,
     queue_delay_ms: float,
 ) -> RequestMetric:
-    """通过 proxy 普通 `/v1/completions` 回放最终逻辑 prompt 并计量 TTFT。"""
+    """通过 proxy 普通 P/D 分离回放最终逻辑 prompt 并计量 TTFT。"""
     request_start_time = time.perf_counter()
     normal_payload, append_chars, final_update_chars = _make_normal_payload(
         sample,
@@ -79,10 +97,14 @@ async def _replay_normal_sample(
         normal_prompt_chars=len(str(normal_payload["prompt"])),
     )
     try:
-        # 普通模式的 TTFT 起点是整段 prompt 的 completions 请求提交时刻。
+        # 普通模式的 TTFT 起点是整段 prompt 的 normal PD 请求提交时刻。
+        # --ttft-only 对应 P-only 路由，首 token 不会再触发 D 的 KV load。
         async with client.stream(
             "POST",
-            _normalize_v1_url(args.proxy_url, "/v1/completions"),
+            _normalize_v1_url(
+                args.proxy_url,
+                _normal_completion_endpoint(args),
+            ),
             json=normal_payload,
         ) as normal_response:
             if normal_response.is_error:
@@ -107,7 +129,7 @@ async def _replay_normal_sample(
             sse_measurement.completed_time - request_start_time
         ) * 1000
         metric.request_to_done_ms = metric.finish_to_done_ms
-        metric.ttft_origin = "normal_decode"
+        metric.ttft_origin = "normal_prefill"
         metric.completion_chars = sse_measurement.completion_chars
         metric.completion_chunks = sse_measurement.completion_chunks
         metric.response_payloads = list(sse_measurement.payloads)

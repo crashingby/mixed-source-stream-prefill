@@ -6,7 +6,7 @@
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=16
 #SBATCH --mem=64G
-#SBATCH --time=04:00:00
+#SBATCH --time=12:00:00
 #SBATCH --output=research/scripts/logs/vllm-d-%j.out
 
 set -euo pipefail
