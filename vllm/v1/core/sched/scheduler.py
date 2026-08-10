@@ -56,7 +56,12 @@ from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.metrics.perf import ModelMetrics, PerfStats
 from vllm.v1.metrics.stats import PrefixCacheStats, SchedulerStats
 from vllm.v1.outputs import DraftTokenIds, KVConnectorOutput, ModelRunnerOutput
-from vllm.v1.request import Request, RequestStatus, StreamingUpdate
+from vllm.v1.request import (
+    PromptStreamKVSegment,
+    Request,
+    RequestStatus,
+    StreamingUpdate,
+)
 from vllm.v1.spec_decode.dynamic.utils import build_dynamic_sd_schedule_lookup
 from vllm.v1.spec_decode.metrics import SpecDecodingStats
 from vllm.v1.structured_output import StructuredOutputManager
@@ -421,7 +426,7 @@ class Scheduler(SchedulerInterface):
         event = incoming.prompt_stream_event
         assert event is not None
 
-        mutation = existing.apply_prompt_stream_event(event)
+        existing.apply_prompt_stream_event(event)
         incoming.prompt_stream_event = None
 
         prompt_stream = existing.prompt_stream
@@ -451,19 +456,6 @@ class Scheduler(SchedulerInterface):
             )
             return
 
-        # Segment 模式没有全局连续 fallback。Update 无论当前是否持有 blocks，
-        # 都只允许在 UPDATE 域内按来源 LCP 截断；无 blocks 时该操作自然 no-op。
-        if mutation.kv_segment_to_truncate is not None:
-            blocks_were_freed = (
-                self.kv_cache_manager.truncate_prompt_stream_segment_blocks(
-                    existing,
-                    mutation.kv_segment_to_truncate,
-                    mutation.kv_segment_keep_tokens,
-                )
-            )
-            if blocks_were_freed:
-                existing.prompt_stream_needs_worker_refresh = True
-
     def _prepare_prompt_stream_execution(self, request: Request) -> None:
         """在计算 token budget 前刷新流式请求的阶段执行视图。"""
         if not request.is_prompt_streaming():
@@ -480,6 +472,22 @@ class Scheduler(SchedulerInterface):
                 f"logical_len={layout.total_len}, "
                 f"max_model_len={self.max_model_len}."
             )
+
+        # 只有旧 Update work 已完成、下一代 work 被选中后，才能按这两代
+        # 快照的 source-local LCP 截断 UPDATE blocks。事件到达时提前释放会
+        # 破坏 active work 的 KV，因此截断必须位于 prepare 与 allocate 之间。
+        update_kv_keep_tokens = request.take_prompt_stream_update_kv_truncation()
+        if update_kv_keep_tokens is None:
+            return
+        blocks_were_freed = self.kv_cache_manager.truncate_prompt_stream_segment_blocks(
+            request,
+            PromptStreamKVSegment.UPDATE,
+            update_kv_keep_tokens,
+        )
+        if blocks_were_freed:
+            # block table 已缩短，worker 必须在本轮通过 NewRequestData 接收
+            # 与 execution view 一致的完整 segment block table。
+            request.prompt_stream_needs_worker_refresh = True
 
     def _get_worker_blocks(self, request: Request) -> KVCacheBlocks:
         """返回 worker 当前应完整安装的 block table。"""

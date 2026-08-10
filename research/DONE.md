@@ -438,53 +438,68 @@ write segment      = PREFIX_APPEND
 
 ## Update 事件如何计算
 
-当前只支持一个 Update source。设：
+当前只支持一个 Update source，但同一请求可以连续收到多代 Update 快照。设第
+`i` 个到达快照为：
 
 ```text
-U_old = 上一版本 update token ids
-U_new = 本次完整快照
-L = LCP(U_old, U_new)
-C_U = min(旧 Update 已计算进度, L)
+U_(i-1) = 上一条到达的 Update 快照
+U_i     = 当前到达的完整 Update 快照
+L_i     = LCP(U_(i-1), U_i)
 ```
 
-LCP 只在 Update source 内计算：
+`L_i` 只在 Update source 内计算，不包含 prefix/template，也不包含 Append。
+
+**事件到达时不再覆盖旧 work。** `Request._apply_prompt_stream_update()` 会：
+
+1. 把长期 source 的最新逻辑状态更新为 `U_i`；这个状态用于最终 Question 和
+   P/D transfer 的最终布局。
+2. 追加一个冻结的 `UPDATE` work，内部保存 `update_token_ids=U_i` 与
+   `update_common_prefix_len=L_i`。
+3. 保持已有 `active_work_item` 和 `pending_work_items` 原样；正在计算的
+   `U_(i-1)` 必须先完成，之前排队的更早快照也必须按 FIFO 继续计算。
+4. 不修改 `update_num_computed_tokens`，也不立即截断 `UPDATE` blocks。
+
+因此，`PromptStreamState` 同时保存两种不同事实：
+
+- `source.token_ids`：最新到达、最终应该交给 Question / D 节点的 Update 快照。
+- `update_committed_token_ids` 与 `update_num_computed_tokens`：当前实际写入
+  `UPDATE` KV 域的那一代快照及其真实进度；它可能暂时落后于最新 source。
+
+当 scheduler 真正从 FIFO 队列选中 `U_i` 时，设 `C_old` 是上一代物化快照已经
+写入 UPDATE 域的 token 数，则本 work 的可复用进度为：
 
 ```text
-L = source_local_lcp(U_old, U_new)
+C_i = min(C_old, L_i)
 ```
 
-它不包含 prefix，也不包含 Append。
-
-事件到达后：
-
-1. Update 已提交进度回退到 `C_U`。
-2. KV manager 只截断 `UPDATE` key 在 `L` 之后的 blocks。
-3. `PREFIX_APPEND` blocks 和进度保持不变。
+此时 scheduler 才在 `Request.prepare_prompt_stream_execution()` 之后、KV slots
+分配之前，取出 `take_prompt_stream_update_kv_truncation()` 返回的 `C_i`，只截断
+派生 `UPDATE` key 的尾部 blocks。`PREFIX_APPEND` blocks 和进度始终保持不变。
 
 本轮 worker 执行视图是：
 
 ```text
-token ids          = PA_physical + U_new
-num_computed       = len(PA_physical) + C_U
+token ids          = PA_physical + U_i
+num_computed       = len(PA_physical) + C_i
 worker block table = PREFIX_APPEND blocks + UPDATE blocks
 write segment      = UPDATE
 ```
 
-本次需要 prefill 的 tokens 是：
+本次真正需要 prefill 的 tokens 是：
 
 ```text
-U_new[C_U:]
+U_i[C_i:]
 ```
 
 它使用的 KV 前缀是：
 
 ```text
-PA_physical KV + U_new[:C_U] KV
+PA_physical KV + U_i[:C_i] KV
 ```
 
-这里 `L` 是 Update 域允许保留的语义上界，`C_U` 才是已经真实写入 KV、可以
-直接复用的进度。如果旧版本只完成了一部分 prefill，即使这一部分都落在 LCP
-内，也只能从实际完成位置继续计算。
+如果 `U_i` 是 `U_(i-1)` 的严格前缀，`C_i == len(U_i)`，就没有新 token 要
+forward。状态机仍会完成这次仅截断的切换、更新 `update_committed_token_ids`，
+并继续取下一个 work 或 Question，不能留下一个零 token 的 active work。
 
 普通全局 `truncate_blocks_from_position(request_id, global_lcp)` fallback 已经
 完全删除。即使 Update 当前还没有 blocks，截断也只会对派生 Update key 做
@@ -515,6 +530,196 @@ Question 完成后，decode barrier 才打开。判断条件不再只看一个�
 - 当前 Update 快照全部提交。
 - Question 全部提交。
 - 当前物理 prompt 已全部完成 prefill。
+
+## PROMPT_FINISHED 的同步顺序
+
+当前源码里的同步不是靠 REST handler 阻塞，也不是靠 `SOURCE_FINISHED` 事件把
+所有来源统一 join，而是靠长期 `Request` 内部的 work item 队列和 decode
+barrier 一起完成。
+
+事件进入 scheduler 时分两种情况：
+
+- 如果 `request_id` 已经存在，`Scheduler.add_request()` 会调用
+  `_apply_prompt_stream_request(existing, incoming)`，把临时 `incoming`
+  事件应用到长期 `existing Request` 上。临时 `Request` 不保存长期状态。
+- 如果是新的 prompt stream 请求，则先对这个请求执行
+  `request.apply_prompt_stream_event()`，再进入 `waiting` 队列。
+
+`SOURCE_FINISHED` 的作用很轻：`Request._mark_prompt_source_finished()` 只把对应
+source 的 `finished=True` 写入长期状态。它不会新增 work item，也不会等待这个
+source 已经提交的最后一个 chunk prefill 完成。因此 `SOURCE_FINISHED` 更像
+输入侧的“这个 source 不会再来了”，不是 GPU 计算侧的完成通知。
+
+`PROMPT_FINISHED` 到达后，`Request._mark_prompt_stream_finished()` 会：
+
+- 校验最终用户问题 `Q` 非空。
+- 把 `Q` 写入 `prompt_stream.suffix_token_ids`。
+- 设置 `prompt_stream.finished=True`。
+- 将 `question_num_computed_tokens` 重置为 0。
+- 刷新逻辑 prompt revision，但不直接进入 decode。
+
+真正的顺序控制发生在 `Request._select_prompt_stream_execution_view()`：
+
+- 如果当前有 `active_work_item`，继续完成它。
+- 如果没有 active，但 `pending_work_items` 里还有 Append / Update，则先取队首
+  work item 计算。
+- 只有当 `active_work_item is None` 且 `pending_work_items` 为空，并且
+  `prompt_stream.finished=True` 时，Question 才会被组装成
+  `PA_physical + U + Q` 进入 `QUESTION` phase。
+
+也就是说，如果某个 Append / Update chunk 已经被 P 节点 ack 并写入长期
+`Request`，即使它的 prefill 还在 running 或 waiting，后来的
+`PROMPT_FINISHED` 也不会越过它。finish 只会把 Question 挂到状态里，等前面
+已经进入状态机的 source work item 完成后再计算 Question。
+
+decode barrier 由 `Request.can_decode_from_prompt_stream()` 控制。它要求：
+
+- `prompt_stream.finished=True`。
+- 没有 `active_work_item`。
+- `pending_work_items` 为空。
+- `prefix_append_committed_logical_len` 已追上最终 PA 逻辑长度。
+- `prefix_append_num_computed_tokens` 已追上 PA 物理长度，包括 padding。
+- `update_num_computed_tokens` 已追上当前 Update 长度。
+- `question_num_computed_tokens` 已追上最终 Question 长度。
+- `num_computed_tokens >= num_prompt_tokens`。
+
+`Scheduler._cap_prompt_stream_num_new_tokens()` 还会在
+`PROMPT_FINISHED` 之前把本轮调度 token 数裁剪到剩余 prompt 范围内，避免请求
+在输入未封口时跨入 decode。worker 为中间阶段顺手采样出的 token 会在
+`Request.should_discard_prompt_stream_sampled_tokens()` 为 True 时被 scheduler
+丢弃。
+
+当前边界也要明确：scheduler 只能等待**已经到达并成功 ack 到长期 Request 的
+事件**。如果某个 source 的最后一个 chunk 因网络或前端时序原因还没有发到 P，
+而 `PROMPT_FINISHED` 已经先到，scheduler 无法知道那个未来 chunk 的存在。这个
+顺序必须由 proxy / frontend 保证：所有要纳入回答的 source event 收到 P ack
+后，再发送 `PROMPT_FINISHED`。
+
+## active_work_item 和 pending_work_items 如何维护
+
+`active_work_item` 和 `pending_work_items` 都保存在长期
+`PromptStreamState` 中。它们不是 vLLM 全局 scheduler 的三个请求队列，而是
+**单个逻辑 Request 内部的流式 prompt 小队列**。
+
+两个字段的职责不同：
+
+- `pending_work_items` 表示已经到达、已经应用到长期 `Request`，但还没有被这个
+  Request 内部状态机选中计算的 Append / Update 工作。
+- `active_work_item` 表示当前已经被选中、正在 chunked prefill 的那一项工作。
+  一个 work item 进入 active 后，中途不会因为 Question 到达而被普通插队。
+
+Append 事件到达时，`Request._apply_prompt_stream_append()` 会先更新 source 状态
+和请求级 `append_token_ids`。如果事件里有 token，就追加一个
+`PREFIX_APPEND` work item 到 `pending_work_items`：
+
+```text
+pending_work_items.append(PREFIX_APPEND work)
+```
+
+这个 work item 记录目标 `prefix_append_logical_len`。它不会立即覆写
+`PREFIX_APPEND` 尾部 padding，只有后续真正被 scheduler 选中时才开始写 KV。
+
+Update 事件到达时，`Request._apply_prompt_stream_update()` 会先计算相邻快照的
+source-local LCP，但**不会**回退当前 `update_num_computed_tokens`，也不会调用
+任何“丢弃旧 Update work”的函数。它会把下面两个值冻结到一个新的队尾
+`UPDATE` work：
+
+```text
+work_item.update_token_ids          = 本次 U_i 完整快照
+work_item.update_common_prefix_len  = LCP(U_(i-1), U_i)
+```
+
+已有队列和当前执行状态都保留：
+
+- `pending_work_items` 中所有旧 Update work 都继续保留，按原到达顺序计算。
+- `active_work_item` 如果正是旧 Update，也继续使用自己的冻结快照完成，不会被
+  新事件置空。
+- Append work 也保留；Append 与 Update 仍在同一个请求内 FIFO 竞争。
+- 新 Update 到达时不截断 blocks。这样旧 active Update 的 KV 前缀不会被提前
+  释放，worker 也不会被迫从一个不匹配的新视图继续执行。
+
+`source.token_ids` 会立即变为最新 `U_i`，但 `update_committed_token_ids` 仍指向
+当前实际物化在 UPDATE KV 域的旧快照。这两个状态在存在排队 Update 时可以不同，
+是“保留所有历史 work”所必需的区分。
+
+每轮 scheduler 准备执行视图时，会调用
+`Request.prepare_prompt_stream_execution()`，内部再调用
+`_select_prompt_stream_execution_view()` 和 `_start_next_prompt_stream_work_item()`。
+这里维护从 pending 到 active 的迁移：
+
+- 如果固定模板还没有 bootstrap 完，先创建或继续一个 `PREFIX_APPEND` active
+  work，用来计算模板 KV。
+- 如果已经有 `active_work_item`，直接继续它，不从 pending 里取新任务。
+- 如果没有 active 且 pending 非空，从 `pending_work_items.popleft()` 取一个
+  work item，放入 `active_work_item`。
+
+取出 Append work 时，会把它的起始计算位置设成
+`prefix_append_committed_logical_len`。这表示新 Append 从已经稳定提交的 PA
+逻辑尾部开始写，并覆盖旧 padding。
+
+取出 Update work 时，它的 Update 快照已经在**事件到达时**冻结；这里仅冻结它
+当前能看到的 PA 快照，并根据当前 UPDATE 域的真实物化进度计算可复用位置：
+
+```text
+work_item.prefix_append_logical_len = prefix_append_committed_logical_len
+work_item.prefix_append_token_ids   = PA_physical(committed_logical_len)
+C_i = min(update_num_computed_tokens, work_item.update_common_prefix_len)
+work_item.num_computed_tokens       = C_i
+```
+
+随后 `Request` 记录 `C_i` 为待处理的 UPDATE 域截断边界。
+`Scheduler._prepare_prompt_stream_execution()` 在这项 work 已经被选中后、
+`allocate_slots()` 之前调用 `take_prompt_stream_update_kv_truncation()`，只释放
+UPDATE segment 在 `C_i` 之后的尾部 blocks。
+
+这个冻结动作有两个作用：如果 Update 先被选中，后面才来的 Append 不会被这个
+Update work 读取；如果 Append 先完成并提交，后续 Update 才会看到新的 PA KV。
+同时，多个 Update work 也不会再都错误读取最新的 source 快照。
+
+forward 完成后，`Scheduler._update_after_schedule()` 会调用
+`Request.advance_prompt_stream_computed_tokens(num_scheduled_tokens)`。这里按当前
+phase 推进进度：
+
+- `PREFIX_APPEND` phase 推进 `prefix_append_num_computed_tokens`。当本 work 的
+  物理 token，包括 padding，都算完后，更新
+  `prefix_append_committed_logical_len`，并把 `active_work_item=None`。
+- `UPDATE` phase 推进当前冻结快照的 `update_num_computed_tokens`。当该快照算完后，
+  把它写入 `update_committed_token_ids`，再把 `active_work_item=None`，从而让下一代
+  Update work 基于这份真实物化 KV 进行 LCP 复用。
+- `QUESTION` phase 推进 `question_num_computed_tokens`。Question 不是
+  `pending_work_items` 中的 work item，它只有在 source work 都清空后才由
+  `prompt_stream.finished=True` 触发。
+
+因此，如果 Question 到达时还有 chunk 正在 prefill，状态会是：
+
+```text
+active_work_item = 某个 Append 或 Update
+pending_work_items = 后面尚未被选中的 Append / Update
+prompt_stream.finished = true
+suffix_token_ids = Q
+```
+
+下一轮 scheduler 仍然先继续 active，再消费 pending。只有当：
+
+```text
+active_work_item is None
+pending_work_items 为空
+```
+
+并且 Question 尚未算完时，才会切换到 `QUESTION` phase。
+
+preemption 时会走 `Request.reset_prompt_stream_computed_state()`。它会清空
+`active_work_item` 和 `pending_work_items`，把物理计算进度归零，但保留长期
+source 状态。随后按当前逻辑快照重建安全顺序：
+
+```text
+如果已有 Append token，加入一个 PREFIX_APPEND work
+如果已有 Update token，加入一个 UPDATE work
+```
+
+这个 replay 顺序牺牲了原始交错信息，但保证被释放的 KV blocks 不会被错误复用。
+它是正常事件路径“保留所有已入队 Update work”的唯一例外：preemption 已经释放了
+物理 KV，当前恢复策略只能从最新逻辑快照安全重建。
 
 ## Append 在 Update 之后到达
 

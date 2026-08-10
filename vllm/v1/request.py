@@ -64,17 +64,21 @@ class PromptStreamWorkItem:
     并按进入 Request 的顺序进入同一个队列。这样二者不再由阶段选择函数的
     固定优先级决定。
 
-    对 Update，`prefix_append_token_ids` 在 work item 被 scheduler 选中时
-    冻结。因此在 Update 后到达、但尚未被调度的 Append chunk 不会悄悄进入
-    这次 Update 的 attention 上下文。
+    对 Update，`update_token_ids` 在事件到达时冻结，`prefix_append_token_ids`
+    则在 work item 被 scheduler 选中时冻结。前者保证多个 Update 快照会按
+    到达顺序逐个计算，后者保证 Update 后到达、但尚未被调度的 Append chunk
+    不会悄悄进入这次 Update 的 attention 上下文。
     """
 
     # 本 work item 要写入的物理 KV 域。
     phase: PromptStreamExecutionPhase
     # Append work 完成时 PREFIX_APPEND 应达到的逻辑长度（含固定模板）。
     prefix_append_logical_len: int = 0
-    # Update 被选中时冻结的 update 快照；Append work 为空元组。
-    update_token_ids: tuple[int, ...] = ()
+    # Update 事件到达时冻结的完整快照；None 只表示 PREFIX_APPEND work。
+    update_token_ids: tuple[int, ...] | None = None
+    # 当前快照相对上一条 Update 快照的 source-local LCP。该值既是本 work
+    # 可以复用的 UPDATE KV 上界，也是切换到本 work 时的延后截断位置。
+    update_common_prefix_len: int = 0
     # Update 被选中时冻结的 PREFIX_APPEND 物理 token 视图。
     prefix_append_token_ids: tuple[int, ...] = ()
     # 当前 work item 已完成的 segment-local token 数。
@@ -143,14 +147,8 @@ class PromptStreamMutation:
     new_num_prompt_tokens: int
     # 仅用于统计和调试的逻辑 prompt 公共前缀长度。
     common_prefix_len: int
-    # 已经 prefill 过但现在失效的 segment 内 token 数。
-    num_tokens_to_invalidate: int
     # 每次 prompt 真实变化都递增，后面防止 scheduler 用旧状态 decode。
     prompt_revision: int
-    # 需要按 segment 粒度截断的 KV 域；None 表示不需要释放 block。
-    kv_segment_to_truncate: PromptStreamKVSegment | None = None
-    # segment 内部可以安全保留的 token 数，只在 kv_segment_to_truncate 非空时使用。
-    kv_segment_keep_tokens: int = 0
 
     @classmethod
     def noop(
@@ -164,7 +162,6 @@ class PromptStreamMutation:
             old_num_prompt_tokens=num_prompt_tokens,
             new_num_prompt_tokens=num_prompt_tokens,
             common_prefix_len=num_prompt_tokens,
-            num_tokens_to_invalidate=0,
             prompt_revision=prompt_revision,
         )
 
@@ -219,6 +216,9 @@ class PromptStreamState:
     prefix_append_num_computed_tokens: int = 0
     # 当前 update 快照已经完成 prefill 的 token 数。
     update_num_computed_tokens: int = 0
+    # 当前实际物化到 UPDATE KV 域的完整快照。它可能落后于 source.token_ids，
+    # 因为后到 Update work 会先在 pending 队列中等待前一代快照完成。
+    update_committed_token_ids: list[int] = field(default_factory=list)
     # 最终用户问题已经完成 prefill 的 token 数。
     question_num_computed_tokens: int = 0
     # scheduler 首次准备执行视图后记录的统一 block size。
@@ -236,6 +236,9 @@ class PromptStreamState:
     # 当前正在 chunked prefill 的 work item；一个 work item 中途不可切换，
     # 防止覆写 PREFIX_APPEND 尾部 padding 后再用旧 padding 作为 Update 前缀。
     active_work_item: PromptStreamWorkItem | None = None
+    # 下一次选中 Update work 时需要执行的 UPDATE 域截断边界。事件到达时不
+    # 立刻释放块，避免破坏仍在运行或排队等待的旧 Update work。
+    pending_update_kv_truncation_keep_tokens: int | None = None
 
 
 @dataclass(frozen=True)
@@ -624,6 +627,26 @@ class Request:
             return 0
         return self.prompt_stream.revision
 
+    def take_prompt_stream_update_kv_truncation(self) -> int | None:
+        """取出本轮选中 Update work 需要的 UPDATE KV 截断边界。
+
+        Update 事件到达时只把不可变快照追加到请求内队列，不能立即截断
+        UPDATE blocks，否则仍在执行的上一代 Update work 会失去自己的
+        KV 前缀。scheduler 在准备好下一轮执行视图之后调用本方法，并在
+        分配新 slots 之前按返回的 token 边界完成实际截断。
+
+        Returns:
+            UPDATE segment 内应保留的 token 数；没有待处理截断时返回 None。
+
+        Side Effects:
+            成功读取后清空暂存边界，保证同一 work 的截断只执行一次。
+        """
+        if self.prompt_stream is None:
+            return None
+        keep_tokens = self.prompt_stream.pending_update_kv_truncation_keep_tokens
+        self.prompt_stream.pending_update_kv_truncation_keep_tokens = None
+        return keep_tokens
+
     def apply_prompt_stream_event(
         self,
         event: PromptStreamEvent,
@@ -631,9 +654,9 @@ class Request:
         """应用一次流式 prompt 事件，并返回对调度层有用的变化摘要。
 
         这个方法是 scheduler 面向流式 prompt 的主入口。scheduler 不需要
-        理解 append、update、source finished 的内部语义，只需要根据返回的
-        `PromptStreamMutation` 决定是否释放失效 KV、是否继续 prefill，以及
-        什么时候允许 decode。
+        理解 append、update、source finished 的内部语义；它只需根据返回的
+        `PromptStreamMutation` 更新请求状态，并在 work 被真正选中时处理
+        对应的 segment KV 变化。
 
         Args:
             event: 本次入站的流式 prompt 事件。
@@ -788,27 +811,24 @@ class Request:
         prompt_stream.source_order.append(event.source_id)
         return source
 
-    def _discard_prompt_stream_update_work(self) -> None:
-        """丢弃被新 update 快照取代的排队/执行 work item。
+    def _record_prompt_stream_update_kv_truncation(self, keep_tokens: int) -> None:
+        """记录下一代 Update work 开始前的延后 UPDATE KV 截断。
 
-        Update 的 KV 只允许复用当前 source 内 LCP。新快照一旦到达，旧快照
-        对应的 work item 即使尚未写完也不能继续提交；scheduler 会在下一轮
-        用新的 work item 和更新后的 UPDATE segment 重新建立执行视图。
+        Args:
+            keep_tokens: 当前物化快照和下一代快照可安全复用的 token 前缀长度。
+
+        Raises:
+            ValueError: 当截断边界为负数时抛出，保护 segment-local 进度不变量。
         """
+        if keep_tokens < 0:
+            raise ValueError(
+                "Prompt stream UPDATE KV truncation boundary must be non-negative: "
+                f"request_id={self.request_id}, keep_tokens={keep_tokens}."
+            )
         prompt_stream = self._ensure_prompt_stream_state()
-        prompt_stream.pending_work_items = deque(
-            work_item
-            for work_item in prompt_stream.pending_work_items
-            if work_item.phase != PromptStreamExecutionPhase.UPDATE
-        )
-        if (
-            prompt_stream.active_work_item is not None
-            and prompt_stream.active_work_item.phase
-            == PromptStreamExecutionPhase.UPDATE
-        ):
-            prompt_stream.active_work_item = None
-            self.prompt_stream_execution_view = None
-            self.prompt_stream_needs_worker_refresh = True
+        # 每次只会有一个 active Update work。若连续处理纯截断的零 token work，
+        # 后一个 work 的 LCP 不会超过前一个快照长度，覆盖为最新边界即可。
+        prompt_stream.pending_update_kv_truncation_keep_tokens = keep_tokens
 
     def _apply_prompt_stream_append(
         self,
@@ -914,7 +934,6 @@ class Request:
             new_update_token_ids,
         )
         old_prompt_token_ids = self._rebuild_prompt_from_stream_state()
-        old_update_num_computed_tokens = prompt_stream.update_num_computed_tokens
         source.token_ids = new_update_token_ids
         source.version = event.version
         source.next_sequence_no += 1
@@ -924,32 +943,21 @@ class Request:
 
         # Update 只在来源内部做 LCP。这里不把 prefix/template 或 append
         # 纳入公共前缀比较，否则 append 到达会错误扩大 update 的可复用范围。
-        # 新快照到来会取消尚未开始或正在执行的旧 Update work；后续由最新
-        # work item 在真正获调度时冻结它看到的 PREFIX_APPEND 快照。
-        prompt_stream.update_num_computed_tokens = min(
-            old_update_num_computed_tokens,
-            update_common_prefix_len,
-        )
-        self._discard_prompt_stream_update_work()
-        if len(new_update_token_ids) > update_common_prefix_len:
+        #
+        # 关键不变量：新快照绝不能取消旧 Update work。active work 仍要使用
+        # 已冻结的旧快照继续写完；pending work 也必须按到达顺序逐个计算。
+        # 因此不能在这里回退全局 update 进度或截断 UPDATE blocks。两项操作
+        # 都会延后到对应 work 被 scheduler 选中、前一代已完整物化之后执行。
+        if new_update_token_ids != old_update_token_ids:
             prompt_stream.pending_work_items.append(
                 PromptStreamWorkItem(
                     phase=PromptStreamExecutionPhase.UPDATE,
+                    update_token_ids=tuple(new_update_token_ids),
+                    update_common_prefix_len=update_common_prefix_len,
                 )
             )
 
-        mutation = self._sync_prompt_from_stream_state(old_prompt_token_ids)
-        # KV 释放只发生在 UPDATE segment。KV manager 会按 block 粒度释放
-        # `update_common_prefix_len` 之后的 blocks；如果 LCP 落在半个 block
-        # 内，会保留包含 LCP 的整块，后续 forward 从 token 级进度继续覆盖。
-        mutation.kv_segment_to_truncate = PromptStreamKVSegment.UPDATE
-        mutation.kv_segment_keep_tokens = update_common_prefix_len
-        mutation.num_tokens_to_invalidate = max(
-            0,
-            old_update_num_computed_tokens - update_common_prefix_len,
-        )
-        prompt_stream.total_tokens_invalidated += mutation.num_tokens_to_invalidate
-        return mutation
+        return self._sync_prompt_from_stream_state(old_prompt_token_ids)
 
     def _mark_prompt_source_finished(
         self,
@@ -1227,18 +1235,40 @@ class Request:
                 )
                 return
 
-        if not prompt_stream.pending_work_items:
-            return
+        # 一个 Update 快照可能只是上一代的严格前缀，此时只需要截断而不需要
+        # forward。循环会同步提交这种零 token work，随后继续寻找真正需要计算
+        # 的 work，避免把它留成永远无法 advance 的 active work。
+        while prompt_stream.pending_work_items:
+            work_item = prompt_stream.pending_work_items.popleft()
+            if work_item.phase == PromptStreamExecutionPhase.PREFIX_APPEND:
+                # 新 Append 从已提交的逻辑末尾开始写，复用该位置之后的旧 padding
+                # 槽位。一个 Append work 开始后必须运行到新的 block 边界，不能
+                # 在半个 block 内切给 Update。
+                work_item.num_computed_tokens = (
+                    prompt_stream.prefix_append_committed_logical_len
+                )
+                prompt_stream.active_work_item = work_item
+                return
 
-        work_item = prompt_stream.pending_work_items.popleft()
-        if work_item.phase == PromptStreamExecutionPhase.PREFIX_APPEND:
-            # 新 Append 从已提交的逻辑末尾开始写，复用该位置之后的旧 padding
-            # 槽位。一个 Append work 开始后必须运行到新的 block 边界，不能
-            # 在半个 block 内切给 Update。
-            work_item.num_computed_tokens = (
-                prompt_stream.prefix_append_committed_logical_len
-            )
-        else:
+            # Update 快照必须在事件到达时已经冻结；若这里缺失，说明某条控制流
+            # 绕过了 _apply_prompt_stream_update()，继续执行会把旧 work 错算成
+            # 最新 source 快照，因此直接 fail closed。
+            update_token_ids = work_item.update_token_ids
+            if update_token_ids is None:
+                raise RuntimeError(
+                    "Prompt stream UPDATE work is missing its frozen snapshot: "
+                    f"request_id={self.request_id}."
+                )
+            if not 0 <= work_item.update_common_prefix_len <= len(
+                update_token_ids
+            ):
+                raise RuntimeError(
+                    "Prompt stream UPDATE work has an invalid source-local LCP: "
+                    f"request_id={self.request_id}, "
+                    f"lcp={work_item.update_common_prefix_len}, "
+                    f"snapshot_len={len(update_token_ids)}."
+                )
+
             # Update 在真正获调度时才冻结可见的 PREFIX_APPEND。此刻仍在队列
             # 里的 Append 尚未写入 KV，因此不会被拼到该次 Update 前缀中。
             committed_logical_len = prompt_stream.prefix_append_committed_logical_len
@@ -1246,11 +1276,33 @@ class Request:
             work_item.prefix_append_token_ids = tuple(
                 self._get_prefix_append_physical_token_ids(committed_logical_len)
             )
-            work_item.update_token_ids = tuple(
-                self._get_prompt_stream_segment_token_ids(PromptSourceType.UPDATE)
+
+            # UPDATE KV 域仍保存上一代已经物化的快照。只能复用“上一代实际
+            # 已计算进度”和“相邻 Update 快照 LCP”两者都覆盖的部分。
+            old_update_num_computed_tokens = prompt_stream.update_num_computed_tokens
+            work_item.num_computed_tokens = min(
+                old_update_num_computed_tokens,
+                work_item.update_common_prefix_len,
             )
-            work_item.num_computed_tokens = prompt_stream.update_num_computed_tokens
-        prompt_stream.active_work_item = work_item
+            prompt_stream.update_num_computed_tokens = work_item.num_computed_tokens
+            self._record_prompt_stream_update_kv_truncation(
+                work_item.num_computed_tokens
+            )
+            prompt_stream.total_tokens_invalidated += max(
+                0,
+                old_update_num_computed_tokens - work_item.num_computed_tokens,
+            )
+
+            if work_item.num_computed_tokens >= len(update_token_ids):
+                # 严格前缀或内容完全相同的下一代快照没有 delta prefill；仍需
+                # 把逻辑上的 UPDATE KV 状态切换到该快照，并让 scheduler 完成
+                # 延后截断，然后继续消费后续 work / Question。
+                prompt_stream.update_num_computed_tokens = len(update_token_ids)
+                prompt_stream.update_committed_token_ids = list(update_token_ids)
+                continue
+
+            prompt_stream.active_work_item = work_item
+            return
 
     def _select_prompt_stream_execution_view(
         self,
@@ -1282,10 +1334,12 @@ class Request:
                     segment_offset=0,
                 )
 
-            # Update delta 基于获调度时冻结的 PREFIX_APPEND KV 和 update 源内
-            # LCP KV。新 KV 仍然只写入 UPDATE segment。
+            # Update delta 基于获调度时冻结的 PREFIX_APPEND KV 和 work 自己
+            # 保存的 source-local LCP KV。新 KV 仍然只写入 UPDATE segment。
+            update_token_ids = active_work_item.update_token_ids
+            assert update_token_ids is not None
             execution_token_ids = list(active_work_item.prefix_append_token_ids) + list(
-                active_work_item.update_token_ids
+                update_token_ids
             )
             prefix_append_physical_len = len(active_work_item.prefix_append_token_ids)
             return PromptStreamExecutionView(
@@ -1476,11 +1530,13 @@ class Request:
                 0,
                 new_num_computed_tokens - view.segment_offset,
             )
-            update_len = (
-                len(active_work_item.update_token_ids)
-                if active_work_item is not None
-                else self.get_prompt_stream_update_len()
-            )
+            if active_work_item is not None:
+                update_token_ids = active_work_item.update_token_ids
+                assert update_token_ids is not None
+                update_len = len(update_token_ids)
+            else:
+                update_token_ids = None
+                update_len = self.get_prompt_stream_update_len()
             local_num_computed_tokens = min(
                 local_num_computed_tokens,
                 update_len,
@@ -1489,6 +1545,10 @@ class Request:
             if active_work_item is not None:
                 active_work_item.num_computed_tokens = local_num_computed_tokens
                 if local_num_computed_tokens >= update_len:
+                    # 到这里该 Update work 的完整快照已经真实写入 UPDATE 域，
+                    # 才能推进 committed 状态并允许下一代 work 复用其 LCP。
+                    assert update_token_ids is not None
+                    prompt_stream.update_committed_token_ids = list(update_token_ids)
                     prompt_stream.active_work_item = None
         else:
             local_num_computed_tokens = max(
@@ -1511,11 +1571,13 @@ class Request:
         prompt_stream = self.prompt_stream
         prompt_stream.prefix_append_num_computed_tokens = 0
         prompt_stream.update_num_computed_tokens = 0
+        prompt_stream.update_committed_token_ids.clear()
         prompt_stream.question_num_computed_tokens = 0
         prompt_stream.prefix_append_committed_logical_len = 0
         prompt_stream.prefix_append_bootstrap_completed = False
         prompt_stream.active_work_item = None
         prompt_stream.pending_work_items.clear()
+        prompt_stream.pending_update_kv_truncation_keep_tokens = None
 
         # Preemption 会释放两个物理域的 blocks。重新执行时不能重放已经丢失的
         # 到达交错，只能以当前逻辑快照构造安全顺序：Append 完整追平后再算 Update。
@@ -1528,10 +1590,15 @@ class Request:
                     ),
                 )
             )
-        if self.get_prompt_stream_update_len() > 0:
+        update_token_ids = self._get_prompt_stream_segment_token_ids(
+            PromptSourceType.UPDATE
+        )
+        if update_token_ids:
             prompt_stream.pending_work_items.append(
                 PromptStreamWorkItem(
                     phase=PromptStreamExecutionPhase.UPDATE,
+                    update_token_ids=tuple(update_token_ids),
+                    update_common_prefix_len=0,
                 )
             )
 
@@ -1565,8 +1632,8 @@ class Request:
             old_prompt_token_ids: 修改流式状态前的逻辑 prompt token。
 
         Returns:
-            本次逻辑变化的统计摘要。KV 截断边界由事件处理函数按 segment
-            单独填写，绝不回退到全局连续 prompt 截断。
+            本次逻辑变化的统计摘要。Update KV 的截断不会在事件处理函数中
+            立即发生，而是由 scheduler 在对应 work 被选中时按 segment 执行。
         """
         assert self.prompt_stream is not None
         new_prompt_token_ids = self._rebuild_prompt_from_stream_state()
@@ -1590,7 +1657,6 @@ class Request:
             old_num_prompt_tokens=old_num_prompt_tokens,
             new_num_prompt_tokens=len(new_prompt_token_ids),
             common_prefix_len=common_prefix_len,
-            num_tokens_to_invalidate=0,
             prompt_revision=self.prompt_stream.revision,
         )
 

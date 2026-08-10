@@ -390,7 +390,7 @@ def test_interleaved_append_sources_keep_global_tail_order() -> None:
 
 
 def test_update_uses_source_local_lcp() -> None:
-    """Update 版本变化只回退 UPDATE 域内 LCP 后缀。"""
+    """下一代 Update 在被选中时才按 source-local LCP 复用和截断 KV。"""
     request = _make_request([1, 2, 3, 4])
     _start_request(request)
     _finish_active_view(request)
@@ -404,6 +404,7 @@ def test_update_uses_source_local_lcp() -> None:
         )
     )
     request.prepare_prompt_stream_execution(4)
+    assert request.take_prompt_stream_update_kv_truncation() == 0
     _finish_active_view(request)
 
     mutation = request.apply_prompt_stream_event(
@@ -416,18 +417,183 @@ def test_update_uses_source_local_lcp() -> None:
             sequence_no=1,
         )
     )
-    assert mutation.kv_segment_to_truncate == PromptStreamKVSegment.UPDATE
-    assert mutation.kv_segment_keep_tokens == 1
-    assert mutation.num_tokens_to_invalidate == 2
+    # 事件到达只追加冻结快照，不得提前回退旧 UPDATE work 的真实进度。
+    assert mutation.applied
     assert request.prompt_stream is not None
-    assert request.prompt_stream.update_num_computed_tokens == 1
+    assert request.prompt_stream.update_num_computed_tokens == 3
+    assert request.prompt_stream.update_committed_token_ids == [10, 11, 12]
+    assert len(request.prompt_stream.pending_work_items) == 1
+    pending_work_item = request.prompt_stream.pending_work_items[0]
+    assert pending_work_item.update_token_ids == (10, 13, 14)
+    assert pending_work_item.update_common_prefix_len == 1
 
     request.prepare_prompt_stream_execution(4)
     view = request.prompt_stream_execution_view
     assert view is not None
     assert view.phase == PromptStreamExecutionPhase.UPDATE
     assert view.num_computed_tokens == 5
+    assert request.take_prompt_stream_update_kv_truncation() == 1
     assert request.num_tokens - request.num_computed_tokens == 2
+
+
+def test_pending_update_snapshots_are_computed_in_arrival_order() -> None:
+    """多个 pending Update 必须各自使用到达时冻结的快照。"""
+    request = _make_request([1, 2, 3, 4])
+    _start_request(request)
+    _finish_active_view(request)
+
+    # 两代 Update 在第一次被 scheduler 选中前连续到达。
+    request.apply_prompt_stream_event(
+        _make_event(
+            PromptStreamEventType.UPDATE,
+            [10, 11, 12],
+            source_id="update",
+            source_type=PromptSourceType.UPDATE,
+        )
+    )
+    request.apply_prompt_stream_event(
+        _make_event(
+            PromptStreamEventType.UPDATE,
+            [10, 13, 14],
+            source_id="update",
+            source_type=PromptSourceType.UPDATE,
+            version=1,
+            sequence_no=1,
+        )
+    )
+
+    assert request.prompt_stream is not None
+    pending_update_snapshots = [
+        work_item.update_token_ids
+        for work_item in request.prompt_stream.pending_work_items
+    ]
+    assert pending_update_snapshots == [(10, 11, 12), (10, 13, 14)]
+
+    # 先完整计算 U0，而不是错误地把它替换成最新的 U1。
+    request.prepare_prompt_stream_execution(4)
+    view = request.prompt_stream_execution_view
+    assert view is not None
+    assert list(view.token_ids) == [1, 2, 3, 4, 10, 11, 12]
+    assert view.num_computed_tokens == 4
+    assert request.take_prompt_stream_update_kv_truncation() == 0
+    _finish_active_view(request)
+
+    # U1 只复用相邻 U0 的一个 source-local LCP token。
+    request.prepare_prompt_stream_execution(4)
+    view = request.prompt_stream_execution_view
+    assert view is not None
+    assert list(view.token_ids) == [1, 2, 3, 4, 10, 13, 14]
+    assert view.num_computed_tokens == 5
+    assert request.take_prompt_stream_update_kv_truncation() == 1
+    _finish_active_view(request)
+
+    assert request.prompt_stream.update_committed_token_ids == [10, 13, 14]
+
+
+def test_active_update_is_not_discarded_by_later_snapshot() -> None:
+    """新 Update 到达时，正在计算的旧 Update 必须继续完成。"""
+    request = _make_request([1, 2, 3, 4])
+    _start_request(request)
+    _finish_active_view(request)
+
+    request.apply_prompt_stream_event(
+        _make_event(
+            PromptStreamEventType.UPDATE,
+            [10, 11, 12],
+            source_id="update",
+            source_type=PromptSourceType.UPDATE,
+        )
+    )
+    request.prepare_prompt_stream_execution(4)
+    assert request.take_prompt_stream_update_kv_truncation() == 0
+    request.advance_prompt_stream_computed_tokens(1)
+
+    # U0 只完成一个 token 时，U1 到达。U0 不能被置空，也不能被截断。
+    request.apply_prompt_stream_event(
+        _make_event(
+            PromptStreamEventType.UPDATE,
+            [10, 13, 14],
+            source_id="update",
+            source_type=PromptSourceType.UPDATE,
+            version=1,
+            sequence_no=1,
+        )
+    )
+    assert request.prompt_stream is not None
+    active_work_item = request.prompt_stream.active_work_item
+    assert active_work_item is not None
+    assert active_work_item.update_token_ids == (10, 11, 12)
+    assert active_work_item.num_computed_tokens == 1
+    assert len(request.prompt_stream.pending_work_items) == 1
+    assert request.prompt_stream.pending_work_items[0].update_token_ids == (10, 13, 14)
+
+    # 当前 execution view 仍然是 U0；它必须先完成自己的剩余两个 token。
+    request.prepare_prompt_stream_execution(4)
+    view = request.prompt_stream_execution_view
+    assert view is not None
+    assert list(view.token_ids) == [1, 2, 3, 4, 10, 11, 12]
+    _finish_active_view(request)
+
+    # 下一轮才切换到 U1，并按 LCP=1 重用 UPDATE KV。
+    request.prepare_prompt_stream_execution(4)
+    view = request.prompt_stream_execution_view
+    assert view is not None
+    assert list(view.token_ids) == [1, 2, 3, 4, 10, 13, 14]
+    assert view.num_computed_tokens == 5
+    assert request.take_prompt_stream_update_kv_truncation() == 1
+
+
+def test_strict_prefix_update_commits_without_zero_token_deadlock() -> None:
+    """严格前缀 Update 必须完成纯截断状态转换，不能留下零 token active work。"""
+    request = _make_request([1, 2, 3, 4])
+    _start_request(request)
+    _finish_active_view(request)
+
+    request.apply_prompt_stream_event(
+        _make_event(
+            PromptStreamEventType.UPDATE,
+            [10, 11, 12],
+            source_id="update",
+            source_type=PromptSourceType.UPDATE,
+        )
+    )
+    request.prepare_prompt_stream_execution(4)
+    assert request.take_prompt_stream_update_kv_truncation() == 0
+    _finish_active_view(request)
+
+    request.apply_prompt_stream_event(
+        _make_event(
+            PromptStreamEventType.UPDATE,
+            [10, 11],
+            source_id="update",
+            source_type=PromptSourceType.UPDATE,
+            version=1,
+            sequence_no=1,
+        )
+    )
+    request.prepare_prompt_stream_execution(4)
+
+    assert request.prompt_stream is not None
+    assert request.prompt_stream.active_work_item is None
+    assert not request.prompt_stream.pending_work_items
+    assert request.prompt_stream.update_num_computed_tokens == 2
+    assert request.prompt_stream.update_committed_token_ids == [10, 11]
+    assert request.take_prompt_stream_update_kv_truncation() == 2
+
+    request.apply_prompt_stream_event(
+        _make_event(
+            PromptStreamEventType.PROMPT_FINISHED,
+            [20],
+            source_id="question",
+            source_type=None,
+        )
+    )
+    request.prepare_prompt_stream_execution(4)
+    view = request.prompt_stream_execution_view
+    assert view is not None
+    assert view.phase == PromptStreamExecutionPhase.QUESTION
+    _finish_active_view(request)
+    assert request.can_decode_from_prompt_stream()
 
 
 def test_preemption_replays_all_segments() -> None:
@@ -591,7 +757,7 @@ def test_update_truncation_never_frees_prefix_append_blocks() -> None:
     _finish_active_view(request)
     pa_block_ids_before = manager.get_blocks(request.request_id).get_block_ids()
 
-    mutation = request.apply_prompt_stream_event(
+    request.apply_prompt_stream_event(
         _make_event(
             PromptStreamEventType.UPDATE,
             [10, 20],
@@ -601,15 +767,19 @@ def test_update_truncation_never_frees_prefix_append_blocks() -> None:
             sequence_no=1,
         )
     )
-    assert mutation.kv_segment_to_truncate == PromptStreamKVSegment.UPDATE
+
+    # 事件到达时旧 UPDATE blocks 必须保留；切换到新 work 后才执行截断。
+    update_key = request.get_prompt_stream_segment_key(PromptStreamKVSegment.UPDATE)
+    assert [len(group) for group in manager.get_blocks(update_key).blocks] == [2]
+    request.prepare_prompt_stream_execution(4)
+    assert request.take_prompt_stream_update_kv_truncation() == 1
     manager.truncate_prompt_stream_segment_blocks(
         request,
-        mutation.kv_segment_to_truncate,
-        mutation.kv_segment_keep_tokens,
+        PromptStreamKVSegment.UPDATE,
+        1,
     )
 
     assert manager.get_blocks(request.request_id).get_block_ids() == pa_block_ids_before
-    update_key = request.get_prompt_stream_segment_key(PromptStreamKVSegment.UPDATE)
     assert [len(group) for group in manager.get_blocks(update_key).blocks] == [1]
 
 

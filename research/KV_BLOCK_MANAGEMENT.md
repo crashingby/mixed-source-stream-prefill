@@ -201,22 +201,35 @@ update_common_prefix_len = self._get_common_prefix_len(
 
 注意：LCP 只比较旧 update 快照和新 update 快照，不包含 prefix/template，也不包含 append。
 
-然后系统会：
-
-- 把 `update_num_computed_tokens` 回退到 `min(old_computed, update_common_prefix_len)`。
-- 只要求 KV manager 截断 UPDATE segment。
-- 保留 PREFIX_APPEND segment 的 blocks 和 computed 进度。
-
-对应源码在 `Request._apply_prompt_stream_update()`：
+每个会改变 token 快照的 Update 事件都会把自身快照和相邻快照的
+source-local LCP 冻结为一个
+`PromptStreamWorkItem`：
 
 ```python
-prompt_stream.update_num_computed_tokens = min(
-    old_update_num_computed_tokens,
-    update_common_prefix_len,
+PromptStreamWorkItem(
+    phase=PromptStreamExecutionPhase.UPDATE,
+    update_token_ids=tuple(new_update_token_ids),
+    update_common_prefix_len=update_common_prefix_len,
 )
-mutation.kv_segment_to_truncate = PromptStreamKVSegment.UPDATE
-mutation.kv_segment_keep_tokens = update_common_prefix_len
 ```
+
+事件到达时不会修改 `update_num_computed_tokens`，也不会立即截断 UPDATE segment。
+这保证仍在运行的旧 Update work 可以使用自己的快照完成。`source.token_ids` 保存
+最新逻辑快照，`update_committed_token_ids` 则保存当前实际写入 UPDATE KV 域的快照。
+
+当 scheduler 选中该 work 时，`Request._start_next_prompt_stream_work_item()` 才计算：
+
+```python
+reusable_tokens = min(
+    prompt_stream.update_num_computed_tokens,
+    work_item.update_common_prefix_len,
+)
+work_item.num_computed_tokens = reusable_tokens
+```
+
+接着 `Scheduler._prepare_prompt_stream_execution()` 在分配 slots 前调用
+`take_prompt_stream_update_kv_truncation()`，仅截断 UPDATE segment 到
+`reusable_tokens`。PREFIX_APPEND segment 的 blocks 和 computed 进度保持不变。
 
 Update 阶段的执行视图是：
 
@@ -375,22 +388,18 @@ Append 到来时不会释放 UPDATE blocks。它只会把 PREFIX_APPEND 的 comp
 
 原因是旧 padding 后续会被真实 append token 覆盖。下一轮 scheduler 会继续给 PREFIX_APPEND 补算新的 append token 和新的 padding。
 
-### Update 到来
+### Update 到来与选中
 
-Update 到来时会只截断 UPDATE segment：
-
-```python
-mutation.kv_segment_to_truncate = PromptStreamKVSegment.UPDATE
-mutation.kv_segment_keep_tokens = update_common_prefix_len
-```
-
-scheduler 收到 mutation 后调用：
+Update 到来时只会更新最新 source 状态并追加一个冻结的 FIFO work，**不会**释放
+任何 UPDATE blocks。只有排在它前面的 Update work 已经完成、它自己被 scheduler
+选中后，才会按该 work 的 source-local LCP 截断 UPDATE segment：
 
 ```python
+keep_tokens = request.take_prompt_stream_update_kv_truncation()
 self.kv_cache_manager.truncate_prompt_stream_segment_blocks(
-    existing,
-    mutation.kv_segment_to_truncate,
-    mutation.kv_segment_keep_tokens,
+    request,
+    PromptStreamKVSegment.UPDATE,
+    keep_tokens,
 )
 ```
 
