@@ -1,8 +1,8 @@
 # Volatility-Aware Bounded Update Coalescing
 
 > **研究定位**：混合来源流式 Prefill 的第二个创新点。
-> **范围**：一个逻辑请求只允许一个单调 Append 源和一个全量快照语义的 Update 源；暂不处理多 Append / Update 源、跨源 KV 排布与跨源公平性。
-> **状态**：完整设计，尚未接入 scheduler。现有系统已经具备分段 KV、冻结 Update work、FIFO 执行与延后 UPDATE KV 截断；本文在此基础上设计 Append-aware（感知 Append 完成）的两阶段 Update 合并层。
+> **范围**：一个逻辑请求至多包含一个单调 Append 源和一个全量快照语义的 Update 源；暂不处理多 Append / Update 源、跨源 KV 排布与跨源公平性。
+> **状态**：第一版源码已经接入配置、Request、Scheduler 与 EngineCore；本次按要求未启动服务、未运行测试。运行时指标与实验验证仍是后续工作。
 
 ## 重构说明：Append-aware 两阶段控制面
 
@@ -130,7 +130,7 @@ $$
 
 此外，`AppendUpdateGateState.append_epoch` 记为 $E_A$，表示当前 Append 上下文版本。严格
 `hold_until_append_finished` 下，最终 Update work 绑定最终 $E_A$；近似早放行模式中，work 则绑定
-它实际开始时可见的 $E_A$。
+它 admission 时已经接受的 $E_A$，并在真正执行前等待该 epoch 物理提交。
 
 
 ### 快照必须完整保存
@@ -152,10 +152,14 @@ $$
 
 只保存旧 LCP 无法判断应复用多少。因此，合并层和每个已放行 Update work 都要保存完整冻结快照，或采用“父快照引用 + LCP 长度 + 后缀 token”这种可以完整还原快照的持久化表示。第一版用不可变 tuple[int, ...] 最清楚。
 
-## 建议的数据模型
+## 数据模型
 
 长期 Request 中保留一个 Update 窗口状态，以及一个轻量 Append gate 状态。前者保存所有 Update
 合并统计；后者只保存 source 完成状态和 Append epoch，绝不保存第二份 Update token 快照。
+
+下面的代码只展示核心关系，是概念精简版；源码中的 dataclass 还包含 source id、
+`committed_append_epoch`、`update_committed_append_epoch`、配置、请求开始时间、TTFT deadline、
+EWMA 观测数和 `last_admitted_append_epoch` 等执行与恢复字段。
 
 ```python
 class AppendGatePhase(enum.Enum):
@@ -359,8 +363,9 @@ $U_e\leftarrow U_p$，清空 $U_p$ 与当前窗口状态。
 
 ## Update 策略与 Append admission gate
 
-所有策略都从窗口第一条 Update 开始维护统计和 deadline；Append gate 只决定策略希望 flush 时能否
-真的创建 work。`flush_ready=True` 表示策略已经要求执行、但严格 Append gate 尚未允许 admission。
+所有策略都从窗口第一条 Update 开始维护统计；只有 `fixed_window`、`quiet_debounce` 与
+`adaptive` 创建 soft / hard / 可选 TTFT deadline。Append gate 只决定策略希望 flush 时能否真的
+创建 work。`flush_ready=True` 表示策略已经要求执行、但 Append gate 尚未允许 admission。
 
 | 策略 | Update 到达时 | 正常 flush 条件 | gate 未开但条件满足时 |
 | --- | --- | --- | --- |
@@ -498,7 +503,17 @@ source finished 或合法 `PROMPT_FINISHED` 时要求 flush。
 | Append source finished | 更新 gate，然后立即复查 `flush_ready`、当前 deadline 与 policy；条件满足则直接 flush 原窗口。 |
 | Update source finished + 近似早放行 gate | 更新 gate，然后立即复查并按当前可见 Append epoch admission。 |
 
-标准 P/D 路径的 TTFT 剩余 slack 为：
+当前第一版不在线预测剩余 P 计算、KV 传输和 D 首 token 时间。配置
+`ttft_deadline_ms` 后，只为三种有界 policy 建立绝对 deadline：
+
+$$
+D_{\mathrm{abs}}=t_{\mathrm{request\_start}}+D_{\mathrm{TTFT}}.
+$$
+
+当 EngineCore 单调时钟到达 $D_{\mathrm{abs}}$ 时，policy 要求 flush；若 gate 仍关闭，则只设置
+`flush_ready=True`，待 admission 合法后优先放行。`delay_price` 在当前 adaptive 公式中仍是常量。
+
+下面更精细的阶段预测 slack 是后续 Adaptive 阶段的扩展模型，不属于本次已接入代码：
 
 $$
 S_i
@@ -514,7 +529,7 @@ D_{\mathrm{TTFT}}
 \hat{T}_{\mathrm{D1}}.
 $$
 
-当 $S_i\leq0$ 时，policy 已经要求立即 flush；若严格 Append gate 仍关闭，只能记录
+未来实现该预测后，当 $S_i\leq0$ 时，policy 应立即要求 flush；若严格 Append gate 仍关闭，只能记录
 `flush_ready=True`，不能违反 gate 直接物化 work。Append 结束后，这份已过期的窗口必须优先
 admission。这样 TTFT slack 仍被完整统计，且其等待来源会被准确记为“Append gate blocking”。
 
@@ -541,8 +556,8 @@ buffer。
 ### 合法 Update 事件到达
 
 1. `Request` 先完成 version、sequence、去重和乱序校验，更新 $U_o$。
-2. 更新唯一的 $U_p$：首次到达初始化 `first_pending_time`、`soft_deadline`、`hard_deadline`；后续
-   到达覆盖 $U_p$ 并按 policy 更新 soft deadline。
+2. 更新唯一的 $U_p$：首次到达初始化 `first_pending_time`；三种有界 policy 同时创建 soft / hard /
+   可选 TTFT deadline，后续到达覆盖 $U_p$ 并按 policy 决定是否刷新 soft deadline。
 3. 无论 gate 是否打开，都计算相邻 Update 的统计、更新 EWMA 与 `hypothetical_eager_tokens`。
 4. 按 policy 判断是否应 flush；若 gate 未允许，设置 `flush_ready=True` 而非建 work。
 
@@ -562,15 +577,17 @@ flush 时读取 `base = last_admitted_token_ids` 与 `target = latest_pending_to
 `work(base -> target)`，并将 `base` 写入 `work.execution_base_token_ids`。随后令
 `last_admitted_token_ids = target`，清空窗口状态。
 
-`PROMPT_FINISHED` 仍要求两个 source 已按协议 sealed。它强制 policy 进入“应 flush”状态；若严格
-Append gate 尚未打开，则请求协议有问题，不能以 finish 穿透 gate。
+启用合并器时，`PROMPT_FINISHED` 是最终请求级 barrier。它会原子封闭尚未单独 sealed、且
+没有乱序缺口的现有 source，并把未出现的可选 source 视为不会再到达；随后
+强制 policy 进入“应 flush”状态。严格 gate 因此只在最终 Append 上下文确定后打开。
 
-`finished=True` 只表示最终用户问题已经到达，**不表示 question 已经可调度**。第一版应将 question
-建成显式的 `QUESTION` work，并按以下步骤处理：
+`finished=True` 只表示最终用户问题已经到达，**不表示 question 已经可调度**。
+当前实现将 question 建成显式的 `QUESTION` work，并按以下步骤处理：
 
 1. `PROMPT_FINISHED` 先保存 suffix，标记 `finished=True`，并强制最终 Update 窗口进入应 flush 状态。
-2. controller 在最终 Update 已 admission 后，调用 `enqueue_question_if_ready()`；它要求两个 source
-   sealed、没有 `$U_p$` 或 `flush_ready`，且所有最终 Update work 已在 FIFO 中排定。
+2. controller 在最终 Update 已 admission 后调用 `enqueue_question_if_ready()`；它要求
+   所有存在或隐式关闭的 source 已 sealed、没有 `$U_p$` 或 `flush_ready`，且最终
+   Update work 已在 FIFO 中排定。
 3. 该函数只追加一个 `QUESTION` work 到 `pending_work_items` 尾部，并用
    `question_work_enqueued` 防止重复入队。FIFO 保证它不会越过已放行但尚未完成的 Append / Update
    work；严格 Update work 仍先等待 `required_append_epoch` 的物理提交。
@@ -580,7 +597,7 @@ Append gate 尚未打开，则请求协议有问题，不能以 finish 穿透 ga
 
 ### 严格与近似 admission
 
-- `append_gate=none`：每次 policy 想 flush 时均可 admission；Update 使用执行时 Append 前缀。
+- `append_gate=none`：每次 policy 想 flush 时均可 admission；Update 绑定 admission 时已接受的 Append epoch。
 - `hold_until_append_finished`：只有 Append source finished 后才可 admission；严格路径的最终 Update
   work 绑定 $E_f$。
 - `hold_until_append_or_update_finished`：Append 或 Update source 任一结束都可 admission。Update 先
@@ -647,7 +664,7 @@ class PromptStreamUpdateCoalescingConfig:
 
 | 字段 | 取值 / 使用范围 | 含义 |
 | --- | --- | --- |
-| `append_gate` | `none`、`hold_until_append_finished`、`hold_until_append_or_update_finished` | 决定 Update 是否先被 Append completion gate 阻挡。第三项是近似早放行模式，使用执行时可见的 Append 前缀。 |
+| `append_gate` | `none`、`hold_until_append_finished`、`hold_until_append_or_update_finished` | 决定 Update 是否先被 Append completion gate 阻挡。第三项是近似早放行模式，绑定 admission 时已接受的 Append epoch。 |
 | `update_policy` | `immediate`、`fixed_window`、`quiet_debounce`、`adaptive`、`full_merge` | 所有 Update 持续采用的窗口 / flush 规则；gate 只决定此刻能否 admission。 |
 | `soft_window_ms` | fixed、debounce、adaptive | fixed window 长度、debounce 静默时长，以及 adaptive 的配置最大候选等待；单位 ms。 |
 | `hard_deadline_ms` | fixed、debounce、adaptive | Update 窗口的最大等待，单位 ms；gate 关闭时到期只置 `flush_ready`。 |
@@ -663,7 +680,7 @@ class PromptStreamUpdateCoalescingConfig:
 `soft_deadline`、`hard_deadline`、$\hat{\lambda}$、$\hat{G}$、$w^\star$、
 `append_epoch` 和 gate 状态都是每个请求运行时计算出的状态，不放入 JSON。
 
-建议的文件和传递路径为：
+当前实现的文件和传递路径为：
 
 ~~~text
 vllm/config/prompt_stream.py
@@ -679,7 +696,13 @@ vllm/config/scheduler.py
         → 随 VllmConfig 传到 P 节点 EngineCore
 
 vllm/v1/core/sched/scheduler.py
-    仅当 config is not None 时创建 Append-aware controller
+    config is not None 时创建 PromptStreamUpdateCoalescingController
+
+vllm/v1/request.py
+    保存 gate、单窗口、冻结 work、显式 QUESTION 与 Append epoch
+
+vllm/v1/engine/core.py
+    仅在 controller 开启时使用 runnable 判定和 deadline-aware queue wait
 ~~~
 
 严格 Append gate + 固定窗口的主方案示例：
@@ -740,6 +763,36 @@ Adaptive 的完整示例如下。这里的先验值只是一组起始实验配�
 controller 更清楚：Scheduler、EngineCore 与 Request 都通过一次 `is None` 判定回到原始
 路径，也不会分配 deadline heap、dormant 集合或请求级合并状态。
 
+### 实际开启方式
+
+该参数只传给 P 节点。直接启动 P 节点时，在原命令后追加一段 JSON：
+
+~~~shell
+.venv/bin/python -m vllm.entrypoints.openai.api_server \
+  --model <MODEL_PATH> \
+  --served-model-name <SERVED_MODEL_NAME> \
+  --host 0.0.0.0 \
+  --port 8100 \
+  --enforce-eager \
+  --no-async-scheduling \
+  --prompt-stream-update-coalescing-config \
+  '{"append_gate":"hold_until_append_finished","update_policy":"fixed_window","soft_window_ms":20,"hard_deadline_ms":80}' \
+  --kv-transfer-config \
+  '{"kv_connector":"NixlConnector","kv_role":"kv_producer","kv_load_failure_policy":"fail"}'
+~~~
+
+使用仓库内 Slurm 脚本时，通过环境变量传入相同 JSON：
+
+~~~shell
+PROMPT_STREAM_UPDATE_COALESCING_CONFIG='{"append_gate":"hold_until_append_finished","update_policy":"adaptive","soft_window_ms":40,"hard_deadline_ms":80,"ttft_deadline_ms":400,"interval_ewma_alpha":0.25,"gain_ewma_alpha":0.25,"cold_start_prior_weight":8.0,"arrival_rate_prior_per_s":10.0,"merge_gain_prior_tokens":128.0,"delay_price":1.0,"load_price_scale":0.0}' \
+MODEL_PATH=<MODEL_PATH> \
+SERVED_MODEL_NAME=<SERVED_MODEL_NAME> \
+sbatch --nodelist=<P_HOST> research/scripts/server/start_p_node.sbatch
+~~~
+
+不设置 `PROMPT_STREAM_UPDATE_COALESCING_CONFIG` 就是关闭。D 节点的启动命令
+不追加该参数；REST payload 也无需增加合并字段。
+
 ### 启动拓扑与第一版兼容性边界
 
 | 进程角色 | 是否启用 | 行为 |
@@ -748,15 +801,18 @@ controller 更清楚：Scheduler、EngineCore 与 Request 都通过一次 `is No
 | P 节点 | 是 | 接收 Update 事件，并在本地合并、Prefill 和保留 P 侧 KV。 |
 | D 节点 | 否 | 只接收 P 传来的最终 KV 与首 token，不维护 Update 合并窗口。 |
 
-第一版启动校验应明确拒绝尚未实现的组合，而不是静默改变行为：
+当前源码会在配置层明确拒绝 DP、多在途 batch，以及已配置但不是 NIXL pull producer 的
+KV transfer 组合；source 数量则在 Request 接受事件时 fail closed。运维上仍只应给 P 节点传入该参数：
 
-- 仅支持一个 Update source 和一个 Append source；多 Append source 需要先定义“全部封闭”的
-  source barrier。
+- 至多支持一个 Update source 和一个真实 Append source；省略的来源会在
+  `PROMPT_FINISHED` 时被请求级 barrier 封闭。
 - V0 支持 `append_gate=none`、严格 `hold_until_append_finished` 与近似
   `hold_until_append_or_update_finished`；第三项只需记录执行时 Append epoch，不要求失效 / 重建机制。
-- 仅支持常规单 EngineCore P 路径；暂不支持 data-parallel EngineCore 的独立 busy loop。
-- 启用时要求 `async_scheduling=False`。异步调度的并行 batch 生命周期需要单独验证后再
-  放开。
+- 仅支持单 EngineCore、DP=1、PP=1 的 P 路径。
+- 启用时要求 `max_concurrent_batches == 1`；这同时排除 async scheduling 与
+  pipeline parallel 的多在途 batch 生命周期。
+- 配置 KV transfer 时，仅支持 `NixlConnector` / `NixlPullConnector` 的
+  `kv_producer`；D 节点或其它 connector 若误传该开关会在配置阶段被拒绝。
 
 这些限制只在传入 coalescing JSON config 时校验；参数未传时不得改变现有配置组合的合法性。
 
@@ -765,8 +821,8 @@ controller 更清楚：Scheduler、EngineCore 与 Request 都通过一次 `is No
 启用后，Scheduler 创建一个组合式 controller，而不是把合并判断散落到通用队列代码中：
 
 ~~~python
-self.prompt_stream_update_coalescer = (
-    PromptStreamUpdateCoalescer(config)
+self._prompt_stream_update_coalescer = (
+    PromptStreamUpdateCoalescingController(config)
     if config is not None
     else None
 )
@@ -777,8 +833,8 @@ self.prompt_stream_update_coalescer = (
 | 位置 | 关闭时 | 启用时 |
 | --- | --- | --- |
 | `Request` / `PromptSourceState` | 当前事件校验、tokenize 后快照更新、立即创建 Update work。 | 仍是 version、sequence、去重与 source 状态的唯一权威；持有 `AppendUpdateGateState` 和 `UpdateCoalescingState`。 |
-| `PromptStreamUpdateCoalescer` | 不存在。 | 不复制 token 快照；只维护 controller 的 dormant id、deadline heap 和 gate / window 索引，并通过 Request 的窄接口移动状态。 |
-| `Scheduler._apply_prompt_stream_request()` | 保持当前即时语义。 | 对 Update 调 `on_update_snapshot(...)`，对 Append 记录 epoch，对 source-finished 调 `on_source_finished(...)`，对 `PROMPT_FINISHED` 调 `force_final_flush(...)`；Append work completion 则调 `on_append_epoch_committed(...)`。 |
+| `PromptStreamUpdateCoalescingController` | 不存在。 | 不复制 token 快照；只维护 dormant id、deadline heap，并通过 Request 的窄接口移动状态。 |
+| `Scheduler._apply_prompt_stream_request()` | 保持当前即时语义。 | 先让 `Request.apply_prompt_stream_event()` 更新权威 source / gate / window 状态，再调用 Request 的 flush、Question admission 与 dormant reconcile 窄接口。 |
 | `Scheduler.schedule()` | 当前 work 队列调度。 | 只消费已冻结 work；选择 Update work 前还检查 `required_append_epoch` 是否已物理提交。 |
 
 这要求把 Request 内“更新 source 快照”和“创建 Update work”拆成两个内部动作，但不改变
@@ -787,14 +843,15 @@ self.prompt_stream_update_coalescer = (
 
 ### dormant 请求的局部化
 
-controller 只能在请求当前**没有任何 runnable work**时把它标为 dormant。Append-aware 设计中至少
-存在三类 dormant 原因：
+controller 只能在请求当前**没有任何 runnable work**时把它标为 dormant。源码把原因归并成四个
+实际字符串；它们是诊断标签，不改变 Request 内的 policy 状态：
 
 | dormant 原因 | 条件 | 是否登记 deadline | 唤醒方式 |
 | --- | --- | --- | --- |
-| `append_gate_blocked` | Update window 已要求 flush，但 Append 尚未结束，且没有其他 work。 | 否。 | 等 Append source-finished、abort 或合法 finish。 |
-| `admission_deadline` | admission 已允许、有界 Update window 尚未到期，且当前没有可运行 work。 | 是。 | EngineCore 等到最近 deadline 或接收新输入。 |
-| `full_merge` | policy 为 `full_merge`，只保存最新 Update。 | 否。 | 等 Update source-finished、Append source-finished、finish 或 abort 输入。 |
+| `stream_input` | bootstrap 已完成，当前没有 Update 窗口或可运行 work。 | 否。 | 新 source event、finish 或 abort。 |
+| `append_gate` | policy 已要求 flush，但 Append gate 不允许 admission。 | 否。 | source-finished、合法 `PROMPT_FINISHED` 或 abort。 |
+| `update_deadline` | 有界窗口尚未到期。 | 是。 | 最近 deadline 或新输入。 |
+| `update_policy` | `full_merge` 等无 timer policy 正在等待终止事件。 | 否。 | source-finished、finish 或 abort。 |
 
 因此，gate 阻挡 **不等于**整个 Request 都 dormant：只要还有 PREFIX_APPEND work，request 仍是
 runnable，Append 会照常占用 scheduler。只有所有 runnable work 都耗尽、controller 又无法 admission
@@ -802,25 +859,36 @@ runnable，Append 会照常占用 scheduler。只有所有 runnable work 都耗�
 
 1. Request 仍保留在 `Scheduler.requests[request_id]`，因此后续 event、finish、abort 能按
    request id 找到同一个长期 Request。
-2. controller 记录 `dormant_request_ids[request_id] = reason`；它不复制 Request 的 token
+2. controller 记录 `_dormant_reasons[request_id] = reason`；它不复制 Request 的 token
    或 KV 状态。
-3. `wake_dormant(request_id)` 是唯一的恢复入口：删除 dormant 标记后，若已经有冻结 work，或
+3. `_wake_prompt_stream_request(request)` 是唯一的恢复入口：删除 dormant 标记后，若已经有冻结 work，或
    deadline 到期使 controller 新建了 work，则用现有 `_enqueue_waiting_request()` 放回普通队列。
-   `append_gate_blocked` 保留已到期状态但不登记 timer，收到 source 终止事件后才重新判断。
-4. abort、engine error 与正常完成必须执行 `remove_dormant(request_id)`，并同时清理 deadline heap
-   的逻辑所有权；堆中的遗留条目仍可通过 generation / request-id 校验惰性丢弃。
+   请求从 dormant 醒来到真正进入 running 之前仍可能保留 segment KV，因此 Scheduler 会把它登记进
+   `_prompt_stream_retained_waiting_req_ids` 并设置 `prompt_stream_needs_worker_refresh`。该状态仍是
+   runnable waiting，但在 KV 压力和强制 cache reset 下可被回收并 replay。真正 admission 到 running
+   后删除 retained 标记。
+4. parking 同时把 request id 放入 `_prompt_stream_worker_removal_req_ids`；下一次
+   `SchedulerOutput.preempted_req_ids` 先删除 worker persistent row，但 Scheduler 持有的 segment KV
+   继续保留。worker removal 自身也算 maintenance work，纯 dormant 时不会无限延后。
+5. abort、engine error 与正常完成会清理 dormant、retained-waiting 和 deadline 的逻辑所有权；heap
+   中的遗留条目仍可通过 generation / request-id 校验惰性丢弃。
 
-不能让 dormant id 参与普通未完成请求计数或 connector cleanup 计数。启用 controller 时，
-Scheduler 需提供只给 EngineCore 用的 runnable 判定，例如：
+dormant id 仍参与逻辑未完成请求计数，并在 connector 的 accounted-request
+口径中占位；只有 EngineCore 的即时 runnable 判定排除它。Scheduler 提供：
 
 ~~~python
 def has_runnable_engine_work(self) -> bool:
-    if self.prompt_stream_update_coalescer is None:
+    if self._prompt_stream_update_coalescer is None:
         return self.has_requests()
-    return self._has_requests_excluding_coalescing_dormant()
+    return bool(
+        waiting_or_running
+        or pending_worker_removal
+        or finished_connector_cleanup
+        or connector_pending_push
+    )
 ~~~
 
-后者必须保留真正的 `waiting` / `running` 请求、已完成请求的 connector 后处理以及
+上述是语义伪码。实际实现保留真正的 `waiting` / `running` 请求、待发送的 worker-row removal、已完成请求的 connector 后处理以及
 connector pending push work。它只排除 controller 纯粹等待外部 source 或 admission deadline 的
 request id，不能把 dormant Request 误判成 finished connector cleanup。
 
@@ -830,20 +898,19 @@ EngineCore 不应了解 Update 快照、LCP 或 EWMA，只识别“当前是否�
 wakeup provider”。建议 controller 经 Scheduler 暴露三个窄接口：
 
 ~~~python
-def has_prompt_stream_coalescer(self) -> bool: ...
+def has_prompt_stream_update_coalescer(self) -> bool: ...
 def get_next_prompt_stream_deadline(self) -> float | None: ...
 def flush_due_update_coalescing(self, now: float) -> int: ...
 ~~~
 
-其中 `get_next_prompt_stream_deadline()` 只返回 **admission 已允许、且尚未到期** 的有界 Update
-窗口的最近 deadline。gate 关闭而已 `flush_ready` 的窗口，以及 `full_merge` 等待期都返回 `None`；
-它们应等待下一条外部 source 事件，而不应反复唤醒 EngineCore。
+其中 `get_next_prompt_stream_deadline()` 返回最近的有效有界 Update deadline。
+gate 阻挡窗口可以在首次到期时唤醒一次并转成 `flush_ready`；此后它与
+`full_merge` 等待期都返回 `None`，等待下一条 source 事件而不反复唤醒。
 
-`flush_due_update_coalescing()` 只处理已经到期且 admission 已允许的有界 Update window。Append /
-Update source-finished 与 `PROMPT_FINISHED` 是输入事件，它们会更新 admission 条件并重新判定
-`flush_ready`；最后一个 Append work 的物理提交则是 scheduler / worker completion callback，它通过
-`on_append_epoch_committed()` **解除既有 work 的执行 barrier**，而不是把 completion 伪装成 deadline
-或重新决定 window policy。
+`flush_due_update_coalescing()` 处理所有已经到期的有界 Update window：允许
+admission 时冻结 work，被 gate 阻挡时只置 sticky `flush_ready`。Append / Update
+source-finished 与 `PROMPT_FINISHED` 会更新 admission 条件并重新判定原窗口；
+Append work 的物理提交只解除 `required_append_epoch` 执行 barrier。
 
 对 `EngineCore` 的改动应限于以下三处，并且关闭时逐字保留旧分支的关键行为：
 
@@ -883,10 +950,10 @@ work。普通请求不进入上述任何一步。
 
 ### 关闭开关的回归保证
 
-实现完成后必须覆盖：
+后续验证必须覆盖：
 
 - 不传开关时，现有普通 scheduler 测试与 PromptStream 即时 Update 测试的结果不变。
-- 关闭时不创建 `PromptStreamUpdateCoalescer`、deadline heap、dormant 集合或
+- 关闭时不创建 `PromptStreamUpdateCoalescingController`、deadline heap、dormant 集合或
   `UpdateCoalescingState`。
 - 开启但没有 Update 事件时，Append-only 流式 Prefill 的行为与当前版本一致。
 - 开启后只有 Update source 的 work 数、等待时间和 Update KV 截断时机发生变化；最终
@@ -905,8 +972,9 @@ FastAPI/router 不应直接修改长期 Request。外部 REST 事件进入 Engin
 ~~~text
 Scheduler.add_request
     → _apply_prompt_stream_request
+    → [仅启用 controller 时] 先兑现同一 monotonic 时刻之前已到期的旧窗口
     → Request.apply_prompt_stream_event
-    → [仅启用 controller 时] Scheduler.flush_due_update_coalescing
+    → 对本事件执行 policy flush / gate / dormant reconcile
     → Scheduler.schedule
 ~~~
 
@@ -915,22 +983,28 @@ controller 时，AppendUpdateGateState、UpdateCoalescingState 与 deadline heap
 
 - 不需要把 pending_work_items 改成带锁队列。
 - 不需要 asyncio.Lock 或 threading.Lock；它们不能跨 API 进程保护 EngineCore 状态。
-- 定时器线程最多向 EngineCore 投递 wake-up 或 deadline hint，绝不能直接 flush Request 或修改快照。
+- 第一版不创建定时器线程；若未来增加外部 timer，也只能投递 wake-up / deadline hint，绝不能
+  直接 flush Request 或修改快照。
 
 ### deadline 最小堆
 
-启用 controller 后，PromptStreamUpdateCoalescer 应维护一个最小堆，条目只包含：
+启用 controller 后，`PromptStreamUpdateCoalescingController` 维护一个最小堆，条目只包含：
 
 ~~~text
 (deadline, request_id, generation)
 ~~~
 
-- 只给 admission 已允许且尚未到期的有界 window 入堆；gate 阻挡的 `flush_ready` 和 `full_merge` 不入堆。
+- 所有尚未到期的有界 window 都可入堆，包括暂时被 gate 阻挡的窗口。
+  gate 阻挡窗口到期时只置一次 sticky `flush_ready`，随后清除其 deadline；
+  `full_merge` 不创建时间 deadline。
 - 每个新窗口和每次允许刷新的 soft deadline 刷新都递增 generation。
 - 堆不保存 token；快照始终归 Request 的 UpdateCoalescingState 所有。
-- 每轮调度前先处理已经到达的输入事件，再弹出所有已到期条目。
+- 每条 PromptStream 事件应用前，先以同一 EngineCore monotonic 时刻兑现已经到期的旧窗口，
+  因而越过 deadline 的新事件不会反向刷新旧窗口；输入队列 drain 完成后、schedule 前还会再统一
+  扫描一次到期条目。
 - generation 不匹配的条目是过期 deadline，直接跳过。
-- 有效条目在同一 EngineCore 主线程中 flush。
+- 有效条目在同一 EngineCore 主线程中处理：admission 已允许时创建 work；
+  gate 阻挡时只记录 `flush_ready`。
 
 这样，deadline 附近若新事件先到达，它会使旧条目失效；若 deadline 先被处理，则旧窗口先 flush，新事件进入下一窗口。两者都满足有界等待和不可变 work 语义。
 
@@ -943,13 +1017,19 @@ controller 时，AppendUpdateGateState、UpdateCoalescingState 与 deadline heap
   无 deadline 的 dormant。
 - 若 admission 已允许且仅等待有界 deadline，则标为带 deadline 的 dormant；EngineCore 在最近
   deadline 到达时被唤醒，flush 后再把请求加入普通等待队列。
+- dormant 仍是**逻辑未完成请求**，计入 `get_num_unfinished_requests()`；
+  它只从 `has_runnable_engine_work()` 中排除，避免 shutdown、统计或 connector
+  生命周期把长期请求误判为已经完成。
+- dormant 保留分段 KV。KV 分配失败时，Scheduler 可以驱逐最早的 dormant
+  请求块，并从 source 权威状态重建其物理执行链。
 
 第一版应采用下文的 **deadline-aware 阻塞等待**，不能每毫秒空 `schedule()` 检查时间；
 后者会引入 CPU 空转并污染实验。
 
 ### EngineCore 的 gated deadline-aware 阻塞等待
 
-这是后续实现需要修改 `vllm/v1/engine/core.py` 的位置；当前代码尚未具备该能力。
+第一版已经在 `vllm/v1/engine/core.py` 接入该能力；下面保留问题背景与
+实现边界，作为后续审查基准。
 
 #### 当前 EngineCore 为什么会无限等输入
 
@@ -978,7 +1058,9 @@ IO 线程从 REST/ZMQ 收到新的 ADD、ABORT 或其他控制消息并写入 `i
 
 #### Scheduler 与 EngineCore 的职责边界
 
-Scheduler 在 controller 存在时持有它；deadline 最小堆和 dormant 集合归 controller 所有。Scheduler 仅转发两个由 EngineCore 主线程调用的接口；以下名称是建议的实现接口：
+Scheduler 在 controller 存在时持有它；deadline 最小堆和 dormant 集合归
+controller 所有。当前实现通过 `has_prompt_stream_update_coalescer()`、
+`has_runnable_engine_work()` 以及以下两个 deadline 接口与 EngineCore 协作：
 
 ~~~python
 def get_next_prompt_stream_deadline(self) -> float | None:
@@ -997,8 +1079,9 @@ def flush_due_update_coalescing(self, now: float) -> int:
   request id 索引的长期状态表中，以接收后续 Update、finish 或 abort。
 - `get_next_prompt_stream_deadline()` 只读最小堆，跳过 generation 失效、请求已取消、策略已变为
   `full_merge` 或已无 pending Update 的陈旧条目。
-- `flush_due_update_coalescing()` 是唯一将 `latest_pending_token_ids` 物化为不可变
-  `pending_work_items` 的入口。它完成后，请求才重新成为普通 runnable request。
+- 所有 deadline、事件与 recovery 路径最终都调用 Request 的
+  `flush_prompt_stream_update()`，它是将 `latest_pending_token_ids` 物化为
+  不可变 `pending_work_items` 的唯一状态转换接口。
 
 #### 主循环的目标顺序
 
@@ -1010,7 +1093,7 @@ while self._handle_shutdown():
     # 处理已经到达的 REST/ZMQ 输入；可能创建、刷新或取消 deadline。
     self._process_input_queue()
 
-    if self.scheduler.has_prompt_stream_coalescer():
+    if self.scheduler.has_prompt_stream_update_coalescer():
         # 同一主线程检查到期窗口；必要时把 dormant 请求转回 runnable 队列。
         self.scheduler.flush_due_update_coalescing(time.monotonic())
 
@@ -1021,7 +1104,7 @@ while self._handle_shutdown():
 `_process_input_queue()` 在 `not self.has_work()` 时的等待逻辑改为概念上的：
 
 ~~~python
-if not self.scheduler.has_prompt_stream_coalescer():
+if not self.scheduler.has_prompt_stream_update_coalescer():
     # 关闭时保留当前的无限期阻塞语义。
     request = self.input_queue.get(block=block)
 else:
@@ -1044,11 +1127,14 @@ Update 放行；若没有有效 admission deadline，`timeout=None`，仍是原�
 
 #### 输入事件与 deadline 同时发生
 
-在同一 EngineCore 主线程上采用固定顺序：先处理已进入 `input_queue` 的事件，再检查
+在同一 EngineCore 主线程上采用固定顺序：应用每个 PromptStream 事件前，Scheduler
+先按当前 monotonic 时间兑现已经到期的旧窗口；处理完输入队列后，主循环再检查一次
 deadline。
 
-- 新 Update 先被处理时，它可以刷新 soft deadline 并递增 generation；堆内旧条目在
-  随后的检查中失效。
+- 事件处理时刻仍早于 deadline，它可以刷新 soft deadline 并递增 generation；
+  堆内旧条目随后惰性失效。
+- 事件处理时刻已经达到 deadline，旧窗口先冻结或进入 sticky `flush_ready`；
+  本事件只能覆盖 sticky target，或进入下一窗口，不能把已到期边界向后刷新。
 - queue wait 先 timeout 时，主线程先 flush 旧窗口；稍后到达的新 Update 进入下一窗口。
 - 无论哪一种先发生，hard deadline 不会被刷新，且已放行 work 永远不可变，因此不需要
   锁来保护 `Request`、`pending_work_items` 或 KV block table。Append / Update source-finished
@@ -1069,9 +1155,9 @@ deadline。
 
 | 字段 | 含义 | 写入时刻 |
 | --- | --- | --- |
-| `target_update_token_ids` | 本 work 对应的完整 Update 快照 $U_p$。 | flush。 |
+| `update_token_ids` | 本 work 对应的完整 Update 快照 $U_p$。 | flush。 |
 | `execution_base_token_ids` | flush 时读取的 $U_e$；它仅在该 work 内冻结为执行前驱。 | flush。 |
-| `update_lcp_len` | $L(U_e,U_p)$，只比较 Update token。 | flush。 |
+| `update_common_prefix_len` | $L(U_e,U_p)$，只比较 Update token。 | flush。 |
 | `required_append_epoch` | 本 work 所需的 `PREFIX_APPEND` 物理版本；严格 gate 下为最终 $E_f$。 | flush。 |
 | `prefix_append_logical_len` | 该 epoch 下可见 Prefix+Append 的逻辑 token 长度。 | flush 或由 epoch 查表。 |
 
@@ -1085,7 +1171,7 @@ segment、各段逻辑长度和既有 padding 规则，构造 worker 所需的 s
 Append source finished
     → final_append_epoch = E_f，重新检查既有 Update 窗口是否可以冻结 work
     → 最后一个 PREFIX_APPEND work 计算并提交 E_f
-    → Scheduler 观察 committed_append_epoch >= required_append_epoch
+    → Scheduler 观察 committed_append_epoch == required_append_epoch
     → Update work 才可成为 active
     → 按 source-local LCP 截断 UPDATE segment 并计算新后缀
     → UPDATE KV 以 (U_p, E_f) 提交
@@ -1094,11 +1180,11 @@ Append source finished
 
 1. **flush 只创建不可变 work。** 它不截断 UPDATE KV、不释放 block，也不把 work 直接塞给 worker。
 2. **Scheduler 先检查 Append dependency。** 若 `committed_append_epoch < required_append_epoch`，该
-   Update work 不能成为 active。即使同一 Request 的 FIFO 已让 Append work 排在它前面，这个检查
-   仍应保留为防御性条件。
+   Update work 不能成为 active；若前者大于后者，则说明 FIFO / 冻结依赖已被破坏并立即 fail closed。
+   只有二者严格相等时才可执行。
 3. **dependency 满足后才计算执行 LCP。** 对严格 gate，UPDATE KV 当前 epoch 与
    `required_append_epoch` 相同，才可按 work 内冻结的
-   $L(\text{execution\_base\_token\_ids},\text{target\_update\_token\_ids})$ 延后截断并复用
+   `L(execution_base_token_ids, update_token_ids)` 延后截断并复用
    Update 前缀；epoch 不同则必须视为 LCP 为零并重建，不能错误复用 token LCP。
 4. **worker 的 attention 视图**是当前已提交的 `PREFIX_APPEND` 加上 Update LCP KV；新计算 token
    只写入独立 `UPDATE` segment。Append block 不因 Update 被截断或覆写。
@@ -1108,7 +1194,7 @@ Append source finished
 
 逻辑 token 与物理 block 边界必须继续分开看：`PREFIX_APPEND` 末 block 未满而 UPDATE segment 从
 独立 block 起始时，现有分段实现可能含有 segment 间 padding。该 padding / attention-mask /
-position 近似属于第一项分段 KV 设计的既有边界；本合并器不得通过改变 `update_lcp_len` 或伪造
+position 近似属于第一项分段 KV 设计的既有边界；本合并器不得通过改变 `update_common_prefix_len` 或伪造
 Append token 来处理它。它只保证任何可复用 UPDATE KV 都绑定正确的逻辑 prefix epoch。
 
 若目标 $U_p$ 是其 work 内执行基准 $U_e$ 的严格前缀，$R(U_e,U_p)=0$，仍要创建零 token
@@ -1117,7 +1203,7 @@ Append token 来处理它。它只保证任何可复用 UPDATE KV 都绑定正�
 ### 严格与近似执行语义的边界
 
 - `append_gate=none` 是无 gate 的近似 / 消融路径：Append 与 Update work 按实际到达与调度顺序
-  竞争，Update 使用当时已提交的 Append 前缀。
+  竞争，Update 在 admission 时冻结已接受的 Append epoch，并等该 epoch 物理提交后执行。
 - `hold_until_append_or_update_finished` 是**合并后早放行**的近似路径：Append 未结束期间仍只暂存和
   覆盖 Update；一旦 Update source 结束，就放行该最终合并快照，并使用当时可见的 Append epoch。
 - `hold_until_append_finished` 是严格路径：所有 Update work 都等待最终 $E_f$，因此 Update KV 可被
@@ -1153,13 +1239,16 @@ preemption 使其物理前驱不存在时，允许清空受影响的 active / pe
 
 - abort、engine error 或 Request 完成后，controller 删除 request id 的 dormant 标记；heap 遗留条目
   通过 request 不存在或 generation 不匹配自然失效。
-- 乱序 sequence number 仍留在 source pending-event buffer；只有按序接受后才更新单一
-  `UpdateCoalescingState` 窗口。
+- 第一版 REST 事件采用严格 source-local 顺序：每个新 source 的首事件必须是 `sequence_no=0`，
+  后续 sequence 必须正好等于 `next_sequence_no`；发现 gap、回退或跳号立即 fail closed，不先返回
+  ACK 再把事件留在未消费的 pending buffer。`SOURCE_FINISHED` 同样必须与下一期待 sequence 和
+  当前 source version 一致。
 - 重复 chunk 或 token 完全相同的 Update snapshot 不创建 work，也不刷新 `quiet_debounce` deadline。
-- 相同 version 但 token 内容不同仍为协议错误，合并器不能掩盖 source version 违规。
-- V0 的 `PROMPT_FINISHED` 前置条件是两个 source 均已 sealed；若未来允许它隐式 close source，
-  请求协议必须明确声明、原子地关闭哪些 source，并拒绝任何后续 event。不能用 finish 启动缺少
-  知识 chunk 的 question。
+- Update 的相同 version 若携带不同 token 内容仍为协议错误；Append 的 version 不承担快照
+  替换语义，允许同一 version 下追加不同 chunk，但 version 也必须保持单调且不能回退。
+- 启用合并器时，`PROMPT_FINISHED` 是最终请求级 barrier：已单独发送 `SOURCE_FINISHED` 的
+  source 保持 sealed；尚未单独封闭但没有乱序缺口的现有 source，以及根本未出现
+  的可选 source，会被原子地封闭。此后任何 source event 均被拒绝。
 
 ## 正确性不变量
 
@@ -1168,7 +1257,8 @@ preemption 使其物理前驱不存在时，允许清空受影响的 active / pe
 - **严格 gate 安全**：`hold_until_append_finished` 下，Append 未逻辑封闭时不创建 UPDATE work；最终
   Update work 的 `required_append_epoch` 必须等于 `final_append_epoch`。
 - **逻辑封闭与物理提交分离**：Append source finished 可以创建依赖 $E_f$ 的 work；只有
-  `committed_append_epoch >= E_f` 才允许它 active。
+  `committed_append_epoch == E_f` 才允许它 active；大于所需 epoch 表示 FIFO /
+  冻结依赖已被破坏，必须 fail closed。
 - **LCP + epoch 双重正确性**：Update LCP 只比较 Update token；同一执行语义下复用 UPDATE KV
   还要求 `update_committed_append_epoch == required_append_epoch`。严格路径要求该 epoch 为最终
   $E_f$；近似路径允许它是执行时 epoch $E_s$。
@@ -1285,20 +1375,23 @@ Append 长度、QPS、P 节点利用率和 $D_{\mathrm{hard}}$。重点图包括
 `strict_gate_immediate` 的 token 节省与额外等待、不同 QPS 下 p50/p95/p99 TTFT 与 goodput，以及
 Update window / append-gate / scheduler waiting 的分解。
 
-## 分阶段实现
+## 实现进度与后续阶段
 
-1. **配置骨架与严格 gate**：解析 JSON config、保留 `None` 默认路径；实现
-   `AppendUpdateGateState`、Append epoch、逻辑 sealed / 物理 committed 区分和
-   `required_append_epoch` barrier。先实现 `strict_gate_immediate` 与 `joint_finish_merge`。
-2. **固定 policy 与 EngineCore 唤醒**：实现 `fixed_window`、`quiet_debounce`、deadline generation
-   和 dormant 标记。只有 controller 开启时加入 deadline-aware `Queue.get(timeout=...)`；gate 阻挡或
-   `full_merge` 的窗口不保留到期 heap 条目，继续等待外部输入，禁止 1 ms busy-spin。
-3. **恢复与可观测性**：实现 preemption replay、abort、乱序、source-finished、finish 的状态矩阵；
-   补齐 epoch、waiting、token / block、TTFT 指标和单元 / 集成测试。
-4. **Adaptive 与 Oracle**：加入 EWMA、冷启动先验、$w_i^\star$、资源价格与 TTFT slack；实现遵守
-   strict gate 的 offline Oracle。
-5. **近似早放行评估**：实现 `hold_until_append_or_update_finished` 的 gate-open 转换与
-   `early_release_append_epoch` 统计；比较它、`none` 与严格路径的 TTFT、token 成本和回答质量。
+1. **已接入配置与 Request 状态机**：JSON config、`None` 默认路径、
+   `AppendUpdateGateState`、单一 Update 窗口、Append epoch、冻结 Update /
+   QUESTION work 与 `required_append_epoch` barrier 已进入源码。
+2. **已接入 Scheduler / EngineCore 控制面**：`immediate`、`fixed_window`、
+   `quiet_debounce`、`adaptive`、`full_merge`，以及 deadline heap、dormant
+   停放 / 唤醒、deadline-aware `Queue.get(timeout=...)` 均由启动开关隔离。
+3. **已接入恢复和协议保护**：preemption / dormant KV 驱逐会从 source 权威
+   状态重建；abort、shutdown、source finish sequence gap、Append epoch 与
+   committed Update 快照均有 fail-closed 检查。
+4. **待完成可观测性与验证**：补齐 window、gate、token / block、epoch、TTFT
+   指标，并为默认关闭、五种 policy、三种 gate、preemption 与 P/D 路径增加
+   单元和集成测试。本次修改没有运行这些测试，也没有启动服务。
+5. **待完成 Oracle 与实验**：实现遵守 strict gate 的 offline Oracle；比较
+   `none`、严格路径与 `hold_until_append_or_update_finished` 的 TTFT、token
+   成本、GPU 时间和回答质量。
 
 最重要的严格路径正确性准则不是“少算了多少”，而是：在相同 source-finish / question 边界下，
 最终提交的 `(PREFIX_APPEND final epoch, Update snapshot, question)` 必须与

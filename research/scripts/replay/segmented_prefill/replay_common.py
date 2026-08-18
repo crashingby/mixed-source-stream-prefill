@@ -33,7 +33,9 @@ logger = logging.getLogger(__name__)
 
 MIX_SOURCE_SCHEMA_VERSION = "prompt_stream_mixed/v2"
 DEFAULT_DATA_DIR = Path("research/data/mix_source")
-DEFAULT_OUTPUT_DIR = Path("research/scripts/replay/results")
+DEFAULT_OUTPUT_DIR = Path(
+    "research/scripts/replay/segmented_prefill/results"
+)
 DEFAULT_PROXY_URL = "http://127.0.0.1:8000"
 
 ReplayMode = Literal["stream", "normal", "merged_update"]

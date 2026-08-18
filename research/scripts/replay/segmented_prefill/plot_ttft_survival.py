@@ -21,7 +21,9 @@ import matplotlib.pyplot as plt
 from matplotlib.ticker import PercentFormatter
 
 
-DEFAULT_OUTPUT = Path("research/scripts/replay/results/ttft_survival.png")
+DEFAULT_OUTPUT = Path(
+    "research/scripts/replay/segmented_prefill/results/ttft_survival.png"
+)
 DEFAULT_STREAM_TTFT_COLUMN = "finish_to_first_token_ms"
 DEFAULT_SERIES_COLORS = (
     "#1f77b4",

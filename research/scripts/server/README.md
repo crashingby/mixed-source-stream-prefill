@@ -95,6 +95,21 @@ sbatch --nodelist=<D_HOST> research/scripts/server/start_d_node.sbatch
 | `GPU_MEMORY_UTILIZATION` | `0.65` | vLLM GPU 显存使用比例 |
 | `MAX_MODEL_LEN` | `4096` | 最大上下文长度 |
 | `MAX_NUM_SEQS` | `16` | 最大并发序列数 |
+| `PROMPT_STREAM_UPDATE_COALESCING_CONFIG` | 空，功能关闭 | 仅 P 节点使用的 Update 合并 JSON；非空时透传为 `--prompt-stream-update-coalescing-config`。 |
+
+启用严格 Append gate 与固定窗口的 P 节点提交示例：
+
+```shell
+PROMPT_STREAM_UPDATE_COALESCING_CONFIG='{"append_gate":"hold_until_append_finished","update_policy":"fixed_window","soft_window_ms":20,"hard_deadline_ms":80}' \
+MODEL_PATH=<MODEL_PATH> \
+SERVED_MODEL_NAME=<SERVED_MODEL_NAME> \
+sbatch --nodelist=<P_HOST> research/scripts/server/start_p_node.sbatch
+```
+
+不设置 `PROMPT_STREAM_UPDATE_COALESCING_CONFIG` 时保持逐 Update 事件立即创建
+work 的原有行为。D 节点不要设置这个变量。第一版只支持 P 节点上的
+NIXL pull-mode `kv_producer`、DP=1、PP=1 和单 in-flight batch；本脚本已有
+`--no-async-scheduling`，不需要再添加异步调度参数。
 
 跨节点 P/D 时，`VLLM_NIXL_SIDE_CHANNEL_HOST` 必须是对端可以访问的地址。脚本默认用 job 实际运行节点的 `hostname`，通常比 `localhost` 更安全。若集群 DNS 不可用，可以显式设置为日志中 `HOST_IP` 的内网 IP。
 
@@ -157,23 +172,24 @@ mkdir -p research/scripts/logs
 ```
 
 ```shell
-VLLM_NIXL_SIDE_CHANNEL_HOST=g2c12 \
+VLLM_NIXL_SIDE_CHANNEL_HOST=g2c9 \
+PROMPT_STREAM_UPDATE_COALESCING_CONFIG='{"append_gate":"hold_until_append_finished","update_policy":"fixed_window","soft_window_ms":20,"hard_deadline_ms":80}' \
 MODEL_PATH=/workplace/home/huangxinying/Models/Qwen2.5-3B/ \
 SERVED_MODEL_NAME=qwen2.5-3b \
 GPU_MEMORY_UTILIZATION=0.6 \
 MAX_MODEL_LEN=4096 \
 MAX_NUM_SEQS=16 \
-sbatch --nodelist=g2c12 research/scripts/server/start_p_node.sbatch
+sbatch --nodelist=g2c9 research/scripts/server/start_p_node.sbatch
 ```
 
 ```shell
-VLLM_NIXL_SIDE_CHANNEL_HOST=g2c12 \
+VLLM_NIXL_SIDE_CHANNEL_HOST=g2c9 \
 MODEL_PATH=/workplace/home/huangxinying/Models/Qwen2.5-3B/ \
 SERVED_MODEL_NAME=qwen2.5-3b \
 GPU_MEMORY_UTILIZATION=0.6 \
 MAX_MODEL_LEN=4096 \
 MAX_NUM_SEQS=16 \
-sbatch --nodelist=g2c12 research/scripts/server/start_d_node.sbatch
+sbatch --nodelist=g2c9 research/scripts/server/start_d_node.sbatch
 ```
 
 proxy：

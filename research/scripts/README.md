@@ -7,7 +7,8 @@
 - `server/`：启动 PD 分离实验链路的脚本，包括 proxy 服务器和 Slurm 启动脚本。
 - `simple_test/`：最小 RESTFUL 联调前端，用于快速验证 append、update 和混合事件链路。
 - `data_processing/`：把原始 ANNS / crawl 数据构造成 mixed-source replay 数据集。
-- `replay/`：批量回放实验脚本、TTFT 统计和画图脚本。
+- `replay/`：按研究问题拆分的批量回放实验。`segmented_prefill/` 保存第一个
+  创新点，`update_coalescing/` 保存 Update 合并实验设计与后续脚本。
 - `logs/`：Slurm 启动 P/D 节点时输出的日志目录。
 
 ## 推荐阅读顺序
@@ -16,7 +17,7 @@
 
 1. `server/README.md`：先启动 P 节点、D 节点和 proxy。
 2. `simple_test/README.md`：再跑 append-only、update-only 或 mixed 测试。
-3. `replay/README.md`：服务稳定后，再跑批量 replay 和 TTFT 统计。
+3. `replay/README.md`：服务稳定后，选择分段 Prefill 或 Update 合并实验。
 4. `data_processing/README.md`：需要重新构造实验数据时再看。
 
 ## 通用约定

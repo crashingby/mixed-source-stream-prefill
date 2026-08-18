@@ -14,7 +14,7 @@ cd "${REPO_ROOT}"
 
 PYTHON_BIN="${PYTHON_BIN:-${REPO_ROOT}/.venv/bin/python}"
 DATA_DIR="${DATA_DIR:-research/data/mix_source}"
-OUTPUT_DIR="${OUTPUT_DIR:-research/scripts/replay/results}"
+OUTPUT_DIR="${OUTPUT_DIR:-research/scripts/replay/segmented_prefill/results}"
 PROXY_URL="${PROXY_URL:-http://127.0.0.1:8000}"
 MODEL="${MODEL:-qwen2.5-3b}"
 
@@ -112,12 +112,12 @@ run_replay() {
 
 for qps in ${QPS_LIST}; do
   run_replay "stream" \
-    "research/scripts/replay/replay_prompt_stream.py" \
+    "research/scripts/replay/segmented_prefill/replay_prompt_stream.py" \
     "${qps}"
   run_replay "merged-update" \
-    "research/scripts/replay/replay_merged_update.py" \
+    "research/scripts/replay/segmented_prefill/replay_merged_update.py" \
     "${qps}"
   run_replay "normal" \
-    "research/scripts/replay/replay_normal.py" \
+    "research/scripts/replay/segmented_prefill/replay_normal.py" \
     "${qps}"
 done
