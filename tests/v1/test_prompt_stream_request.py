@@ -6,6 +6,7 @@ from unittest.mock import patch
 import pytest
 import torch
 
+from vllm.config import PromptStreamUpdateCoalescingConfig
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.pull_scheduler import (
     NixlPullConnectorScheduler,
     _trim_prompt_stream_local_blocks,
@@ -115,7 +116,7 @@ def _start_request(request: Request, block_size: int = 4) -> None:
         _make_event(
             PromptStreamEventType.APPEND,
             [],
-            source_id="__start__",
+            source_id="__prompt_stream_start__",
             source_type=PromptSourceType.APPEND,
         )
     )
@@ -488,6 +489,155 @@ def test_pending_update_snapshots_are_computed_in_arrival_order() -> None:
     _finish_active_view(request)
 
     assert request.prompt_stream.update_committed_token_ids == [10, 13, 14]
+
+
+def test_prompt_stream_stats_without_coalescing_tracks_each_update() -> None:
+    """未启用合并时，每代 Update 都应独立 admission、执行并计数。"""
+    request = _make_request([1, 2, 3, 4])
+    _start_request(request)
+    _finish_active_view(request)
+
+    # U0 从空 Update 快照增长到 3 tokens，因此完整调度 3 tokens。
+    request.apply_prompt_stream_event(
+        _make_event(
+            PromptStreamEventType.UPDATE,
+            [10, 11, 12],
+            source_id="update",
+            source_type=PromptSourceType.UPDATE,
+        )
+    )
+    request.prepare_prompt_stream_execution(4)
+    _finish_active_view(request)
+
+    # U1 与 U0 的 source-local LCP 为 1；旧 KV 后 2 tokens 失效，新目标
+    # 同样只需调度 LCP 之后的 2 tokens。
+    request.apply_prompt_stream_event(
+        _make_event(
+            PromptStreamEventType.UPDATE,
+            [10, 13, 14],
+            source_id="update",
+            source_type=PromptSourceType.UPDATE,
+            version=1,
+            sequence_no=1,
+        )
+    )
+    request.prepare_prompt_stream_execution(4)
+    _finish_active_view(request)
+
+    assert request.build_prompt_stream_stats() == {
+        "coalescing_enabled": False,
+        "update_events_accepted": 2,
+        "update_works_admitted": 2,
+        "update_works_completed": 2,
+        # 未启用 coalescer 时没有“合并反事实”统计，不能伪装成零收益。
+        "eager_update_prefill_tokens": None,
+        "admitted_update_prefill_tokens": 5,
+        "scheduled_update_prefill_tokens": 5,
+        "saved_update_prefill_tokens": None,
+        "extra_update_prefill_tokens": None,
+        "update_tokens_invalidated": 2,
+    }
+
+
+def test_prompt_stream_stats_track_coalesced_update_window() -> None:
+    """两个 Update 快照合并为一个 work 时应记录真实节省与执行成本。"""
+    request = _make_request([1, 2, 3, 4])
+    request.enable_prompt_stream_update_coalescing(
+        PromptStreamUpdateCoalescingConfig(
+            append_gate="none",
+            update_policy="fixed_window",
+            soft_window_ms=100.0,
+            hard_deadline_ms=200.0,
+        ),
+        now=0.0,
+    )
+    _start_request(request)
+    _finish_active_view(request)
+
+    # eager 反事实中 U0 需要 4 tokens，U1 相对 U0 的 LCP=2、需要 2 tokens。
+    # 两个事件保持在同一窗口内，尚未创建任何 Update work。
+    request.apply_prompt_stream_event(
+        _make_event(
+            PromptStreamEventType.UPDATE,
+            [10, 11, 12, 13],
+            source_id="update",
+            source_type=PromptSourceType.UPDATE,
+        )
+    )
+    request.apply_prompt_stream_event(
+        _make_event(
+            PromptStreamEventType.UPDATE,
+            [10, 11, 14, 15],
+            source_id="update",
+            source_type=PromptSourceType.UPDATE,
+            version=1,
+            sequence_no=1,
+        )
+    )
+    assert request.prompt_stream is not None
+    assert not request.prompt_stream.pending_work_items
+
+    # 测试只验证 admission 与统计口径，force 模拟固定窗口已经到期。
+    assert request.flush_prompt_stream_update(
+        now=1.0,
+        reason="test_fixed_window_due",
+        force=True,
+    )
+    assert len(request.prompt_stream.pending_work_items) == 1
+
+    request.prepare_prompt_stream_execution(4)
+    _finish_active_view(request)
+
+    assert request.build_prompt_stream_stats() == {
+        "coalescing_enabled": True,
+        "update_events_accepted": 2,
+        "update_works_admitted": 1,
+        "update_works_completed": 1,
+        "eager_update_prefill_tokens": 6,
+        "admitted_update_prefill_tokens": 4,
+        "scheduled_update_prefill_tokens": 4,
+        "saved_update_prefill_tokens": 2,
+        "extra_update_prefill_tokens": 0,
+        "update_tokens_invalidated": 0,
+    }
+
+
+def test_append_only_prompt_stream_stats_have_no_update_counterfactual() -> None:
+    """Append-only 请求不应输出不适用的 Update 合并收益数值。"""
+    request = _make_request([1, 2, 3, 4])
+    request.enable_prompt_stream_update_coalescing(
+        PromptStreamUpdateCoalescingConfig(
+            append_gate="none",
+            update_policy="immediate",
+        ),
+        now=0.0,
+    )
+    _start_request(request)
+    _finish_active_view(request)
+
+    request.apply_prompt_stream_event(
+        _make_event(
+            PromptStreamEventType.APPEND,
+            [5, 6],
+            source_id="append",
+            source_type=PromptSourceType.APPEND,
+        )
+    )
+    request.prepare_prompt_stream_execution(4)
+    _finish_active_view(request)
+
+    assert request.build_prompt_stream_stats() == {
+        "coalescing_enabled": True,
+        "update_events_accepted": 0,
+        "update_works_admitted": 0,
+        "update_works_completed": 0,
+        "eager_update_prefill_tokens": None,
+        "admitted_update_prefill_tokens": 0,
+        "scheduled_update_prefill_tokens": 0,
+        "saved_update_prefill_tokens": None,
+        "extra_update_prefill_tokens": None,
+        "update_tokens_invalidated": 0,
+    }
 
 
 def test_active_update_is_not_discarded_by_later_snapshot() -> None:

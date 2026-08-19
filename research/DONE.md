@@ -932,7 +932,10 @@ P 和 proxy 在 finish 成功后都会删除各自的长期 session，避免已�
   该请求标记为 `FINISHED_ERROR` 并释放两个 segment；start 和后续 event 都走
   请求级失败，不再让长度异常退出整个调度循环。由于 event 是异步 ack，具体
   超长原因还没有通过独立错误通道回传给已经返回的 `/event`。
-- `total_tokens_recomputed` 统计字段尚未完整维护。
+- 旧的 `total_tokens_recomputed` 已删除。当前通过最终响应中的
+  `prompt_stream_stats` 分别报告 `admitted_update_prefill_tokens`、
+  `scheduled_update_prefill_tokens` 和 `update_tokens_invalidated`，避免把逻辑
+  admission、Scheduler 重复调度和语义失效混为同一指标。
 
 下一步最有价值的验证是把三类 smoke test 固化成可重复脚本或 pytest 集成测试，
 并系统记录 P 日志中的：

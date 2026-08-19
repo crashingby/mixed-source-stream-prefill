@@ -6,6 +6,10 @@
 
 运行前需要先按照 `research/scripts/server/README.md` 启动 P 节点、D 节点和 proxy。
 
+三个脚本都会从 finish 响应顶层解析 `prompt_stream_stats`；字段缺失、类型非法或
+统计关系不一致时会直接失败。重点输出包括 `saved_update_prefill_tokens`、
+`scheduled_update_prefill_tokens` 和 `update_tokens_invalidated`。
+
 ## 参数关系
 
 三个脚本的常用参数基本一致：

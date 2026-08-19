@@ -2293,6 +2293,7 @@ class Scheduler(SchedulerInterface):
             new_token_ids = generated_token_ids
             pooler_output = pooler_outputs[req_index] if pooler_outputs else None
             kv_transfer_params = None
+            prompt_stream_stats = None
             status_before_stop = request.status
             num_output_tokens_before = len(request._output_token_ids)
 
@@ -2370,6 +2371,8 @@ class Scheduler(SchedulerInterface):
                 finish_reason = request.get_finished_reason()
                 finished = self._handle_stopped_request(request)
                 if finished:
+                    # Request 释放后流式状态不可再访问，因此必须先冻结最终统计。
+                    prompt_stream_stats = request.build_prompt_stream_stats()
                     kv_transfer_params = self._free_request(request)
 
                 if status_before_stop == RequestStatus.RUNNING:
@@ -2412,6 +2415,7 @@ class Scheduler(SchedulerInterface):
                         trace_headers=request.trace_headers,
                         routed_experts=routed_experts,
                         num_nans_in_logits=request.num_nans_in_logits,
+                        prompt_stream_stats=prompt_stream_stats,
                     )
                 )
             else:

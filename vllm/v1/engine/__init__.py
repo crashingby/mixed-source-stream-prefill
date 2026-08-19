@@ -201,6 +201,9 @@ class EngineCoreOutput(
     # A value greater than 0 indicates that the output is corrupted.
     num_nans_in_logits: int = 0
 
+    # Prompt Stream 请求的最终实验统计。普通请求以及非最终输出保持为 None。
+    prompt_stream_stats: dict[str, Any] | None = None
+
     @property
     def finished(self) -> bool:
         return self.finish_reason is not None

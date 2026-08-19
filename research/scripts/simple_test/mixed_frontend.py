@@ -9,6 +9,11 @@ from typing import Any, Literal, cast
 
 import httpx
 
+from prompt_stream_stats import (
+    parse_prompt_stream_stats,
+    print_prompt_stream_stats,
+)
+
 
 PromptStreamEventKind = Literal["append", "update"]
 
@@ -479,6 +484,14 @@ def run_mixed_demo(args: argparse.Namespace) -> None:
             finish_payload,
         )
         _print_json("finish response", finish_response)
+        num_sent_update_events = sum(
+            event.event_kind == "update" for event in mixed_events
+        )
+        prompt_stream_stats = parse_prompt_stream_stats(
+            finish_response,
+            num_sent_update_events=num_sent_update_events,
+        )
+        print_prompt_stream_stats(prompt_stream_stats)
 
 
 def main() -> None:

@@ -55,6 +55,7 @@ class PromptStreamPrefillOutput:
     text: str
     finish_reason: str | None
     stop_reason: int | str | None
+    prompt_stream_stats: dict[str, Any] | None
 
 
 class PromptStreamServing:
@@ -224,6 +225,7 @@ class PromptStreamServing:
                 output_text=prefill_output.text,
                 output_finish_reason=prefill_output.finish_reason,
                 output_stop_reason=prefill_output.stop_reason,
+                prompt_stream_stats=prefill_output.prompt_stream_stats,
             )
             self.sessions.pop(session.request_id, None)
             return response
@@ -453,7 +455,7 @@ class PromptStreamServing:
 
         Returns:
             P 节点为了完成 PD prefill 采样出的首个 decode token、文本、停止
-            原因以及 connector 参数。
+            原因、connector 参数以及 Prompt Stream 最终统计。
         """
         while True:
             output = await session.collector.get()
@@ -475,6 +477,7 @@ class PromptStreamServing:
                     text=completion_output.text,
                     finish_reason=completion_output.finish_reason,
                     stop_reason=completion_output.stop_reason,
+                    prompt_stream_stats=output.prompt_stream_stats,
                 )
             if output.finished:
                 raise ValueError(

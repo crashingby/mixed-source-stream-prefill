@@ -173,7 +173,6 @@ mkdir -p research/scripts/logs
 
 ```shell
 VLLM_NIXL_SIDE_CHANNEL_HOST=g2c9 \
-PROMPT_STREAM_UPDATE_COALESCING_CONFIG='{"append_gate":"hold_until_append_finished","update_policy":"fixed_window","soft_window_ms":20,"hard_deadline_ms":80}' \
 MODEL_PATH=/workplace/home/huangxinying/Models/Qwen2.5-3B/ \
 SERVED_MODEL_NAME=qwen2.5-3b \
 GPU_MEMORY_UTILIZATION=0.6 \
@@ -184,12 +183,23 @@ sbatch --nodelist=g2c9 research/scripts/server/start_p_node.sbatch
 
 ```shell
 VLLM_NIXL_SIDE_CHANNEL_HOST=g2c9 \
+PROMPT_STREAM_UPDATE_COALESCING_CONFIG='{"append_gate":"hold_until_append_finished","update_policy":"fixed_window","soft_window_ms":20,"hard_deadline_ms":80}' \
 MODEL_PATH=/workplace/home/huangxinying/Models/Qwen2.5-3B/ \
 SERVED_MODEL_NAME=qwen2.5-3b \
 GPU_MEMORY_UTILIZATION=0.6 \
 MAX_MODEL_LEN=4096 \
 MAX_NUM_SEQS=16 \
-sbatch --nodelist=g2c9 research/scripts/server/start_d_node.sbatch
+sbatch --nodelist=g2c9 research/scripts/server/start_p_node.sbatch
+```
+
+```shell
+VLLM_NIXL_SIDE_CHANNEL_HOST=g2c14 \
+MODEL_PATH=/workplace/home/huangxinying/Models/Qwen2.5-3B/ \
+SERVED_MODEL_NAME=qwen2.5-3b \
+GPU_MEMORY_UTILIZATION=0.6 \
+MAX_MODEL_LEN=4096 \
+MAX_NUM_SEQS=16 \
+sbatch --nodelist=g2c14 research/scripts/server/start_d_node.sbatch
 ```
 
 proxy：
@@ -198,8 +208,8 @@ proxy：
 .venv/bin/python research/scripts/server/proxy_server.py \
   --host 0.0.0.0 \
   --port 8000 \
-  --prefiller-hosts g2c12 \
+  --prefiller-hosts g2c9 \
   --prefiller-ports 8100 \
-  --decoder-hosts g2c12 \
+  --decoder-hosts g2c14 \
   --decoder-ports 8200
 ```

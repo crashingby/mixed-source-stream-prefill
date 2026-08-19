@@ -114,6 +114,9 @@ class UpdateCoalescingState:
     last_update_time: float | None = None
     # 最近一次合法 Update 的跨窗口到达时间。
     last_observed_update_time: float | None = None
+    # 最近一次合法 Update 到达时绑定的 Append epoch。跨 epoch 的 eager
+    # 反事实不能复用旧 Update LCP，必须按从零 Prefill 计数。
+    last_observed_update_append_epoch: int | None = None
     # interval 与 gain EWMA 各自拥有独立的跨窗口观测数。
     interval_observation_count: int = 0
     gain_observation_count: int = 0
@@ -133,6 +136,10 @@ class UpdateCoalescingState:
     # 到达间隔与覆盖收益的请求级 EWMA。
     interval_ewma: float | None = None
     merge_gain_ewma: float | None = None
+    # 统计口径中的最近一次逻辑 admission。它不随 preemption 回退，避免
+    # 恢复物理 KV 时把同一目标重复计为算法创建的 work。
+    stats_last_admitted_token_ids: tuple[int, ...] = ()
+    stats_last_admitted_append_epoch: int | None = None
 
 
 @dataclass
@@ -170,6 +177,9 @@ class PromptStreamWorkItem:
     question_token_ids: tuple[int, ...] | None = None
     # 当前 work item 已完成的 segment-local token 数。
     num_computed_tokens: int = 0
+    # 当前 Update work 是否代表一次新的算法 admission。preemption 恢复
+    # 可能重建相同目标，此时仍累计 scheduled token，但不重复累计 work 完成数。
+    count_as_admitted_update_work: bool = True
 
 
 @dataclass(frozen=True)
@@ -281,6 +291,45 @@ class PromptSourceState:
     finished_chunk_id: str | None = None
 
 
+@dataclass(frozen=True)
+class PromptStreamTokenStats:
+    """保存单个 Prompt Stream 请求的只读 token 统计快照。
+
+    所有字段均为 JSON 可表达的标量。调用方可以直接使用 ``to_dict()``
+    构造跨进程或 REST 响应载荷；快照本身不会随 Request 后续状态变化。
+    """
+
+    coalescing_enabled: bool
+    update_events_accepted: int
+    update_works_admitted: int
+    update_works_completed: int
+    eager_update_prefill_tokens: int | None
+    admitted_update_prefill_tokens: int
+    scheduled_update_prefill_tokens: int
+    saved_update_prefill_tokens: int | None
+    extra_update_prefill_tokens: int | None
+    update_tokens_invalidated: int
+
+    def to_dict(self) -> dict[str, bool | int | None]:
+        """返回可直接交给 msgspec/JSON 的独立字典。"""
+        return {
+            "coalescing_enabled": self.coalescing_enabled,
+            "update_events_accepted": self.update_events_accepted,
+            "update_works_admitted": self.update_works_admitted,
+            "update_works_completed": self.update_works_completed,
+            "eager_update_prefill_tokens": self.eager_update_prefill_tokens,
+            "admitted_update_prefill_tokens": (
+                self.admitted_update_prefill_tokens
+            ),
+            "scheduled_update_prefill_tokens": (
+                self.scheduled_update_prefill_tokens
+            ),
+            "saved_update_prefill_tokens": self.saved_update_prefill_tokens,
+            "extra_update_prefill_tokens": self.extra_update_prefill_tokens,
+            "update_tokens_invalidated": self.update_tokens_invalidated,
+        }
+
+
 @dataclass
 class PromptStreamState:
     """保存一个 Request 内部的多源流式 prompt 状态。"""
@@ -299,10 +348,20 @@ class PromptStreamState:
     finished: bool
     # prompt 每次真实变化后递增，用于防止使用旧状态 decode。
     revision: int
-    # 累计失效 token 数。
+    # 已经写入 UPDATE KV、但因新快照 LCP 缩短而失效的 token 累计。
     total_tokens_invalidated: int
-    # 累计重算 token 数。
-    total_tokens_recomputed: int
+    # 请求生命周期内通过协议校验且真实改变内容的 Update 事件数。
+    update_events_accepted: int
+    # 算法真正创建的 Update work 数；preemption 恢复不重复增加。
+    update_works_admitted: int
+    # 已完成的算法 admission work 数；恢复用的合成 work 不计入。
+    update_works_completed: int
+    # 逐 Update 立即执行反事实下需要 Prefill 的 Update token 累计。
+    total_eager_update_prefill_tokens: int
+    # 合并策略真正 admission 的 Update token 累计。
+    total_admitted_update_prefill_tokens: int
+    # Scheduler 实际推进的 Update token 累计，preemption 重放会重复增加。
+    total_scheduled_update_prefill_tokens: int
     # prefix+append 物理域已经完成 prefill 的 token 数，包含尾部 padding。
     prefix_append_num_computed_tokens: int = 0
     # 当前 update 快照已经完成 prefill 的 token 数。
@@ -327,6 +386,9 @@ class PromptStreamState:
     # 当前正在 chunked prefill 的 work item；一个 work item 中途不可切换，
     # 防止覆写 PREFIX_APPEND 尾部 padding 后再用旧 padding 作为 Update 前缀。
     active_work_item: PromptStreamWorkItem | None = None
+    # preemption 若打断最新已 admission 的 Update，恢复 work 完成时仍应
+    # 结清原 admission；已经完成后单纯重放物理 KV 则不能重复结算。
+    recovery_update_completion_pending: bool = False
     # 下一次选中 Update work 时需要执行的 UPDATE 域截断边界。事件到达时不
     # 立刻释放块，避免破坏仍在运行或排队等待的旧 Update work。
     pending_update_kv_truncation_keep_tokens: int | None = None
@@ -652,6 +714,59 @@ class Request:
         """
         return self.prompt_stream is not None
 
+    def build_prompt_stream_stats(
+        self,
+    ) -> dict[str, bool | int | None] | None:
+        """构造当前 Prompt Stream 请求的独立可序列化统计快照。
+
+        该接口只读取请求生命周期累计值，不会清空或转移所有权，因此
+        Scheduler 日志和最终网络响应可以安全地重复读取。返回字典与
+        Request 内部状态没有共享的可变引用，修改它不会回写累计器。
+
+        Returns:
+            Prompt Stream 已初始化时返回只读统计；普通请求返回 None。
+            未启用 coalescer 或没有有效 Update 事件时，eager/saved/extra
+            均为 None，避免把“不适用”误写为零收益。
+        """
+        prompt_stream = self.prompt_stream
+        if prompt_stream is None:
+            return None
+
+        coalescing_enabled = prompt_stream.update_coalescing is not None
+        has_update_events = prompt_stream.update_events_accepted > 0
+        if coalescing_enabled and has_update_events:
+            eager_tokens: int | None = (
+                prompt_stream.total_eager_update_prefill_tokens
+            )
+            net_tokens_avoided = (
+                prompt_stream.total_eager_update_prefill_tokens
+                - prompt_stream.total_admitted_update_prefill_tokens
+            )
+            saved_tokens: int | None = max(0, net_tokens_avoided)
+            extra_tokens: int | None = max(0, -net_tokens_avoided)
+        else:
+            eager_tokens = None
+            saved_tokens = None
+            extra_tokens = None
+
+        stats = PromptStreamTokenStats(
+            coalescing_enabled=coalescing_enabled,
+            update_events_accepted=prompt_stream.update_events_accepted,
+            update_works_admitted=prompt_stream.update_works_admitted,
+            update_works_completed=prompt_stream.update_works_completed,
+            eager_update_prefill_tokens=eager_tokens,
+            admitted_update_prefill_tokens=(
+                prompt_stream.total_admitted_update_prefill_tokens
+            ),
+            scheduled_update_prefill_tokens=(
+                prompt_stream.total_scheduled_update_prefill_tokens
+            ),
+            saved_update_prefill_tokens=saved_tokens,
+            extra_update_prefill_tokens=extra_tokens,
+            update_tokens_invalidated=prompt_stream.total_tokens_invalidated,
+        )
+        return stats.to_dict()
+
     def enable_prompt_stream_update_coalescing(
         self,
         config: "PromptStreamUpdateCoalescingConfig",
@@ -729,6 +844,12 @@ class Request:
                 prompt_stream.update_committed_token_ids
             ),
             last_admitted_append_epoch=gate.update_committed_append_epoch,
+            stats_last_admitted_token_ids=tuple(
+                prompt_stream.update_committed_token_ids
+            ),
+            stats_last_admitted_append_epoch=(
+                gate.update_committed_append_epoch
+            ),
         )
 
     @property
@@ -782,15 +903,39 @@ class Request:
         state = self.prompt_stream_update_coalescing_state
         if state is None:
             return
+        assert self.prompt_stream is not None
+        gate = self.prompt_stream.append_update_gate
+        assert gate is not None
         timestamp = time.monotonic() if now is None else now
         config = state.config
 
-        raw_lcp = self._get_common_prefix_len(previous_token_ids, new_token_ids)
+        current_append_epoch = gate.append_epoch
+        same_observed_append_context = (
+            state.last_observed_update_append_epoch is None
+            or state.last_observed_update_append_epoch == current_append_epoch
+        )
+        raw_lcp = (
+            self._get_common_prefix_len(previous_token_ids, new_token_ids)
+            if same_observed_append_context
+            else 0
+        )
         eager_tokens = len(new_token_ids) - raw_lcp
         base_token_ids = list(state.last_admitted_token_ids)
-        base_lcp = self._get_common_prefix_len(base_token_ids, new_token_ids)
+        same_admitted_append_context = (
+            not base_token_ids
+            or state.last_admitted_append_epoch == current_append_epoch
+        )
+        base_lcp = (
+            self._get_common_prefix_len(base_token_ids, new_token_ids)
+            if same_admitted_append_context
+            else 0
+        )
         merged_tokens = len(new_token_ids) - base_lcp
         merge_gain = max(0, eager_tokens - merged_tokens)
+
+        # 事件通过协议校验且内容真实变化后，才进入 eager 反事实累计。
+        self.prompt_stream.update_events_accepted += 1
+        self.prompt_stream.total_eager_update_prefill_tokens += eager_tokens
 
         if state.last_observed_update_time is not None:
             interval = max(
@@ -805,6 +950,7 @@ class Request:
             )
             state.interval_observation_count += 1
         state.last_observed_update_time = timestamp
+        state.last_observed_update_append_epoch = current_append_epoch
 
         gain_alpha = config.gain_ewma_alpha
         state.merge_gain_ewma = (
@@ -1042,6 +1188,40 @@ class Request:
             if same_append_context
             else 0
         )
+
+        # admission 统计使用独立的逻辑链尾，不能跟随 preemption 将物理
+        # execution base 回退到空快照，否则同一目标会被重复计数。
+        stats_base = state.stats_last_admitted_token_ids
+        same_stats_append_context = (
+            not stats_base
+            or state.stats_last_admitted_append_epoch == required_append_epoch
+        )
+        stats_common_prefix_len = (
+            self._get_common_prefix_len(list(stats_base), list(target))
+            if same_stats_append_context
+            else 0
+        )
+        is_new_logical_admission = (
+            target != stats_base
+            or (
+                bool(target)
+                and state.stats_last_admitted_append_epoch
+                != required_append_epoch
+            )
+        )
+        if is_new_logical_admission:
+            admitted_tokens = len(target) - stats_common_prefix_len
+            self.prompt_stream.update_works_admitted += 1
+            self.prompt_stream.total_admitted_update_prefill_tokens += (
+                admitted_tokens
+            )
+            state.stats_last_admitted_token_ids = target
+            state.stats_last_admitted_append_epoch = required_append_epoch
+
+        count_as_admitted_update_work = (
+            is_new_logical_admission
+            or self.prompt_stream.recovery_update_completion_pending
+        )
         self.prompt_stream.pending_work_items.append(
             PromptStreamWorkItem(
                 phase=PromptStreamExecutionPhase.UPDATE,
@@ -1053,8 +1233,10 @@ class Request:
                 execution_base_append_epoch=state.last_admitted_append_epoch,
                 required_append_epoch=required_append_epoch,
                 update_common_prefix_len=common_prefix_len,
+                count_as_admitted_update_work=count_as_admitted_update_work,
             )
         )
+        self.prompt_stream.recovery_update_completion_pending = False
         state.last_admitted_token_ids = target
         state.last_admitted_append_epoch = required_append_epoch
         state.latest_pending_token_ids = None
@@ -1318,7 +1500,12 @@ class Request:
                 finished=False,
                 revision=0,
                 total_tokens_invalidated=0,
-                total_tokens_recomputed=0,
+                update_events_accepted=0,
+                update_works_admitted=0,
+                update_works_completed=0,
+                total_eager_update_prefill_tokens=0,
+                total_admitted_update_prefill_tokens=0,
+                total_scheduled_update_prefill_tokens=0,
                 prefix_append_num_computed_tokens=0,
                 update_num_computed_tokens=0,
                 question_num_computed_tokens=0,
@@ -1597,6 +1784,9 @@ class Request:
         # 因此不能在这里回退全局 update 进度或截断 UPDATE blocks。两项操作
         # 都会延后到对应 work 被 scheduler 选中、前一代已完整物化之后执行。
         if new_update_token_ids != old_update_token_ids:
+            # 新目标覆盖了 preemption 前尚未结清的旧目标；后续 admission
+            # 将为新目标建立自己的完成关系，不能把旧 completion 转嫁给它。
+            prompt_stream.recovery_update_completion_pending = False
             if prompt_stream.update_coalescing is not None:
                 # 合并开启时只覆盖唯一窗口；work 只能由显式 flush 接口创建。
                 self.on_prompt_stream_update_snapshot(
@@ -1606,6 +1796,11 @@ class Request:
                 )
             else:
                 # 默认关闭路径保持每个 Update 事件立即生成不可变 FIFO work。
+                eager_tokens = len(new_update_token_ids) - update_common_prefix_len
+                prompt_stream.update_events_accepted += 1
+                prompt_stream.update_works_admitted += 1
+                prompt_stream.total_eager_update_prefill_tokens += eager_tokens
+                prompt_stream.total_admitted_update_prefill_tokens += eager_tokens
                 prompt_stream.pending_work_items.append(
                     PromptStreamWorkItem(
                         phase=PromptStreamExecutionPhase.UPDATE,
@@ -2188,6 +2383,9 @@ class Request:
                     gate.update_committed_append_epoch = (
                         work_item.required_append_epoch
                     )
+                if work_item.count_as_admitted_update_work:
+                    # 零 forward 截断也是一个完整结束的逻辑 Update work。
+                    prompt_stream.update_works_completed += 1
                 continue
 
             prompt_stream.active_work_item = work_item
@@ -2410,6 +2608,12 @@ class Request:
         view = self.prompt_stream_execution_view
         new_num_computed_tokens = self.num_computed_tokens + num_scheduled_tokens
         active_work_item = prompt_stream.active_work_item
+        if view.phase == PromptStreamExecutionPhase.UPDATE:
+            # 该接口在 Scheduler 完成本轮 schedule 后推进进度，因此这里
+            # 诚实记录 scheduled token；preemption 后的重放会再次累计。
+            prompt_stream.total_scheduled_update_prefill_tokens += (
+                num_scheduled_tokens
+            )
         if view.phase == PromptStreamExecutionPhase.PREFIX_APPEND:
             # PREFIX_APPEND work 的全局位置就是 segment-local 位置。
             local_num_computed_tokens = min(
@@ -2462,6 +2666,8 @@ class Request:
                         gate.update_committed_append_epoch = (
                             active_work_item.required_append_epoch
                         )
+                    if active_work_item.count_as_admitted_update_work:
+                        prompt_stream.update_works_completed += 1
                     prompt_stream.active_work_item = None
         else:
             local_num_computed_tokens = max(
@@ -2490,6 +2696,22 @@ class Request:
         if self.prompt_stream is None:
             return
         prompt_stream = self.prompt_stream
+
+        # 只把“最新逻辑快照对应且尚未完成”的 admission completion 交给
+        # 恢复 work。较旧的排队快照被恢复流程折叠后不会伪装成已完成。
+        latest_update_token_ids = tuple(
+            self._get_prompt_stream_segment_token_ids(PromptSourceType.UPDATE)
+        )
+        candidate_work_items = list(prompt_stream.pending_work_items)
+        if prompt_stream.active_work_item is not None:
+            candidate_work_items.append(prompt_stream.active_work_item)
+        prompt_stream.recovery_update_completion_pending = any(
+            work_item.phase == PromptStreamExecutionPhase.UPDATE
+            and work_item.count_as_admitted_update_work
+            and work_item.update_token_ids == latest_update_token_ids
+            for work_item in candidate_work_items
+        )
+
         prompt_stream.prefix_append_num_computed_tokens = 0
         prompt_stream.update_num_computed_tokens = 0
         prompt_stream.update_committed_token_ids.clear()
@@ -2530,8 +2752,12 @@ class Request:
                         update_token_ids=tuple(update_token_ids),
                         execution_base_token_ids=(),
                         update_common_prefix_len=0,
+                        count_as_admitted_update_work=(
+                            prompt_stream.recovery_update_completion_pending
+                        ),
                     )
                 )
+                prompt_stream.recovery_update_completion_pending = False
             self.enqueue_question_if_ready()
         else:
             # 所有已 admission work 的物理结果均已丢失；以最新逻辑快照重建

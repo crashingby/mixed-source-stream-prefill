@@ -71,7 +71,7 @@ async def finish_prompt_stream(
     request: PromptStreamEventEnvelope,
     raw_request: Request,
 ):
-    """提交 PROMPT_FINISHED，并返回 P 节点的 kv_transfer_params。"""
+    """提交 PROMPT_FINISHED，并返回 P 节点的 KV 参数与实验统计。"""
     try:
         response = await prompt_stream_serving(raw_request).finish(request)
     except ValueError as err:

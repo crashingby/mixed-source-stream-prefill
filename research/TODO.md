@@ -21,8 +21,9 @@
 
 - `PromptStreamState.total_tokens_invalidated`：已经在新 Update work 激活时，
   按旧的已计算 Update 进度减去可复用 LCP 进行累计。
-- `PromptStreamState.total_tokens_recomputed`：字段存在，但目前没有形成完整维护
-  逻辑。
+- 旧的 `PromptStreamState.total_tokens_recomputed` 已删除；当前通过 admitted、
+  scheduled 和 invalidated 三类字段分别表达算法工作量、Scheduler 推进量与
+  语义失效量。
 - `UpdateCoalescingState.hypothetical_eager_tokens`：当前只统计一个尚未 flush
   窗口的 eager token 成本；每次 flush 后会清零，不能直接表示整个请求累计值。
 - `PromptStreamWorkItem.update_common_prefix_len`：可以得到一次真正 admission 的
@@ -52,9 +53,9 @@ Request / Scheduler
     -> replay SSE parser
 ```
 
-当前 `PromptStreamFinishResponse` 只包含 token、文本和 `kv_transfer_params`，没有
-Prompt Stream 统计。proxy 构造的 completions JSON/SSE 也没有保存 Engine 内部的
-失效或合并数据。
+当前链路已经通过独立的 `prompt_stream_stats` 字段完成透传。P 节点在释放 Request
+前冻结统计，proxy 将其保留在最终 JSON 或首个 SSE payload 中；该字段不会进入
+`kv_transfer_params` 或 D 节点请求。
 
 ### 是否应放入网络响应
 
@@ -78,7 +79,7 @@ Prompt Stream 统计。proxy 构造的 completions JSON/SSE 也没有保存 Engi
     "update_works_completed": 4,
     "eager_update_prefill_tokens": 2048,
     "admitted_update_prefill_tokens": 640,
-    "executed_update_prefill_tokens": 640,
+    "scheduled_update_prefill_tokens": 640,
     "saved_update_prefill_tokens": 1408,
     "extra_update_prefill_tokens": 0,
     "update_tokens_invalidated": 96
@@ -153,56 +154,53 @@ saved 字段掩盖实际额外计算。
 - `immediate` controller 应返回接近 0，可用于验证计数逻辑和 controller 开销。
 - fixed、debounce、adaptive 和 full_merge 返回请求级累计值。
 
-### Admission 与实际执行应分开
+### Admission 与实际调度应分开
 
-`admitted_update_prefill_tokens` 是算法决定创建的逻辑 work 成本，不一定等于 GPU
-最终执行量。preemption 或 replay 可能让同一段 token 再次被调度。
+`admitted_update_prefill_tokens` 是算法决定创建的逻辑 work 成本，不一定等于
+Scheduler 实际推进量。preemption 或 replay 可能让同一段 token 再次被调度。
 
-因此建议额外统计：
+当前额外统计：
 
 ```text
-executed_update_prefill_tokens
+scheduled_update_prefill_tokens
 ```
 
-它应在 Update phase 的 scheduled tokens 被确认推进时累计，并包含因 preemption
-发生的重复执行。论文可以同时报告：
+它在 Update phase 的 scheduled tokens 由 Scheduler 确认推进时累计，并包含
+preemption 后的重复调度。该字段只表示 Scheduler 推进的 token 数，不称为
+worker-completed 或严格的 GPU 执行完成量。论文可以同时报告：
 
 - algorithmic saving：eager 对 admitted。
-- realized saving：eager 对 executed。
-
-第一版如果暂时不能得到严格的 worker-completed token，可以先记录 Scheduler 实际
-scheduled 的 Update token，但字段名必须明确为 `scheduled_update_prefill_tokens`，
-不能伪称 completed。
+- scheduled workload reduction：eager 对 scheduled。
 
 ## Request 侧修改方向
 
-- [ ] 新增可序列化的 `PromptStreamTokenStats`，或在 Request 内保存同等字段。
-- [ ] 将 `PromptStreamState.total_tokens_invalidated` 明确为 Update 语义失效累计；
+- [x] 新增可序列化的 `PromptStreamTokenStats`，并在 Request 内维护请求级累计值。
+- [x] 将 `PromptStreamState.total_tokens_invalidated` 明确为 Update 语义失效累计；
   保持当前在 Update work 激活时增加的时机。
-- [ ] 新增请求级 `total_eager_update_prefill_tokens`，不能复用 flush 后会清零的
+- [x] 新增请求级 `total_eager_update_prefill_tokens`，不复用 flush 后会清零的
   `hypothetical_eager_tokens`。
-- [ ] 新增请求级 `total_admitted_update_prefill_tokens`。在
-  `flush_prompt_stream_update()` 冻结 Update work 时，使用最终 target 与 execution
-  base 的 LCP 增加该值。
-- [ ] 默认无 coalescer 的即时 Update work 也增加 admitted/completed/invalidated 等
+- [x] 新增请求级 `total_admitted_update_prefill_tokens`。在
+  `flush_prompt_stream_update()` 冻结 Update work 时，使用最终 target 与独立统计
+  admission base 的 LCP 增加该值。
+- [x] 默认无 coalescer 的即时 Update work 也增加 admitted/completed/invalidated 等
   通用计数，但 saved 字段保持 `None`。
-- [ ] 新增 `update_events_accepted`、`update_works_admitted`、
+- [x] 新增 `update_events_accepted`、`update_works_admitted`、
   `update_works_completed`，用于校验 token 统计是否与 work 生命周期一致。
-- [ ] 明确重复事件、完全相同快照和协议拒绝事件不增加 accepted 计数。
-- [ ] 在请求成功结束前提供只读 `build_prompt_stream_stats()`，返回不可变快照；
+- [x] 明确重复事件、完全相同快照和协议拒绝事件不增加 accepted 计数。
+- [x] 在请求成功结束前提供只读 `build_prompt_stream_stats()`，返回独立字典快照；
   不使用 take-and-clear，避免 finish 日志和网络响应竞争消费。
-- [ ] 整理未完整维护的 `total_tokens_recomputed`：要么用明确口径实现，要么删除，
-  避免它和 admitted/executed/invalidated 三种计数混用。
+- [x] 删除未完整维护的 `total_tokens_recomputed`，避免它和 admitted、scheduled、
+  invalidated 三种计数混用。
 
 ## Scheduler 与 Engine 输出修改方向
 
-- [ ] Scheduler 在 P 节点生成最终首 token、释放 Request 之前调用
+- [x] Scheduler 在 P 节点生成最终首 token、释放 Request 之前调用
   `build_prompt_stream_stats()`。必须先快照再 `_free_request()`。
-- [ ] `EngineCoreOutput` 增加可选 `prompt_stream_stats` 字段，普通请求为 `None`。
-- [ ] `OutputProcessor` 将该字段传入 `RequestOutput`。
-- [ ] `RequestOutput` 增加同名可选字段，并在 streamed output 聚合时保留最新的非空
+- [x] `EngineCoreOutput` 增加可选 `prompt_stream_stats` 字段，普通请求为 `None`。
+- [x] `OutputProcessor` 将该字段传入 `RequestOutput`。
+- [x] `RequestOutput` 增加同名可选字段，并在 streamed output 聚合时保留最新的非空
   stats。
-- [ ] stats 只随完成 Prompt Stream Prefill 的那条 P 输出发送一次，避免每轮 chunked
+- [x] stats 只随完成 Prompt Stream Prefill 的那条 P 输出发送一次，避免每轮 chunked
   Prefill 都复制请求级统计。
 - [ ] abort/error 没有正常 finish 响应时，仍通过结构化日志或 Engine metrics 保存
   部分统计，但不伪造成功网络响应。
@@ -213,32 +211,32 @@ connector 忽略未知字段、序列化兼容和 D 侧误读问题。
 
 ## P 节点 REST 响应修改方向
 
-- [ ] `PromptStreamPrefillOutput` 增加 `prompt_stream_stats`。
-- [ ] `_wait_for_finish_output()` 从 `RequestOutput.prompt_stream_stats` 读取并校验。
-- [ ] `PromptStreamFinishResponse` 增加：
+- [x] `PromptStreamPrefillOutput` 增加 `prompt_stream_stats`。
+- [x] `_wait_for_finish_output()` 从 `RequestOutput.prompt_stream_stats` 读取并透传。
+- [x] `PromptStreamFinishResponse` 增加：
 
 ```python
 prompt_stream_stats: dict[str, int | bool | None]
 ```
 
-- [ ] `/v1/prompt_stream/start` 与 `/event` 仍只返回 ACK，不附带累计统计。中途返回
+- [x] `/v1/prompt_stream/start` 与 `/event` 仍只返回 ACK，不附带累计统计。中途返回
   会产生多个互相覆盖的口径，且增加响应开销。
-- [ ] `/v1/prompt_stream/finish` 在成功时返回最终请求级 stats。
+- [x] `/v1/prompt_stream/finish` 在成功时返回最终请求级 stats。
 
 ## proxy 响应修改方向
 
 proxy 收到 P 节点 finish JSON 后，应原样保存 `prompt_stream_stats`，不能重新计算。
 
-- [ ] 非流式 `/v1/prompt_stream/finish`：在最终 completions JSON 顶层加入
+- [x] 非流式 `/v1/prompt_stream/finish`：在最终 completions JSON 顶层加入
   `prompt_stream_stats`。无论请求是否继续访问 D，该字段都来自 P。
-- [ ] 流式 `/v1/prompt_stream/finish`：在 P 首 token 对应的第一个 SSE JSON chunk
+- [x] 流式 `/v1/prompt_stream/finish`：在 P 首 token 对应的第一个 SSE JSON chunk
   顶层加入 `prompt_stream_stats`。后续 D chunk 不重复携带。
-- [ ] `/v1/prompt_stream/finish_ttft`：必须在唯一首 token SSE chunk 中加入 stats。
+- [x] `/v1/prompt_stream/finish_ttft`：在唯一首 token SSE chunk 中加入 stats。
   replay 的 `--ttft-only` 会在首 token 后立即返回，如果 stats 放在 `[DONE]` 前的
   额外尾帧，客户端将无法读取。
-- [ ] `_build_prefill_only_response()`、`_merge_prefill_output()` 和
+- [x] `_build_prefill_only_response()`、`_merge_prefill_output()` 和
   `_build_prefill_stream_chunk()` 使用同一个 helper 附加 stats，避免三个路径字段不一致。
-- [ ] proxy 不把 `prompt_stream_stats` 放进发给 D 的 `kv_transfer_params` 或 decode
+- [x] proxy 不把 `prompt_stream_stats` 放进发给 D 的 `kv_transfer_params` 或 decode
   request。
 
 建议 SSE 首帧形态：
@@ -269,11 +267,11 @@ proxy 收到 P 节点 finish JSON 后，应原样保存 `prompt_stream_stats`，
 - [ ] 扩展 `RequestMetric` 和 `request_metrics.csv`，至少保存：
   `saved_update_prefill_tokens`、`update_tokens_invalidated`、
   `eager_update_prefill_tokens`、`admitted_update_prefill_tokens`、
-  `executed_update_prefill_tokens`、`update_events_accepted` 和
+  `scheduled_update_prefill_tokens`、`update_events_accepted` 和
   `update_works_completed`。
 - [ ] segmented-prefill 实验重点比较 segmented stream 与 merged-update baseline
-  的 `update_tokens_invalidated` 和实际 Update executed tokens。
-- [ ] update-coalescing 实验重点比较 saved/admitted/executed、TTFT 和 work 数。
+  的 `update_tokens_invalidated` 和实际 Update scheduled tokens。
+- [ ] update-coalescing 实验重点比较 saved/admitted/scheduled、TTFT 和 work 数。
 - [ ] summary.json 增加每个字段的 sum、mean、P50/P95；token 总量主结果应优先
   报告全体请求求和，而不是请求平均值。
 - [ ] 结果校验：成功 Prompt Stream 请求缺少 stats 时标记为实验数据错误，不能
@@ -281,19 +279,20 @@ proxy 收到 P 节点 finish JSON 后，应原样保存 `prompt_stream_stats`，
 
 ## 最小正确性用例
 
-- [ ] Append-only：saved 为 `null`，invalidated 为 0。
+- [x] Append-only：启用 coalescer 但没有 Update 时，eager/saved/extra 为 `null`，
+  invalidated 为 0。
 - [ ] 单 Update：coalescing enabled 时 eager 等于 admitted，saved 为 0。
 - [ ] 两个相同 Update：第二个不创建 work，不增加 invalidated；是否计入 accepted
   需要与当前幂等语义保持一致，推荐不计。
 - [ ] Update 尾部追加：LCP 复用旧 KV，invalidated 为 0。
-- [ ] Update 中部替换：invalidated 等于旧已计算快照中 LCP 之后的 token 数。
+- [x] Update 中部替换：invalidated 等于旧已计算快照中 LCP 之后的 token 数。
 - [ ] Update 严格缩短：产生零-forward truncation，仍应累计被截断的 invalidated
   token。
 - [ ] coalescing window 内三次 Update 只 admission 最后一版：eager 为三次即时
   delta 之和，admitted 为 base 到最终 target 的 delta，saved 为二者差。
 - [ ] strict Append gate：Update 在 gate 内被覆盖时只增加 eager/saved，不提前增加
   invalidated。
-- [ ] preemption 后恢复：executed 可以大于 admitted，但 saved 的算法口径不因
+- [ ] preemption 后恢复：scheduled 可以大于 admitted，但 saved 的算法口径不因
   replay 被重复增加。
 - [ ] `finish_ttft`：首个 SSE payload 同时包含首 token 与完整 stats。
 - [ ] 完整 P 到 D decode：最终非流式 JSON 或首个流式 chunk 保留同一份 P stats，
@@ -301,11 +300,11 @@ proxy 收到 P 节点 finish JSON 后，应原样保存 `prompt_stream_stats`，
 
 ## 实施顺序
 
-1. [ ] 先完成 Request 生命周期计数和纯状态测试。
-2. [ ] 再透传 `EngineCoreOutput -> RequestOutput -> PromptStreamFinishResponse`。
-3. [ ] 修改 proxy 的 JSON、完整 SSE 和 TTFT-only SSE 三条返回路径。
+1. [x] 先完成 Request 生命周期计数和纯状态测试。
+2. [x] 再透传 `EngineCoreOutput -> RequestOutput -> PromptStreamFinishResponse`。
+3. [x] 修改 proxy 的 JSON、完整 SSE 和 TTFT-only SSE 三条返回路径。
 4. [ ] 修改 replay CSV 与 summary，确保 stats 缺失时 fail closed。
-5. [ ] 用 `research/scripts/simple_test` 检查单请求返回结构。
+5. [x] `research/scripts/simple_test` 三个脚本已增加最终统计解析和 fail-closed 校验。
 6. [ ] 用 segmented-prefill 的三模式小样本验证 invalidated 统计差异。
 7. [ ] 用 update-coalescing 的最小策略矩阵验证 saved token 与 TTFT 关系。
 
