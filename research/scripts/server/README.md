@@ -210,6 +210,6 @@ proxy：
   --port 8000 \
   --prefiller-hosts g2c9 \
   --prefiller-ports 8100 \
-  --decoder-hosts g2c14 \
+  --decoder-hosts g2c9 \
   --decoder-ports 8200
 ```

@@ -9,7 +9,8 @@
   Update baseline 与普通整段 Prompt。原有回放脚本、QPS sweep、绘图脚本和
   历史结果都已迁入该目录。
 - `update_coalescing/`：第二个创新点的实验目录，用于评估 Update 合并策略。
-  当前先提供完整实验设计，后续回放、批量提交、统计和绘图脚本均放在这里。
+  已包含 P 节点 profile 启动、正式回放、QPS/Update interval sweep、结果汇总和
+  权衡图脚本。
 
 ## 使用入口
 
@@ -25,7 +26,7 @@
 research/scripts/replay/segmented_prefill/results
 ```
 
-Update 合并实验后续统一使用：
+Update 合并实验统一使用：
 
 ```text
 research/scripts/replay/update_coalescing/results

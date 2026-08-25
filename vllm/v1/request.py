@@ -2,11 +2,12 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import enum
+import json
 import math
 import time
 from collections import deque
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -300,6 +301,7 @@ class PromptStreamTokenStats:
     """
 
     coalescing_enabled: bool
+    update_coalescing_config_json: str | None
     update_events_accepted: int
     update_works_admitted: int
     update_works_completed: int
@@ -310,10 +312,13 @@ class PromptStreamTokenStats:
     extra_update_prefill_tokens: int | None
     update_tokens_invalidated: int
 
-    def to_dict(self) -> dict[str, bool | int | None]:
+    def to_dict(self) -> dict[str, bool | int | str | None]:
         """返回可直接交给 msgspec/JSON 的独立字典。"""
         return {
             "coalescing_enabled": self.coalescing_enabled,
+            "update_coalescing_config_json": (
+                self.update_coalescing_config_json
+            ),
             "update_events_accepted": self.update_events_accepted,
             "update_works_admitted": self.update_works_admitted,
             "update_works_completed": self.update_works_completed,
@@ -716,7 +721,7 @@ class Request:
 
     def build_prompt_stream_stats(
         self,
-    ) -> dict[str, bool | int | None] | None:
+    ) -> dict[str, bool | int | str | None] | None:
         """构造当前 Prompt Stream 请求的独立可序列化统计快照。
 
         该接口只读取请求生命周期累计值，不会清空或转移所有权，因此
@@ -732,7 +737,19 @@ class Request:
         if prompt_stream is None:
             return None
 
-        coalescing_enabled = prompt_stream.update_coalescing is not None
+        coalescing_state = prompt_stream.update_coalescing
+        coalescing_enabled = coalescing_state is not None
+        update_coalescing_config_json: str | None = None
+        if coalescing_state is not None:
+            config = coalescing_state.config
+            update_coalescing_config_json = json.dumps(
+                {
+                    config_field.name: getattr(config, config_field.name)
+                    for config_field in fields(config)
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            )
         has_update_events = prompt_stream.update_events_accepted > 0
         if coalescing_enabled and has_update_events:
             eager_tokens: int | None = (
@@ -751,6 +768,7 @@ class Request:
 
         stats = PromptStreamTokenStats(
             coalescing_enabled=coalescing_enabled,
+            update_coalescing_config_json=update_coalescing_config_json,
             update_events_accepted=prompt_stream.update_events_accepted,
             update_works_admitted=prompt_stream.update_works_admitted,
             update_works_completed=prompt_stream.update_works_completed,

@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import json
+from dataclasses import asdict
 from unittest.mock import patch
 
 import pytest
@@ -29,6 +31,17 @@ from vllm.v1.request import (
     PromptStreamKVSegment,
     Request,
 )
+
+
+def _coalescing_config_json(
+    config: PromptStreamUpdateCoalescingConfig,
+) -> str:
+    """按网络统计使用的稳定格式序列化合并配置。"""
+    return json.dumps(
+        asdict(config),
+        sort_keys=True,
+        separators=(",", ":"),
+    )
 
 
 def _make_request(prompt_token_ids: list[int]) -> Request:
@@ -526,6 +539,7 @@ def test_prompt_stream_stats_without_coalescing_tracks_each_update() -> None:
 
     assert request.build_prompt_stream_stats() == {
         "coalescing_enabled": False,
+        "update_coalescing_config_json": None,
         "update_events_accepted": 2,
         "update_works_admitted": 2,
         "update_works_completed": 2,
@@ -542,13 +556,14 @@ def test_prompt_stream_stats_without_coalescing_tracks_each_update() -> None:
 def test_prompt_stream_stats_track_coalesced_update_window() -> None:
     """两个 Update 快照合并为一个 work 时应记录真实节省与执行成本。"""
     request = _make_request([1, 2, 3, 4])
+    coalescing_config = PromptStreamUpdateCoalescingConfig(
+        append_gate="none",
+        update_policy="fixed_window",
+        soft_window_ms=100.0,
+        hard_deadline_ms=200.0,
+    )
     request.enable_prompt_stream_update_coalescing(
-        PromptStreamUpdateCoalescingConfig(
-            append_gate="none",
-            update_policy="fixed_window",
-            soft_window_ms=100.0,
-            hard_deadline_ms=200.0,
-        ),
+        coalescing_config,
         now=0.0,
     )
     _start_request(request)
@@ -590,6 +605,9 @@ def test_prompt_stream_stats_track_coalesced_update_window() -> None:
 
     assert request.build_prompt_stream_stats() == {
         "coalescing_enabled": True,
+        "update_coalescing_config_json": _coalescing_config_json(
+            coalescing_config
+        ),
         "update_events_accepted": 2,
         "update_works_admitted": 1,
         "update_works_completed": 1,
@@ -605,11 +623,12 @@ def test_prompt_stream_stats_track_coalesced_update_window() -> None:
 def test_append_only_prompt_stream_stats_have_no_update_counterfactual() -> None:
     """Append-only 请求不应输出不适用的 Update 合并收益数值。"""
     request = _make_request([1, 2, 3, 4])
+    coalescing_config = PromptStreamUpdateCoalescingConfig(
+        append_gate="none",
+        update_policy="immediate",
+    )
     request.enable_prompt_stream_update_coalescing(
-        PromptStreamUpdateCoalescingConfig(
-            append_gate="none",
-            update_policy="immediate",
-        ),
+        coalescing_config,
         now=0.0,
     )
     _start_request(request)
@@ -628,6 +647,9 @@ def test_append_only_prompt_stream_stats_have_no_update_counterfactual() -> None
 
     assert request.build_prompt_stream_stats() == {
         "coalescing_enabled": True,
+        "update_coalescing_config_json": _coalescing_config_json(
+            coalescing_config
+        ),
         "update_events_accepted": 0,
         "update_works_admitted": 0,
         "update_works_completed": 0,
