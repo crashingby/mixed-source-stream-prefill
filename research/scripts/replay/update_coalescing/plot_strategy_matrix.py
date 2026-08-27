@@ -116,6 +116,15 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--min-stats-coverage",
+        type=float,
+        default=0.95,
+        help=(
+            "Cells below this recovery-safe token-statistics coverage are "
+            "marked unreliable and excluded. Defaults to 0.95."
+        ),
+    )
+    parser.add_argument(
         "--ttft-percentile",
         choices=("p50", "p90", "p95", "p99"),
         default="p95",
@@ -157,11 +166,17 @@ def _profile_sort_key(profile: str) -> tuple[int, str]:
         return (len(DEFAULT_PROFILE_ORDER), profile)
 
 
-def _is_reliable(point: ConfigurationPoint, min_success_rate: float) -> bool:
+def _is_reliable(
+    point: ConfigurationPoint,
+    min_success_rate: float,
+    min_stats_coverage: float,
+) -> bool:
     """判断配置点能否进入正式性能与 winner 比较。"""
     return (
         point.success_rate is not None
         and point.success_rate >= min_success_rate
+        and point.token_stats_coverage is not None
+        and point.token_stats_coverage >= min_stats_coverage
     )
 
 
@@ -258,6 +273,7 @@ def _draw_ttft_matrix(
     percentile: TtftPercentile,
     baseline_profile: str,
     min_success_rate: float,
+    min_stats_coverage: float,
 ) -> None:
     """绘制绝对 TTFT、相对 baseline 变化和每列最优策略。"""
     matrix = np.full((len(profiles), len(columns)), np.nan)
@@ -268,7 +284,9 @@ def _draw_ttft_matrix(
         baseline_point = point_index.get((baseline_profile, update_interval, qps))
         baseline_ttft = None
         if baseline_point is not None and _is_reliable(
-            baseline_point, min_success_rate
+            baseline_point,
+            min_success_rate,
+            min_stats_coverage,
         ):
             baseline_ttft = baseline_point.ttft_ms(percentile)
 
@@ -278,14 +296,24 @@ def _draw_ttft_matrix(
             if point is None:
                 annotations[(row_index, column_index)] = "missing"
                 continue
-            if not _is_reliable(point, min_success_rate):
+            if not _is_reliable(
+                point,
+                min_success_rate,
+                min_stats_coverage,
+            ):
                 success_percent = (
                     point.success_rate * 100
                     if point.success_rate is not None
                     else math.nan
                 )
+                coverage_percent = (
+                    point.token_stats_coverage * 100
+                    if point.token_stats_coverage is not None
+                    else math.nan
+                )
                 annotations[(row_index, column_index)] = (
-                    f"{success_percent:.1f}% success\nunreliable"
+                    f"{success_percent:.1f}% success\n"
+                    f"{coverage_percent:.1f}% stats\nunreliable"
                 )
                 continue
             ttft_ms = point.ttft_ms(percentile)
@@ -340,6 +368,7 @@ def _draw_token_saving_matrix(
     point_index: dict[tuple[str, float, float], ConfigurationPoint],
     *,
     min_success_rate: float,
+    min_stats_coverage: float,
 ) -> None:
     """绘制 token saving ratio、每请求节省量和每列最优策略。"""
     matrix = np.full((len(profiles), len(columns)), np.nan)
@@ -353,14 +382,24 @@ def _draw_token_saving_matrix(
             if point is None:
                 annotations[(row_index, column_index)] = "missing"
                 continue
-            if not _is_reliable(point, min_success_rate):
+            if not _is_reliable(
+                point,
+                min_success_rate,
+                min_stats_coverage,
+            ):
                 success_percent = (
                     point.success_rate * 100
                     if point.success_rate is not None
                     else math.nan
                 )
+                coverage_percent = (
+                    point.token_stats_coverage * 100
+                    if point.token_stats_coverage is not None
+                    else math.nan
+                )
                 annotations[(row_index, column_index)] = (
-                    f"{success_percent:.1f}% success\nunreliable"
+                    f"{success_percent:.1f}% success\n"
+                    f"{coverage_percent:.1f}% stats\nunreliable"
                 )
                 continue
             if point.token_saving_ratio is None:
@@ -439,12 +478,13 @@ def plot_strategy_matrix(
     percentile: TtftPercentile,
     baseline_profile: str,
     min_success_rate: float,
+    min_stats_coverage: float,
     title: str,
     dpi: int,
 ) -> None:
     """把选中的配置点绘制为 TTFT 和 token saving 双矩阵。
 
-    灰色单元格表示数据缺失、不适用或成功率低于阈值。橙色边框只在可靠
+    灰色单元格表示数据缺失、不适用、成功率或统计覆盖率低于阈值。橙色边框只在可靠
     配置中标记每个 `(Update interval, QPS)` 列的最优策略。
 
     Args:
@@ -453,6 +493,7 @@ def plot_strategy_matrix(
         percentile: TTFT 矩阵使用的百分位。
         baseline_profile: TTFT 相对变化使用的基线策略。
         min_success_rate: 进入性能比较所需的最低成功率。
+        min_stats_coverage: 进入性能比较所需的最低统计覆盖率。
         title: 整张图的标题。
         dpi: PNG 输出分辨率。
     """
@@ -460,6 +501,8 @@ def plot_strategy_matrix(
         raise ValueError("No configuration points remain after filtering.")
     if not 0.0 <= min_success_rate <= 1.0:
         raise ValueError("--min-success-rate must be between 0 and 1.")
+    if not 0.0 <= min_stats_coverage <= 1.0:
+        raise ValueError("--min-stats-coverage must be between 0 and 1.")
 
     workload_ids = {point.workload_id for point in points}
     if len(workload_ids) != 1:
@@ -504,6 +547,7 @@ def plot_strategy_matrix(
         percentile=percentile,
         baseline_profile=baseline_profile,
         min_success_rate=min_success_rate,
+        min_stats_coverage=min_stats_coverage,
     )
     _draw_token_saving_matrix(
         saving_axis,
@@ -511,6 +555,7 @@ def plot_strategy_matrix(
         columns,
         point_index,
         min_success_rate=min_success_rate,
+        min_stats_coverage=min_stats_coverage,
     )
     for axis in axes:
         _configure_matrix_axis(
@@ -525,7 +570,8 @@ def plot_strategy_matrix(
         0.5,
         -0.015,
         "Orange border = best reliable strategy in the column; gray = N/A, "
-        f"missing, or success rate < {min_success_rate:.0%}.",
+        f"missing, success < {min_success_rate:.0%}, or stats coverage < "
+        f"{min_stats_coverage:.0%}.",
         ha="center",
         fontsize=9,
     )
@@ -559,6 +605,7 @@ def main() -> None:
         percentile=args.ttft_percentile,
         baseline_profile=args.baseline_profile,
         min_success_rate=args.min_success_rate,
+        min_stats_coverage=args.min_stats_coverage,
         title=args.title,
         dpi=args.dpi,
     )

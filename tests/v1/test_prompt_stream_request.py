@@ -27,8 +27,10 @@ from vllm.v1.kv_cache_interface import (
     KVCacheGroupSpec,
 )
 from vllm.v1.request import (
+    PromptStreamExecutionOrigin,
     PromptStreamExecutionPhase,
     PromptStreamKVSegment,
+    PromptStreamRecoveryReason,
     Request,
 )
 
@@ -42,6 +44,61 @@ def _coalescing_config_json(
         sort_keys=True,
         separators=(",", ":"),
     )
+
+
+def _expected_prompt_stream_stats(
+    *,
+    coalescing_enabled: bool,
+    config_json: str | None,
+    events: int,
+    admitted: int,
+    completed: int,
+    eager_tokens: int | None,
+    policy_tokens: int,
+    scheduled_tokens: int,
+    saved_tokens: int | None,
+    extra_tokens: int | None,
+    invalidated_tokens: int,
+) -> dict[str, bool | int | str | None]:
+    """构造无 recovery 压力时的完整 schema-v2 统计。"""
+    return {
+        "metrics_schema_version": 2,
+        "coalescing_enabled": coalescing_enabled,
+        "update_coalescing_config_json": config_json,
+        "update_events_accepted": events,
+        "update_policy_works_admitted": admitted,
+        "update_policy_works_completed": completed,
+        "update_policy_works_cancelled_by_recovery": 0,
+        "update_policy_works_outstanding": admitted - completed,
+        "update_works_admitted": admitted,
+        "update_works_completed": completed,
+        "eager_update_prefill_tokens": eager_tokens,
+        "policy_admitted_update_prefill_tokens": policy_tokens,
+        "policy_saved_update_prefill_tokens": saved_tokens,
+        "policy_extra_update_prefill_tokens": extra_tokens,
+        "admitted_update_prefill_tokens": policy_tokens,
+        "scheduled_update_prefill_tokens": scheduled_tokens,
+        "saved_update_prefill_tokens": saved_tokens,
+        "extra_update_prefill_tokens": extra_tokens,
+        "update_tokens_invalidated": invalidated_tokens,
+        "update_tokens_invalidated_by_snapshot": invalidated_tokens,
+        "update_execution_attempts_started": admitted,
+        "update_execution_attempts_completed": completed,
+        "update_execution_attempts_preempted": 0,
+        "update_recovery_works_created": 0,
+        "update_tokens_scheduled_total": scheduled_tokens,
+        "update_tokens_scheduled_for_recovery": 0,
+        "prefix_append_tokens_scheduled_for_recovery": 0,
+        "update_tokens_discarded_by_preemption": 0,
+        "prefix_append_tokens_discarded_by_preemption": 0,
+        "question_tokens_discarded_by_preemption": 0,
+        "prompt_stream_running_preemptions": 0,
+        "prompt_stream_dormant_evictions": 0,
+        "prompt_stream_retained_waiting_evictions": 0,
+        "prompt_stream_prefix_cache_resets": 0,
+        "prompt_stream_allocation_failures_running": 0,
+        "prompt_stream_allocation_failures_waiting": 0,
+    }
 
 
 def _make_request(prompt_token_ids: list[int]) -> Request:
@@ -537,20 +594,21 @@ def test_prompt_stream_stats_without_coalescing_tracks_each_update() -> None:
     request.prepare_prompt_stream_execution(4)
     _finish_active_view(request)
 
-    assert request.build_prompt_stream_stats() == {
-        "coalescing_enabled": False,
-        "update_coalescing_config_json": None,
-        "update_events_accepted": 2,
-        "update_works_admitted": 2,
-        "update_works_completed": 2,
-        # 未启用 coalescer 时没有“合并反事实”统计，不能伪装成零收益。
-        "eager_update_prefill_tokens": None,
-        "admitted_update_prefill_tokens": 5,
-        "scheduled_update_prefill_tokens": 5,
-        "saved_update_prefill_tokens": None,
-        "extra_update_prefill_tokens": None,
-        "update_tokens_invalidated": 2,
-    }
+    assert request.build_prompt_stream_stats() == (
+        _expected_prompt_stream_stats(
+            coalescing_enabled=False,
+            config_json=None,
+            events=2,
+            admitted=2,
+            completed=2,
+            eager_tokens=None,
+            policy_tokens=5,
+            scheduled_tokens=5,
+            saved_tokens=None,
+            extra_tokens=None,
+            invalidated_tokens=2,
+        )
+    )
 
 
 def test_prompt_stream_stats_track_coalesced_update_window() -> None:
@@ -603,21 +661,21 @@ def test_prompt_stream_stats_track_coalesced_update_window() -> None:
     request.prepare_prompt_stream_execution(4)
     _finish_active_view(request)
 
-    assert request.build_prompt_stream_stats() == {
-        "coalescing_enabled": True,
-        "update_coalescing_config_json": _coalescing_config_json(
-            coalescing_config
-        ),
-        "update_events_accepted": 2,
-        "update_works_admitted": 1,
-        "update_works_completed": 1,
-        "eager_update_prefill_tokens": 6,
-        "admitted_update_prefill_tokens": 4,
-        "scheduled_update_prefill_tokens": 4,
-        "saved_update_prefill_tokens": 2,
-        "extra_update_prefill_tokens": 0,
-        "update_tokens_invalidated": 0,
-    }
+    assert request.build_prompt_stream_stats() == (
+        _expected_prompt_stream_stats(
+            coalescing_enabled=True,
+            config_json=_coalescing_config_json(coalescing_config),
+            events=2,
+            admitted=1,
+            completed=1,
+            eager_tokens=6,
+            policy_tokens=4,
+            scheduled_tokens=4,
+            saved_tokens=2,
+            extra_tokens=0,
+            invalidated_tokens=0,
+        )
+    )
 
 
 def test_append_only_prompt_stream_stats_have_no_update_counterfactual() -> None:
@@ -645,21 +703,21 @@ def test_append_only_prompt_stream_stats_have_no_update_counterfactual() -> None
     request.prepare_prompt_stream_execution(4)
     _finish_active_view(request)
 
-    assert request.build_prompt_stream_stats() == {
-        "coalescing_enabled": True,
-        "update_coalescing_config_json": _coalescing_config_json(
-            coalescing_config
-        ),
-        "update_events_accepted": 0,
-        "update_works_admitted": 0,
-        "update_works_completed": 0,
-        "eager_update_prefill_tokens": None,
-        "admitted_update_prefill_tokens": 0,
-        "scheduled_update_prefill_tokens": 0,
-        "saved_update_prefill_tokens": None,
-        "extra_update_prefill_tokens": None,
-        "update_tokens_invalidated": 0,
-    }
+    assert request.build_prompt_stream_stats() == (
+        _expected_prompt_stream_stats(
+            coalescing_enabled=True,
+            config_json=_coalescing_config_json(coalescing_config),
+            events=0,
+            admitted=0,
+            completed=0,
+            eager_tokens=None,
+            policy_tokens=0,
+            scheduled_tokens=0,
+            saved_tokens=None,
+            extra_tokens=None,
+            invalidated_tokens=0,
+        )
+    )
 
 
 def test_active_update_is_not_discarded_by_later_snapshot() -> None:
@@ -805,6 +863,335 @@ def test_preemption_replays_all_segments() -> None:
     assert request.prompt_stream is not None
     assert request.prompt_stream.update_num_computed_tokens == 0
     assert manager.allocate_slots(request, num_new_tokens=4) is not None
+
+
+def test_latest_only_recovery_carries_only_newest_admission() -> None:
+    """Recovery 取消旧 active admission，并沿用最新 pending 的稳定 ID。"""
+    request = _make_request([1, 2, 3, 4])
+    _start_request(request)
+    _finish_active_view(request)
+
+    request.apply_prompt_stream_event(
+        _make_event(
+            PromptStreamEventType.UPDATE,
+            [10, 11, 12],
+            source_id="update",
+            source_type=PromptSourceType.UPDATE,
+        )
+    )
+    request.prepare_prompt_stream_execution(4)
+    _finish_active_view(request)
+
+    request.apply_prompt_stream_event(
+        _make_event(
+            PromptStreamEventType.UPDATE,
+            [10, 21, 22],
+            source_id="update",
+            source_type=PromptSourceType.UPDATE,
+            version=1,
+            sequence_no=1,
+        )
+    )
+    request.prepare_prompt_stream_execution(4)
+    request.advance_prompt_stream_computed_tokens(1)
+
+    request.apply_prompt_stream_event(
+        _make_event(
+            PromptStreamEventType.UPDATE,
+            [10, 31, 32],
+            source_id="update",
+            source_type=PromptSourceType.UPDATE,
+            version=2,
+            sequence_no=2,
+        )
+    )
+    assert request.prompt_stream is not None
+    pending_admission_id = (
+        request.prompt_stream.pending_work_items[-1].update_admission_id
+    )
+    assert pending_admission_id == 3
+
+    first_delta = request.reset_prompt_stream_computed_state(
+        PromptStreamRecoveryReason.RUNNING_PREEMPTION
+    )
+    assert first_delta is not None
+    assert first_delta.cancelled_update_admission_ids == (2,)
+    assert first_delta.carried_update_admission_id == pending_admission_id
+    recovery_update = request.prompt_stream.pending_work_items[-1]
+    assert recovery_update.update_admission_id == pending_admission_id
+    assert (
+        recovery_update.execution_origin
+        == PromptStreamExecutionOrigin.RECOVERY
+    )
+
+    # 第二次 reset 只能继续携带 U3，不能再次取消已经终结的 U2。
+    second_delta = request.reset_prompt_stream_computed_state(
+        PromptStreamRecoveryReason.PREFIX_CACHE_RESET
+    )
+    assert second_delta is not None
+    assert second_delta.cancelled_update_admission_ids == ()
+    assert second_delta.carried_update_admission_id == pending_admission_id
+
+    request.prepare_prompt_stream_execution(4)
+    _finish_active_view(request)
+    request.prepare_prompt_stream_execution(4)
+    _finish_active_view(request)
+
+    stats = request.build_prompt_stream_stats()
+    assert stats is not None
+    assert stats["update_policy_works_admitted"] == 3
+    assert stats["update_policy_works_completed"] == 2
+    assert stats["update_policy_works_cancelled_by_recovery"] == 1
+    assert stats["update_policy_works_outstanding"] == 0
+    assert stats["update_execution_attempts_started"] == 3
+    assert stats["update_execution_attempts_completed"] == 2
+    assert stats["update_execution_attempts_preempted"] == 1
+    assert stats["prompt_stream_running_preemptions"] == 1
+    assert stats["prompt_stream_prefix_cache_resets"] == 1
+
+
+def test_completed_update_kv_loss_creates_recovery_only_attempt() -> None:
+    """Completed admission 丢 KV 后只能创建 admission_id=None 的物理重放。"""
+    request = _make_request([1, 2, 3, 4])
+    _start_request(request)
+    _finish_active_view(request)
+    request.apply_prompt_stream_event(
+        _make_event(
+            PromptStreamEventType.UPDATE,
+            [10, 11],
+            source_id="update",
+            source_type=PromptSourceType.UPDATE,
+        )
+    )
+    request.prepare_prompt_stream_execution(4)
+    _finish_active_view(request)
+
+    delta = request.reset_prompt_stream_computed_state(
+        PromptStreamRecoveryReason.DORMANT_EVICTION
+    )
+    assert delta is not None
+    assert delta.carried_update_admission_id is None
+    assert delta.cancelled_update_admission_ids == ()
+    assert request.prompt_stream is not None
+    recovery_update = request.prompt_stream.pending_work_items[-1]
+    assert recovery_update.phase == PromptStreamExecutionPhase.UPDATE
+    assert recovery_update.update_admission_id is None
+    assert (
+        recovery_update.execution_origin
+        == PromptStreamExecutionOrigin.RECOVERY
+    )
+
+    request.prepare_prompt_stream_execution(4)
+    _finish_active_view(request)
+    request.prepare_prompt_stream_execution(4)
+    _finish_active_view(request)
+
+    stats = request.build_prompt_stream_stats()
+    assert stats is not None
+    assert stats["update_policy_works_admitted"] == 1
+    assert stats["update_policy_works_completed"] == 1
+    assert stats["update_policy_works_cancelled_by_recovery"] == 0
+    assert stats["update_execution_attempts_started"] == 2
+    assert stats["update_execution_attempts_completed"] == 2
+    assert stats["update_execution_attempts_preempted"] == 0
+    assert stats["update_recovery_works_created"] == 1
+    assert stats["prompt_stream_dormant_evictions"] == 1
+
+
+def test_recovery_preserves_empty_coalescing_window_state() -> None:
+    """合法空快照与 bounded-window 的 deadline/EWMA 必须原样保留。"""
+    request = _make_request([1, 2, 3, 4])
+    config = PromptStreamUpdateCoalescingConfig(
+        append_gate="hold_until_append_finished",
+        update_policy="fixed_window",
+        soft_window_ms=100.0,
+        hard_deadline_ms=200.0,
+        ttft_deadline_ms=300.0,
+    )
+    request.enable_prompt_stream_update_coalescing(config, now=10.0)
+    _start_request(request)
+    _finish_active_view(request)
+    request.apply_prompt_stream_event(
+        _make_event(
+            PromptStreamEventType.UPDATE,
+            [10, 11],
+            source_id="update",
+            source_type=PromptSourceType.UPDATE,
+        )
+    )
+    request.apply_prompt_stream_event(
+        _make_event(
+            PromptStreamEventType.UPDATE,
+            [],
+            source_id="update",
+            source_type=PromptSourceType.UPDATE,
+            version=1,
+            sequence_no=1,
+        )
+    )
+
+    state = request.prompt_stream_update_coalescing_state
+    assert state is not None
+    assert state.latest_pending_token_ids == ()
+    state.first_pending_time = 11.0
+    state.last_update_time = 12.0
+    state.last_observed_update_time = 12.0
+    state.last_observed_update_append_epoch = 7
+    state.interval_observation_count = 3
+    state.gain_observation_count = 4
+    state.soft_deadline = 13.0
+    state.hard_deadline = 14.0
+    state.ttft_deadline = 15.0
+    state.flush_ready = True
+    state.flush_ready_reason = "test_gate_blocked"
+    state.generation = 8
+    state.pending_event_count = 2
+    state.hypothetical_eager_tokens = 9
+    state.interval_ewma = 0.125
+    state.merge_gain_ewma = 6.5
+    preserved_fields = (
+        "latest_pending_token_ids",
+        "first_pending_time",
+        "last_update_time",
+        "last_observed_update_time",
+        "last_observed_update_append_epoch",
+        "interval_observation_count",
+        "gain_observation_count",
+        "soft_deadline",
+        "hard_deadline",
+        "ttft_deadline",
+        "flush_ready",
+        "flush_ready_reason",
+        "generation",
+        "pending_event_count",
+        "hypothetical_eager_tokens",
+        "interval_ewma",
+        "merge_gain_ewma",
+    )
+    before = {
+        field_name: getattr(state, field_name)
+        for field_name in preserved_fields
+    }
+
+    delta = request.reset_prompt_stream_computed_state(
+        PromptStreamRecoveryReason.RETAINED_WAITING_EVICTION
+    )
+    assert delta is not None
+    after = {
+        field_name: getattr(state, field_name)
+        for field_name in preserved_fields
+    }
+    assert after == before
+    assert request.prompt_stream is not None
+    assert not any(
+        work.phase == PromptStreamExecutionPhase.UPDATE
+        for work in request.prompt_stream.pending_work_items
+    )
+    stats = request.build_prompt_stream_stats()
+    assert stats is not None
+    assert stats["prompt_stream_retained_waiting_evictions"] == 1
+
+
+def test_empty_update_admission_survives_recovery() -> None:
+    """空 Update tuple 是待结算目标，不得退化成没有 Update source。"""
+    request = _make_request([1, 2, 3, 4])
+    _start_request(request)
+    _finish_active_view(request)
+    request.apply_prompt_stream_event(
+        _make_event(
+            PromptStreamEventType.UPDATE,
+            [10],
+            source_id="update",
+            source_type=PromptSourceType.UPDATE,
+        )
+    )
+    request.prepare_prompt_stream_execution(4)
+    _finish_active_view(request)
+    request.apply_prompt_stream_event(
+        _make_event(
+            PromptStreamEventType.UPDATE,
+            [],
+            source_id="update",
+            source_type=PromptSourceType.UPDATE,
+            version=1,
+            sequence_no=1,
+        )
+    )
+
+    delta = request.reset_prompt_stream_computed_state()
+    assert delta is not None
+    assert delta.carried_update_admission_id == 2
+    assert request.prompt_stream is not None
+    recovery_update = request.prompt_stream.pending_work_items[-1]
+    assert recovery_update.update_token_ids == ()
+    assert recovery_update.update_admission_id == 2
+
+    request.prepare_prompt_stream_execution(4)
+    _finish_active_view(request)
+    # 选择空 Update 会同步完成零-forward recovery attempt。
+    request.prepare_prompt_stream_execution(4)
+    stats = request.build_prompt_stream_stats()
+    assert stats is not None
+    assert stats["update_policy_works_admitted"] == 2
+    assert stats["update_policy_works_completed"] == 2
+    assert stats["update_policy_works_outstanding"] == 0
+
+
+def test_question_waits_for_latest_update_recovery() -> None:
+    """Question 在 reset 后必须排在 completed-only Update replay 之后。"""
+    request = _make_request([1, 2, 3, 4])
+    _start_request(request)
+    _finish_active_view(request)
+    request.apply_prompt_stream_event(
+        _make_event(
+            PromptStreamEventType.UPDATE,
+            [10, 11],
+            source_id="update",
+            source_type=PromptSourceType.UPDATE,
+        )
+    )
+    request.prepare_prompt_stream_execution(4)
+    _finish_active_view(request)
+    request.apply_prompt_stream_event(
+        _make_event(
+            PromptStreamEventType.PROMPT_FINISHED,
+            [20, 21],
+            source_id="question",
+            source_type=None,
+        )
+    )
+    request.prepare_prompt_stream_execution(4)
+    request.advance_prompt_stream_computed_tokens(1)
+
+    delta = request.reset_prompt_stream_computed_state(
+        PromptStreamRecoveryReason.RUNNING_PREEMPTION
+    )
+    assert delta is not None
+    assert delta.question_tokens_discarded == 1
+    assert request.prompt_stream is not None
+    assert [
+        work.phase for work in request.prompt_stream.pending_work_items
+    ] == [
+        PromptStreamExecutionPhase.UPDATE,
+        PromptStreamExecutionPhase.QUESTION,
+    ]
+    assert not request.can_decode_from_prompt_stream()
+
+    request.prepare_prompt_stream_execution(4)
+    _finish_active_view(request)
+    request.prepare_prompt_stream_execution(4)
+    update_view = request.prompt_stream_execution_view
+    assert update_view is not None
+    assert update_view.phase == PromptStreamExecutionPhase.UPDATE
+    _finish_active_view(request)
+    request.prepare_prompt_stream_execution(4)
+    question_view = request.prompt_stream_execution_view
+    assert question_view is not None
+    assert question_view.phase == PromptStreamExecutionPhase.QUESTION
+    assert request.prompt_stream.update_committed_token_ids == [10, 11]
+    assert not request.can_decode_from_prompt_stream()
+    _finish_active_view(request)
+    assert request.can_decode_from_prompt_stream()
 
 
 def test_kv_manager_allocates_two_independent_segments() -> None:
@@ -1045,3 +1432,112 @@ def test_prompt_stream_exact_transfer_uses_manifest_token_boundary() -> None:
 
     assert num_external_tokens == num_remote_tokens
     assert is_async
+
+
+def test_adaptive_recovery_preserves_absolute_soft_deadline() -> None:
+    """Recovery 不得按抢占时负载重算 Adaptive deadline。"""
+    request = _make_request([1, 2, 3, 4])
+    config = PromptStreamUpdateCoalescingConfig(
+        append_gate="none",
+        update_policy="adaptive",
+        soft_window_ms=500.0,
+        hard_deadline_ms=1000.0,
+        cold_start_prior_weight=100.0,
+        arrival_rate_prior_per_s=1.0,
+        merge_gain_prior_tokens=1.2,
+        delay_price=1.0,
+        load_price_scale=1.0,
+    )
+    request.enable_prompt_stream_update_coalescing(config, now=0.0)
+    _start_request(request)
+    _finish_active_view(request)
+
+    with patch("vllm.v1.request.time.monotonic", return_value=10.0):
+        request.apply_prompt_stream_event(
+            _make_event(
+                PromptStreamEventType.UPDATE,
+                [10, 11],
+                source_id="update",
+                source_type=PromptSourceType.UPDATE,
+            )
+        )
+
+    state = request.prompt_stream_update_coalescing_state
+    assert state is not None
+    assert state.adaptive_deadline_needs_refresh
+    assert not request.is_prompt_stream_update_flush_due(
+        now=10.01,
+        prefill_queue_load=0.0,
+    )
+    deadline_before_recovery = state.soft_deadline
+    assert deadline_before_recovery is not None
+    assert not state.adaptive_deadline_needs_refresh
+
+    request.reset_prompt_stream_computed_state(
+        PromptStreamRecoveryReason.RUNNING_PREEMPTION
+    )
+    assert not request.is_prompt_stream_update_flush_due(
+        now=10.01,
+        prefill_queue_load=1.0,
+    )
+    assert state.soft_deadline == deadline_before_recovery
+
+
+def test_merge_gain_uses_policy_base_after_recovery() -> None:
+    """Recovery 回退物理 KV 时不得污染 Update 合并收益。"""
+    request = _make_request([1, 2, 3, 4])
+    config = PromptStreamUpdateCoalescingConfig(
+        append_gate="none",
+        update_policy="fixed_window",
+        soft_window_ms=1000.0,
+        hard_deadline_ms=2000.0,
+    )
+    request.enable_prompt_stream_update_coalescing(config, now=0.0)
+    _start_request(request)
+    _finish_active_view(request)
+
+    request.apply_prompt_stream_event(
+        _make_event(
+            PromptStreamEventType.UPDATE,
+            [10, 11, 12],
+            source_id="update",
+            source_type=PromptSourceType.UPDATE,
+        )
+    )
+    assert request.flush_prompt_stream_update(
+        now=1.0,
+        reason="test_first_admission",
+        force=True,
+    )
+    request.apply_prompt_stream_event(
+        _make_event(
+            PromptStreamEventType.UPDATE,
+            [20, 21, 22],
+            source_id="update",
+            source_type=PromptSourceType.UPDATE,
+            version=1,
+            sequence_no=1,
+        )
+    )
+
+    request.reset_prompt_stream_computed_state(
+        PromptStreamRecoveryReason.RUNNING_PREEMPTION
+    )
+    state = request.prompt_stream_update_coalescing_state
+    assert state is not None
+    assert state.last_admitted_token_ids == ()
+    assert state.stats_last_admitted_token_ids == (10, 11, 12)
+    state.merge_gain_ewma = None
+    state.gain_observation_count = 0
+
+    request.apply_prompt_stream_event(
+        _make_event(
+            PromptStreamEventType.UPDATE,
+            [10, 11, 13],
+            source_id="update",
+            source_type=PromptSourceType.UPDATE,
+            version=2,
+            sequence_no=2,
+        )
+    )
+    assert state.merge_gain_ewma == 2.0

@@ -61,6 +61,32 @@ class PromptStreamExecutionPhase(enum.Enum):
     QUESTION = "question"
 
 
+class PromptStreamExecutionOrigin(enum.Enum):
+    """标记 Prompt Stream work 的物理执行来源。"""
+
+    POLICY = "policy"
+    RECOVERY = "recovery"
+
+
+class PromptStreamRecoveryReason(enum.Enum):
+    """标记 Prompt Stream 丢失物理 KV 后进入恢复的原因。"""
+
+    RUNNING_PREEMPTION = "running_preemption"
+    DORMANT_EVICTION = "dormant_eviction"
+    RETAINED_WAITING_EVICTION = "retained_waiting_eviction"
+    PREFIX_CACHE_RESET = "prefix_cache_reset"
+    UNKNOWN = "unknown"
+
+
+class UpdateAdmissionStatus(enum.Enum):
+    """记录一次 Update policy admission 的稳定生命周期状态。"""
+
+    PENDING = "pending"
+    ACTIVE = "active"
+    COMPLETED = "completed"
+    CANCELLED_BY_RECOVERY = "cancelled_by_recovery"
+
+
 class AppendGatePhase(enum.Enum):
     """表示 Append gate 当前允许 Update admission 的阶段。"""
 
@@ -125,6 +151,9 @@ class UpdateCoalescingState:
     soft_deadline: float | None = None
     hard_deadline: float | None = None
     ttft_deadline: float | None = None
+    # Adaptive 每次新 Update 只允许 Scheduler 按当时负载重算
+    # 一次绝对 soft deadline。recovery 不能重新打开该开关。
+    adaptive_deadline_needs_refresh: bool = False
     # policy 已要求 flush、但 admission 暂时被 gate 阻挡。
     flush_ready: bool = False
     # sticky ready 的首次触发原因，仅用于日志与实验统计。
@@ -141,6 +170,29 @@ class UpdateCoalescingState:
     # 恢复物理 KV 时把同一目标重复计为算法创建的 work。
     stats_last_admitted_token_ids: tuple[int, ...] = ()
     stats_last_admitted_append_epoch: int | None = None
+
+
+@dataclass
+class UpdateAdmissionRecord:
+    """保存一次 Update policy admission 的稳定身份与终态。"""
+
+    admission_id: int
+    target_token_ids: tuple[int, ...]
+    required_append_epoch: int
+    policy_prefill_tokens: int
+    status: UpdateAdmissionStatus = UpdateAdmissionStatus.PENDING
+
+
+@dataclass(frozen=True)
+class PromptStreamRecoveryDelta:
+    """描述一次 latest-only recovery 对请求物理状态的影响。"""
+
+    reason: PromptStreamRecoveryReason
+    cancelled_update_admission_ids: tuple[int, ...]
+    carried_update_admission_id: int | None
+    prefix_append_tokens_discarded: int
+    update_tokens_discarded: int
+    question_tokens_discarded: int
 
 
 @dataclass
@@ -178,9 +230,14 @@ class PromptStreamWorkItem:
     question_token_ids: tuple[int, ...] | None = None
     # 当前 work item 已完成的 segment-local token 数。
     num_computed_tokens: int = 0
-    # 当前 Update work 是否代表一次新的算法 admission。preemption 恢复
-    # 可能重建相同目标，此时仍累计 scheduled token，但不重复累计 work 完成数。
-    count_as_admitted_update_work: bool = True
+    # Update policy admission 的稳定 ID；纯物理 recovery work 使用 None。
+    update_admission_id: int | None = None
+    # work 真正成为 active 时分配的物理执行 attempt ID。
+    execution_attempt_id: int | None = None
+    # 区分 policy work 与抢占后重建物理 KV 的 recovery work。
+    execution_origin: PromptStreamExecutionOrigin = (
+        PromptStreamExecutionOrigin.POLICY
+    )
 
 
 @dataclass(frozen=True)
@@ -300,29 +357,73 @@ class PromptStreamTokenStats:
     构造跨进程或 REST 响应载荷；快照本身不会随 Request 后续状态变化。
     """
 
+    metrics_schema_version: int
     coalescing_enabled: bool
     update_coalescing_config_json: str | None
     update_events_accepted: int
+    update_policy_works_admitted: int
+    update_policy_works_completed: int
+    update_policy_works_cancelled_by_recovery: int
+    update_policy_works_outstanding: int
+    # v1 aliases 保持旧客户端兼容；语义映射到 policy 层。
     update_works_admitted: int
     update_works_completed: int
     eager_update_prefill_tokens: int | None
+    policy_admitted_update_prefill_tokens: int
+    policy_saved_update_prefill_tokens: int | None
+    policy_extra_update_prefill_tokens: int | None
     admitted_update_prefill_tokens: int
     scheduled_update_prefill_tokens: int
     saved_update_prefill_tokens: int | None
     extra_update_prefill_tokens: int | None
     update_tokens_invalidated: int
+    update_tokens_invalidated_by_snapshot: int
+    update_execution_attempts_started: int
+    update_execution_attempts_completed: int
+    update_execution_attempts_preempted: int
+    update_recovery_works_created: int
+    update_tokens_scheduled_total: int
+    update_tokens_scheduled_for_recovery: int
+    prefix_append_tokens_scheduled_for_recovery: int
+    update_tokens_discarded_by_preemption: int
+    prefix_append_tokens_discarded_by_preemption: int
+    question_tokens_discarded_by_preemption: int
+    prompt_stream_running_preemptions: int
+    prompt_stream_dormant_evictions: int
+    prompt_stream_retained_waiting_evictions: int
+    prompt_stream_prefix_cache_resets: int
+    prompt_stream_allocation_failures_running: int
+    prompt_stream_allocation_failures_waiting: int
 
     def to_dict(self) -> dict[str, bool | int | str | None]:
         """返回可直接交给 msgspec/JSON 的独立字典。"""
         return {
+            "metrics_schema_version": self.metrics_schema_version,
             "coalescing_enabled": self.coalescing_enabled,
             "update_coalescing_config_json": (
                 self.update_coalescing_config_json
             ),
             "update_events_accepted": self.update_events_accepted,
+            "update_policy_works_admitted": self.update_policy_works_admitted,
+            "update_policy_works_completed": self.update_policy_works_completed,
+            "update_policy_works_cancelled_by_recovery": (
+                self.update_policy_works_cancelled_by_recovery
+            ),
+            "update_policy_works_outstanding": (
+                self.update_policy_works_outstanding
+            ),
             "update_works_admitted": self.update_works_admitted,
             "update_works_completed": self.update_works_completed,
             "eager_update_prefill_tokens": self.eager_update_prefill_tokens,
+            "policy_admitted_update_prefill_tokens": (
+                self.policy_admitted_update_prefill_tokens
+            ),
+            "policy_saved_update_prefill_tokens": (
+                self.policy_saved_update_prefill_tokens
+            ),
+            "policy_extra_update_prefill_tokens": (
+                self.policy_extra_update_prefill_tokens
+            ),
             "admitted_update_prefill_tokens": (
                 self.admitted_update_prefill_tokens
             ),
@@ -332,6 +433,51 @@ class PromptStreamTokenStats:
             "saved_update_prefill_tokens": self.saved_update_prefill_tokens,
             "extra_update_prefill_tokens": self.extra_update_prefill_tokens,
             "update_tokens_invalidated": self.update_tokens_invalidated,
+            "update_tokens_invalidated_by_snapshot": (
+                self.update_tokens_invalidated_by_snapshot
+            ),
+            "update_execution_attempts_started": (
+                self.update_execution_attempts_started
+            ),
+            "update_execution_attempts_completed": (
+                self.update_execution_attempts_completed
+            ),
+            "update_execution_attempts_preempted": (
+                self.update_execution_attempts_preempted
+            ),
+            "update_recovery_works_created": self.update_recovery_works_created,
+            "update_tokens_scheduled_total": self.update_tokens_scheduled_total,
+            "update_tokens_scheduled_for_recovery": (
+                self.update_tokens_scheduled_for_recovery
+            ),
+            "prefix_append_tokens_scheduled_for_recovery": (
+                self.prefix_append_tokens_scheduled_for_recovery
+            ),
+            "update_tokens_discarded_by_preemption": (
+                self.update_tokens_discarded_by_preemption
+            ),
+            "prefix_append_tokens_discarded_by_preemption": (
+                self.prefix_append_tokens_discarded_by_preemption
+            ),
+            "question_tokens_discarded_by_preemption": (
+                self.question_tokens_discarded_by_preemption
+            ),
+            "prompt_stream_running_preemptions": (
+                self.prompt_stream_running_preemptions
+            ),
+            "prompt_stream_dormant_evictions": self.prompt_stream_dormant_evictions,
+            "prompt_stream_retained_waiting_evictions": (
+                self.prompt_stream_retained_waiting_evictions
+            ),
+            "prompt_stream_prefix_cache_resets": (
+                self.prompt_stream_prefix_cache_resets
+            ),
+            "prompt_stream_allocation_failures_running": (
+                self.prompt_stream_allocation_failures_running
+            ),
+            "prompt_stream_allocation_failures_waiting": (
+                self.prompt_stream_allocation_failures_waiting
+            ),
         }
 
 
@@ -367,6 +513,31 @@ class PromptStreamState:
     total_admitted_update_prefill_tokens: int
     # Scheduler 实际推进的 Update token 累计，preemption 重放会重复增加。
     total_scheduled_update_prefill_tokens: int
+    # 稳定 admission ledger；终态只由完成或显式 recovery 取消推进。
+    update_admissions: dict[int, UpdateAdmissionRecord] = field(
+        default_factory=dict
+    )
+    next_update_admission_id: int = 1
+    # 物理 attempt 与 recovery token 统计独立于 policy admission。
+    next_update_execution_attempt_id: int = 1
+    update_execution_attempts_started: int = 0
+    update_execution_attempts_completed: int = 0
+    update_execution_attempts_preempted: int = 0
+    update_recovery_works_created: int = 0
+    total_recovery_update_prefill_tokens: int = 0
+    total_recovery_prefix_append_prefill_tokens: int = 0
+    total_update_tokens_discarded_by_preemption: int = 0
+    total_prefix_append_tokens_discarded_by_preemption: int = 0
+    total_question_tokens_discarded_by_preemption: int = 0
+    # 请求级 pressure 计数由 Scheduler 通过 Request 接口更新。
+    prompt_stream_running_preemptions: int = 0
+    prompt_stream_dormant_evictions: int = 0
+    prompt_stream_retained_waiting_evictions: int = 0
+    prompt_stream_prefix_cache_resets: int = 0
+    prompt_stream_allocation_failures_running: int = 0
+    prompt_stream_allocation_failures_waiting: int = 0
+    # reset 后 bootstrap/Append 物理重建使用 recovery origin。
+    prefix_append_recovery_pending: bool = False
     # prefix+append 物理域已经完成 prefill 的 token 数，包含尾部 padding。
     prefix_append_num_computed_tokens: int = 0
     # 当前 update 快照已经完成 prefill 的 token 数。
@@ -391,9 +562,6 @@ class PromptStreamState:
     # 当前正在 chunked prefill 的 work item；一个 work item 中途不可切换，
     # 防止覆写 PREFIX_APPEND 尾部 padding 后再用旧 padding 作为 Update 前缀。
     active_work_item: PromptStreamWorkItem | None = None
-    # preemption 若打断最新已 admission 的 Update，恢复 work 完成时仍应
-    # 结清原 admission；已经完成后单纯重放物理 KV 则不能重复结算。
-    recovery_update_completion_pending: bool = False
     # 下一次选中 Update work 时需要执行的 UPDATE 域截断边界。事件到达时不
     # 立刻释放块，避免破坏仍在运行或排队等待的旧 Update work。
     pending_update_kv_truncation_keep_tokens: int | None = None
@@ -719,6 +887,122 @@ class Request:
         """
         return self.prompt_stream is not None
 
+    def _create_prompt_stream_update_admission(
+        self,
+        target_token_ids: tuple[int, ...],
+        required_append_epoch: int,
+        policy_prefill_tokens: int,
+    ) -> int:
+        """创建稳定 Update admission，并更新 policy 层累计值。"""
+        prompt_stream = self._ensure_prompt_stream_state()
+        admission_id = prompt_stream.next_update_admission_id
+        prompt_stream.next_update_admission_id += 1
+        prompt_stream.update_admissions[admission_id] = UpdateAdmissionRecord(
+            admission_id=admission_id,
+            target_token_ids=target_token_ids,
+            required_append_epoch=required_append_epoch,
+            policy_prefill_tokens=policy_prefill_tokens,
+        )
+        prompt_stream.update_works_admitted += 1
+        prompt_stream.total_admitted_update_prefill_tokens += policy_prefill_tokens
+        return admission_id
+
+    def _get_prompt_stream_update_admission(
+        self,
+        admission_id: int,
+    ) -> UpdateAdmissionRecord:
+        """返回 admission 记录；缺失 ID 表示内部生命周期已经损坏。"""
+        assert self.prompt_stream is not None
+        record = self.prompt_stream.update_admissions.get(admission_id)
+        if record is None:
+            raise RuntimeError(
+                "Prompt stream UPDATE work references an unknown admission: "
+                f"request_id={self.request_id}, admission_id={admission_id}."
+            )
+        return record
+
+    def _mark_prompt_stream_update_admission_active(
+        self,
+        admission_id: int | None,
+    ) -> None:
+        """在对应 work 真正进入物理执行时推进 admission 状态。"""
+        if admission_id is None:
+            return
+        record = self._get_prompt_stream_update_admission(admission_id)
+        if record.status == UpdateAdmissionStatus.PENDING:
+            record.status = UpdateAdmissionStatus.ACTIVE
+            return
+        if record.status != UpdateAdmissionStatus.ACTIVE:
+            raise RuntimeError(
+                "Prompt stream UPDATE admission cannot become active from "
+                f"status={record.status.value}: request_id={self.request_id}, "
+                f"admission_id={admission_id}."
+            )
+
+    def _complete_prompt_stream_update_admission(
+        self,
+        admission_id: int | None,
+    ) -> None:
+        """按稳定 ID 结算 policy admission；recovery-only work 不结算。"""
+        if admission_id is None:
+            return
+        record = self._get_prompt_stream_update_admission(admission_id)
+        if record.status == UpdateAdmissionStatus.COMPLETED:
+            return
+        if record.status == UpdateAdmissionStatus.CANCELLED_BY_RECOVERY:
+            raise RuntimeError(
+                "Cancelled prompt stream UPDATE admission completed unexpectedly: "
+                f"request_id={self.request_id}, admission_id={admission_id}."
+            )
+        record.status = UpdateAdmissionStatus.COMPLETED
+        assert self.prompt_stream is not None
+        self.prompt_stream.update_works_completed += 1
+
+    def _start_prompt_stream_update_execution_attempt(
+        self,
+        work_item: PromptStreamWorkItem,
+    ) -> None:
+        """为首次 active 的 Update work 分配物理 attempt ID。"""
+        if work_item.execution_attempt_id is not None:
+            return
+        assert self.prompt_stream is not None
+        work_item.execution_attempt_id = (
+            self.prompt_stream.next_update_execution_attempt_id
+        )
+        self.prompt_stream.next_update_execution_attempt_id += 1
+        self.prompt_stream.update_execution_attempts_started += 1
+        self._mark_prompt_stream_update_admission_active(
+            work_item.update_admission_id
+        )
+
+    def _complete_prompt_stream_update_work(
+        self,
+        work_item: PromptStreamWorkItem,
+    ) -> None:
+        """同时结算一次物理 attempt 与其可选 policy admission。"""
+        self._start_prompt_stream_update_execution_attempt(work_item)
+        assert self.prompt_stream is not None
+        self.prompt_stream.update_execution_attempts_completed += 1
+        self._complete_prompt_stream_update_admission(
+            work_item.update_admission_id
+        )
+
+    def record_prompt_stream_allocation_failure(
+        self,
+        *,
+        is_running: bool,
+    ) -> None:
+        """记录一次 Prompt Stream KV slot 分配失败。
+
+        普通请求调用该接口是 no-op，避免 Scheduler 主路径读取内部状态。
+        """
+        if self.prompt_stream is None:
+            return
+        if is_running:
+            self.prompt_stream.prompt_stream_allocation_failures_running += 1
+        else:
+            self.prompt_stream.prompt_stream_allocation_failures_waiting += 1
+
     def build_prompt_stream_stats(
         self,
     ) -> dict[str, bool | int | str | None] | None:
@@ -766,13 +1050,33 @@ class Request:
             saved_tokens = None
             extra_tokens = None
 
+        cancelled_works = sum(
+            record.status == UpdateAdmissionStatus.CANCELLED_BY_RECOVERY
+            for record in prompt_stream.update_admissions.values()
+        )
+        outstanding_works = sum(
+            record.status
+            in (UpdateAdmissionStatus.PENDING, UpdateAdmissionStatus.ACTIVE)
+            for record in prompt_stream.update_admissions.values()
+        )
+
         stats = PromptStreamTokenStats(
+            metrics_schema_version=2,
             coalescing_enabled=coalescing_enabled,
             update_coalescing_config_json=update_coalescing_config_json,
             update_events_accepted=prompt_stream.update_events_accepted,
+            update_policy_works_admitted=prompt_stream.update_works_admitted,
+            update_policy_works_completed=prompt_stream.update_works_completed,
+            update_policy_works_cancelled_by_recovery=cancelled_works,
+            update_policy_works_outstanding=outstanding_works,
             update_works_admitted=prompt_stream.update_works_admitted,
             update_works_completed=prompt_stream.update_works_completed,
             eager_update_prefill_tokens=eager_tokens,
+            policy_admitted_update_prefill_tokens=(
+                prompt_stream.total_admitted_update_prefill_tokens
+            ),
+            policy_saved_update_prefill_tokens=saved_tokens,
+            policy_extra_update_prefill_tokens=extra_tokens,
             admitted_update_prefill_tokens=(
                 prompt_stream.total_admitted_update_prefill_tokens
             ),
@@ -782,6 +1086,57 @@ class Request:
             saved_update_prefill_tokens=saved_tokens,
             extra_update_prefill_tokens=extra_tokens,
             update_tokens_invalidated=prompt_stream.total_tokens_invalidated,
+            update_tokens_invalidated_by_snapshot=(
+                prompt_stream.total_tokens_invalidated
+            ),
+            update_execution_attempts_started=(
+                prompt_stream.update_execution_attempts_started
+            ),
+            update_execution_attempts_completed=(
+                prompt_stream.update_execution_attempts_completed
+            ),
+            update_execution_attempts_preempted=(
+                prompt_stream.update_execution_attempts_preempted
+            ),
+            update_recovery_works_created=(
+                prompt_stream.update_recovery_works_created
+            ),
+            update_tokens_scheduled_total=(
+                prompt_stream.total_scheduled_update_prefill_tokens
+            ),
+            update_tokens_scheduled_for_recovery=(
+                prompt_stream.total_recovery_update_prefill_tokens
+            ),
+            prefix_append_tokens_scheduled_for_recovery=(
+                prompt_stream.total_recovery_prefix_append_prefill_tokens
+            ),
+            update_tokens_discarded_by_preemption=(
+                prompt_stream.total_update_tokens_discarded_by_preemption
+            ),
+            prefix_append_tokens_discarded_by_preemption=(
+                prompt_stream.total_prefix_append_tokens_discarded_by_preemption
+            ),
+            question_tokens_discarded_by_preemption=(
+                prompt_stream.total_question_tokens_discarded_by_preemption
+            ),
+            prompt_stream_running_preemptions=(
+                prompt_stream.prompt_stream_running_preemptions
+            ),
+            prompt_stream_dormant_evictions=(
+                prompt_stream.prompt_stream_dormant_evictions
+            ),
+            prompt_stream_retained_waiting_evictions=(
+                prompt_stream.prompt_stream_retained_waiting_evictions
+            ),
+            prompt_stream_prefix_cache_resets=(
+                prompt_stream.prompt_stream_prefix_cache_resets
+            ),
+            prompt_stream_allocation_failures_running=(
+                prompt_stream.prompt_stream_allocation_failures_running
+            ),
+            prompt_stream_allocation_failures_waiting=(
+                prompt_stream.prompt_stream_allocation_failures_waiting
+            ),
         )
         return stats.to_dict()
 
@@ -938,10 +1293,12 @@ class Request:
             else 0
         )
         eager_tokens = len(new_token_ids) - raw_lcp
-        base_token_ids = list(state.last_admitted_token_ids)
+        # 合并收益属于 policy 层，必须相对跨 recovery 不回退的
+        # admission 链尾计算。物理 KV 丢失不是新 Update 带来的收益。
+        base_token_ids = list(state.stats_last_admitted_token_ids)
         same_admitted_append_context = (
             not base_token_ids
-            or state.last_admitted_append_epoch == current_append_epoch
+            or state.stats_last_admitted_append_epoch == current_append_epoch
         )
         base_lcp = (
             self._get_common_prefix_len(base_token_ids, new_token_ids)
@@ -1018,6 +1375,7 @@ class Request:
         elif config.update_policy == "adaptive":
             wait_s = self._get_prompt_stream_adaptive_wait_s(prefill_queue_load=0.0)
             state.soft_deadline = timestamp + wait_s
+            state.adaptive_deadline_needs_refresh = True
         else:
             state.soft_deadline = None
 
@@ -1146,11 +1504,16 @@ class Request:
             return True
         if policy == "full_merge":
             return gate.update_source_finished or self.prompt_stream.finished
-        if policy == "adaptive" and state.last_update_time is not None:
+        if (
+            policy == "adaptive"
+            and state.last_update_time is not None
+            and state.adaptive_deadline_needs_refresh
+        ):
             adaptive_deadline = state.last_update_time + (
                 self._get_prompt_stream_adaptive_wait_s(prefill_queue_load)
             )
             state.soft_deadline = adaptive_deadline
+            state.adaptive_deadline_needs_refresh = False
         return any(
             deadline is not None and now >= deadline
             for deadline in (
@@ -1227,19 +1590,17 @@ class Request:
                 != required_append_epoch
             )
         )
+        admission_id: int | None = None
         if is_new_logical_admission:
             admitted_tokens = len(target) - stats_common_prefix_len
-            self.prompt_stream.update_works_admitted += 1
-            self.prompt_stream.total_admitted_update_prefill_tokens += (
-                admitted_tokens
+            admission_id = self._create_prompt_stream_update_admission(
+                target,
+                required_append_epoch,
+                admitted_tokens,
             )
             state.stats_last_admitted_token_ids = target
             state.stats_last_admitted_append_epoch = required_append_epoch
 
-        count_as_admitted_update_work = (
-            is_new_logical_admission
-            or self.prompt_stream.recovery_update_completion_pending
-        )
         self.prompt_stream.pending_work_items.append(
             PromptStreamWorkItem(
                 phase=PromptStreamExecutionPhase.UPDATE,
@@ -1251,10 +1612,9 @@ class Request:
                 execution_base_append_epoch=state.last_admitted_append_epoch,
                 required_append_epoch=required_append_epoch,
                 update_common_prefix_len=common_prefix_len,
-                count_as_admitted_update_work=count_as_admitted_update_work,
+                update_admission_id=admission_id,
             )
         )
-        self.prompt_stream.recovery_update_completion_pending = False
         state.last_admitted_token_ids = target
         state.last_admitted_append_epoch = required_append_epoch
         state.latest_pending_token_ids = None
@@ -1263,6 +1623,7 @@ class Request:
         state.soft_deadline = None
         state.hard_deadline = None
         state.ttft_deadline = None
+        state.adaptive_deadline_needs_refresh = False
         state.flush_ready = False
         state.flush_ready_reason = None
         state.pending_event_count = 0
@@ -1374,11 +1735,33 @@ class Request:
             return False
 
         layout = self.get_prompt_stream_layout()
+        outstanding_update_admission = any(
+            record.status
+            in (UpdateAdmissionStatus.PENDING, UpdateAdmissionStatus.ACTIVE)
+            for record in self.prompt_stream.update_admissions.values()
+        )
+        latest_update_token_ids = (
+            self._get_latest_prompt_stream_update_snapshot()
+        )
+        latest_update_materialized = (
+            latest_update_token_ids is None
+            or tuple(self.prompt_stream.update_committed_token_ids)
+            == latest_update_token_ids
+        )
+        gate = self.prompt_stream.append_update_gate
+        final_append_materialized = (
+            gate is None
+            or gate.final_append_epoch is None
+            or gate.committed_append_epoch == gate.final_append_epoch
+        )
         return (
             self.prompt_stream.prefix_append_bootstrap_completed
             and self.prompt_stream.active_work_item is None
             and not self.prompt_stream.pending_work_items
             and self.prompt_stream.question_work_completed
+            and not outstanding_update_admission
+            and latest_update_materialized
+            and final_append_materialized
             and (
                 self.prompt_stream.update_coalescing is None
                 or (
@@ -1802,9 +2185,6 @@ class Request:
         # 因此不能在这里回退全局 update 进度或截断 UPDATE blocks。两项操作
         # 都会延后到对应 work 被 scheduler 选中、前一代已完整物化之后执行。
         if new_update_token_ids != old_update_token_ids:
-            # 新目标覆盖了 preemption 前尚未结清的旧目标；后续 admission
-            # 将为新目标建立自己的完成关系，不能把旧 completion 转嫁给它。
-            prompt_stream.recovery_update_completion_pending = False
             if prompt_stream.update_coalescing is not None:
                 # 合并开启时只覆盖唯一窗口；work 只能由显式 flush 接口创建。
                 self.on_prompt_stream_update_snapshot(
@@ -1816,15 +2196,19 @@ class Request:
                 # 默认关闭路径保持每个 Update 事件立即生成不可变 FIFO work。
                 eager_tokens = len(new_update_token_ids) - update_common_prefix_len
                 prompt_stream.update_events_accepted += 1
-                prompt_stream.update_works_admitted += 1
                 prompt_stream.total_eager_update_prefill_tokens += eager_tokens
-                prompt_stream.total_admitted_update_prefill_tokens += eager_tokens
+                admission_id = self._create_prompt_stream_update_admission(
+                    tuple(new_update_token_ids),
+                    required_append_epoch=0,
+                    policy_prefill_tokens=eager_tokens,
+                )
                 prompt_stream.pending_work_items.append(
                     PromptStreamWorkItem(
                         phase=PromptStreamExecutionPhase.UPDATE,
                         update_token_ids=tuple(new_update_token_ids),
                         execution_base_token_ids=tuple(old_update_token_ids),
                         update_common_prefix_len=update_common_prefix_len,
+                        update_admission_id=admission_id,
                     )
                 )
 
@@ -2235,12 +2619,19 @@ class Request:
                 # 空模板无需写 KV，直接开放后续 Append/Update 竞争。
                 prompt_stream.prefix_append_bootstrap_completed = True
                 prompt_stream.prefix_append_committed_logical_len = 0
+                prompt_stream.prefix_append_recovery_pending = False
             else:
                 prompt_stream.active_work_item = PromptStreamWorkItem(
                     phase=PromptStreamExecutionPhase.PREFIX_APPEND,
                     prefix_append_logical_len=prefix_len,
                     num_computed_tokens=0,
+                    execution_origin=(
+                        PromptStreamExecutionOrigin.RECOVERY
+                        if prompt_stream.prefix_append_recovery_pending
+                        else PromptStreamExecutionOrigin.POLICY
+                    ),
                 )
+                prompt_stream.prefix_append_recovery_pending = False
                 return
 
         # 一个 Update 快照可能只是上一代的严格前缀，此时只需要截断而不需要
@@ -2336,6 +2727,7 @@ class Request:
                     f"snapshot_len={len(update_token_ids)}."
                 )
 
+            self._start_prompt_stream_update_execution_attempt(work_item)
             # 默认即时路径在 work 获调度时冻结可见 Append；合并路径已在
             # flush 时冻结逻辑长度与 epoch，这里只安装对应的物理 token 视图。
             committed_logical_len = prompt_stream.prefix_append_committed_logical_len
@@ -2401,9 +2793,8 @@ class Request:
                     gate.update_committed_append_epoch = (
                         work_item.required_append_epoch
                     )
-                if work_item.count_as_admitted_update_work:
-                    # 零 forward 截断也是一个完整结束的逻辑 Update work。
-                    prompt_stream.update_works_completed += 1
+                # 零 forward 截断同样结算物理 attempt 与 policy admission。
+                self._complete_prompt_stream_update_work(work_item)
                 continue
 
             prompt_stream.active_work_item = work_item
@@ -2632,6 +3023,23 @@ class Request:
             prompt_stream.total_scheduled_update_prefill_tokens += (
                 num_scheduled_tokens
             )
+            if (
+                active_work_item is not None
+                and active_work_item.execution_origin
+                == PromptStreamExecutionOrigin.RECOVERY
+            ):
+                prompt_stream.total_recovery_update_prefill_tokens += (
+                    num_scheduled_tokens
+                )
+        elif (
+            view.phase == PromptStreamExecutionPhase.PREFIX_APPEND
+            and active_work_item is not None
+            and active_work_item.execution_origin
+            == PromptStreamExecutionOrigin.RECOVERY
+        ):
+            prompt_stream.total_recovery_prefix_append_prefill_tokens += (
+                num_scheduled_tokens
+            )
         if view.phase == PromptStreamExecutionPhase.PREFIX_APPEND:
             # PREFIX_APPEND work 的全局位置就是 segment-local 位置。
             local_num_computed_tokens = min(
@@ -2684,8 +3092,9 @@ class Request:
                         gate.update_committed_append_epoch = (
                             active_work_item.required_append_epoch
                         )
-                    if active_work_item.count_as_admitted_update_work:
-                        prompt_stream.update_works_completed += 1
+                    self._complete_prompt_stream_update_work(
+                        active_work_item
+                    )
                     prompt_stream.active_work_item = None
         else:
             local_num_computed_tokens = max(
@@ -2709,33 +3118,125 @@ class Request:
 
         self.num_computed_tokens = new_num_computed_tokens
 
-    def reset_prompt_stream_computed_state(self) -> None:
-        """在 preemption 后重建流式工作队列，但保留长期 source 状态。"""
+    def _get_latest_prompt_stream_update_snapshot(
+        self,
+    ) -> tuple[int, ...] | None:
+        """返回最新 Update 逻辑快照，并区分空快照与没有 Update source。"""
+        assert self.prompt_stream is not None
+        has_update_source = False
+        token_ids: list[int] = []
+        for source_id in self.prompt_stream.source_order:
+            source = self.prompt_stream.sources[source_id]
+            if source.source_type != PromptSourceType.UPDATE:
+                continue
+            has_update_source = True
+            token_ids.extend(source.token_ids)
+        return tuple(token_ids) if has_update_source else None
+
+    def _record_prompt_stream_recovery_reason(
+        self,
+        reason: PromptStreamRecoveryReason,
+    ) -> None:
+        """把一次物理 KV recovery 归因到互斥的请求级原因。"""
+        assert self.prompt_stream is not None
+        if reason == PromptStreamRecoveryReason.RUNNING_PREEMPTION:
+            self.prompt_stream.prompt_stream_running_preemptions += 1
+        elif reason == PromptStreamRecoveryReason.DORMANT_EVICTION:
+            self.prompt_stream.prompt_stream_dormant_evictions += 1
+        elif reason == PromptStreamRecoveryReason.RETAINED_WAITING_EVICTION:
+            self.prompt_stream.prompt_stream_retained_waiting_evictions += 1
+        elif reason == PromptStreamRecoveryReason.PREFIX_CACHE_RESET:
+            self.prompt_stream.prompt_stream_prefix_cache_resets += 1
+
+    def reset_prompt_stream_computed_state(
+        self,
+        reason: PromptStreamRecoveryReason = PromptStreamRecoveryReason.UNKNOWN,
+    ) -> PromptStreamRecoveryDelta | None:
+        """按 latest-only 语义重建物理 KV，并保留 policy/window 状态。
+
+        资源 recovery 可以折叠尚未完成的旧 admission，但必须给每个旧 ID
+        写入唯一终态。尚未 admission 的 coalescing window、绝对 deadline、
+        sticky ready 和 EWMA 均保持不变，避免 repeated preemption 延长等待。
+
+        Args:
+            reason: Scheduler 提供的互斥 recovery 原因。
+
+        Returns:
+            Prompt Stream 请求返回本次 recovery delta；普通请求返回 None。
+        """
         if self.prompt_stream is None:
-            return
+            return None
         prompt_stream = self.prompt_stream
-
-        # 只把“最新逻辑快照对应且尚未完成”的 admission completion 交给
-        # 恢复 work。较旧的排队快照被恢复流程折叠后不会伪装成已完成。
-        latest_update_token_ids = tuple(
-            self._get_prompt_stream_segment_token_ids(PromptSourceType.UPDATE)
-        )
-        candidate_work_items = list(prompt_stream.pending_work_items)
-        if prompt_stream.active_work_item is not None:
-            candidate_work_items.append(prompt_stream.active_work_item)
-        prompt_stream.recovery_update_completion_pending = any(
-            work_item.phase == PromptStreamExecutionPhase.UPDATE
-            and work_item.count_as_admitted_update_work
-            and work_item.update_token_ids == latest_update_token_ids
-            for work_item in candidate_work_items
+        latest_update_token_ids = self._get_latest_prompt_stream_update_snapshot()
+        state = prompt_stream.update_coalescing
+        has_unadmitted_window = (
+            state is not None and state.latest_pending_token_ids is not None
         )
 
+        # 物理 KV 被释放前，先按 segment 记录实际丢失的有效计算进度。
+        prefix_append_tokens_discarded = (
+            prompt_stream.prefix_append_num_computed_tokens
+        )
+        update_tokens_discarded = prompt_stream.update_num_computed_tokens
+        question_tokens_discarded = prompt_stream.question_num_computed_tokens
+        prompt_stream.total_prefix_append_tokens_discarded_by_preemption += (
+            prefix_append_tokens_discarded
+        )
+        prompt_stream.total_update_tokens_discarded_by_preemption += (
+            update_tokens_discarded
+        )
+        prompt_stream.total_question_tokens_discarded_by_preemption += (
+            question_tokens_discarded
+        )
+        self._record_prompt_stream_recovery_reason(reason)
+
+        # 只有已经成为 active 的 Update work 才拥有物理 attempt。
+        active_work_item = prompt_stream.active_work_item
+        if (
+            active_work_item is not None
+            and active_work_item.phase == PromptStreamExecutionPhase.UPDATE
+            and active_work_item.execution_attempt_id is not None
+        ):
+            prompt_stream.update_execution_attempts_preempted += 1
+
+        # 若没有更新的未放行窗口，保留与 source 最新快照对应的最后一个
+        # outstanding admission；其余旧 ID 由 recovery 显式取消。
+        outstanding_records = [
+            record
+            for record in prompt_stream.update_admissions.values()
+            if record.status
+            in (UpdateAdmissionStatus.PENDING, UpdateAdmissionStatus.ACTIVE)
+        ]
+        carried_admission_id: int | None = None
+        if not has_unadmitted_window and latest_update_token_ids is not None:
+            matching_records = [
+                record
+                for record in outstanding_records
+                if record.target_token_ids == latest_update_token_ids
+            ]
+            if matching_records:
+                carried_admission_id = max(
+                    matching_records,
+                    key=lambda record: record.admission_id,
+                ).admission_id
+
+        cancelled_admission_ids: list[int] = []
+        for record in outstanding_records:
+            if record.admission_id == carried_admission_id:
+                # 新 recovery attempt 延续同一 admission，不增加 policy 计数。
+                record.status = UpdateAdmissionStatus.PENDING
+                continue
+            record.status = UpdateAdmissionStatus.CANCELLED_BY_RECOVERY
+            cancelled_admission_ids.append(record.admission_id)
+
+        # 清空只属于物理执行层的状态；source、ledger 和 window 不回退。
         prompt_stream.prefix_append_num_computed_tokens = 0
         prompt_stream.update_num_computed_tokens = 0
         prompt_stream.update_committed_token_ids.clear()
         prompt_stream.question_num_computed_tokens = 0
         prompt_stream.prefix_append_committed_logical_len = 0
         prompt_stream.prefix_append_bootstrap_completed = False
+        prompt_stream.prefix_append_recovery_pending = True
         prompt_stream.active_work_item = None
         prompt_stream.pending_work_items.clear()
         prompt_stream.pending_update_kv_truncation_keep_tokens = None
@@ -2746,8 +3247,8 @@ class Request:
             gate.committed_append_epoch = 0
             gate.update_committed_append_epoch = None
 
-        # Preemption 会释放两个物理域的 blocks。重新执行时不能重放已经丢失的
-        # 到达交错，只能以当前逻辑快照构造安全顺序：Append 完整追平后再算 Update。
+        # recovery 必须先重建最终 PA。模板 bootstrap 由 work selector 创建；
+        # 若存在 Append，再追加一个从模板末尾追到完整 PA 的 recovery work。
         if prompt_stream.append_token_ids:
             prompt_stream.pending_work_items.append(
                 PromptStreamWorkItem(
@@ -2755,77 +3256,69 @@ class Request:
                     prefix_append_logical_len=(
                         self.get_prompt_stream_prefix_append_len()
                     ),
-                    target_append_epoch=(gate.append_epoch if gate is not None else 0),
+                    target_append_epoch=(
+                        gate.append_epoch if gate is not None else 0
+                    ),
+                    execution_origin=PromptStreamExecutionOrigin.RECOVERY,
                 )
             )
-        update_token_ids = self._get_prompt_stream_segment_token_ids(
-            PromptSourceType.UPDATE
-        )
-        state = prompt_stream.update_coalescing
-        if state is None:
-            if update_token_ids:
-                prompt_stream.pending_work_items.append(
-                    PromptStreamWorkItem(
-                        phase=PromptStreamExecutionPhase.UPDATE,
-                        update_token_ids=tuple(update_token_ids),
-                        execution_base_token_ids=(),
-                        update_common_prefix_len=0,
-                        count_as_admitted_update_work=(
-                            prompt_stream.recovery_update_completion_pending
-                        ),
-                    )
-                )
-                prompt_stream.recovery_update_completion_pending = False
-            self.enqueue_question_if_ready()
-        else:
-            # 所有已 admission work 的物理结果均已丢失；以最新逻辑快照重建
-            # 唯一执行链，并保持 gate 对 admission 的约束。
+
+        # window 存在时保持其原始 policy 状态，等 Scheduler 按原 deadline
+        # admission；否则直接为 source 最新快照建立 recovery-only 执行链。
+        if state is not None:
             state.last_admitted_token_ids = ()
             state.last_admitted_append_epoch = None
-            state.latest_pending_token_ids = (
-                tuple(update_token_ids) if update_token_ids else None
-            )
-            recovery_time = time.monotonic()
-            state.first_pending_time = recovery_time if update_token_ids else None
-            state.last_update_time = recovery_time if update_token_ids else None
-            state.soft_deadline = None
-            state.hard_deadline = None
-            state.ttft_deadline = None
-            state.flush_ready = False
-            state.flush_ready_reason = None
-            state.pending_event_count = 1 if update_token_ids else 0
-            state.hypothetical_eager_tokens = (
-                len(update_token_ids) if update_token_ids else 0
-            )
-            config = state.config
-            if update_token_ids and config.update_policy in (
-                "fixed_window",
-                "quiet_debounce",
-                "adaptive",
-            ):
-                state.hard_deadline = (
-                    recovery_time + config.hard_deadline_ms / 1000.0
+        should_recover_update = (
+            not has_unadmitted_window
+            and latest_update_token_ids is not None
+            and (carried_admission_id is not None or bool(latest_update_token_ids))
+        )
+        if should_recover_update:
+            required_append_epoch = gate.append_epoch if gate is not None else 0
+            prompt_stream.pending_work_items.append(
+                PromptStreamWorkItem(
+                    phase=PromptStreamExecutionPhase.UPDATE,
+                    prefix_append_logical_len=(
+                        self.get_prompt_stream_prefix_append_len()
+                    ),
+                    update_token_ids=latest_update_token_ids,
+                    execution_base_token_ids=(),
+                    execution_base_append_epoch=None,
+                    required_append_epoch=required_append_epoch,
+                    update_common_prefix_len=0,
+                    update_admission_id=carried_admission_id,
+                    execution_origin=PromptStreamExecutionOrigin.RECOVERY,
                 )
-                if config.update_policy == "adaptive":
-                    wait_s = self._get_prompt_stream_adaptive_wait_s(0.0)
-                else:
-                    wait_s = config.soft_window_ms / 1000.0
-                state.soft_deadline = recovery_time + wait_s
-                if config.ttft_deadline_ms is not None:
-                    state.ttft_deadline = (
-                        state.request_start_time
-                        + config.ttft_deadline_ms / 1000.0
-                    )
-            state.generation += 1
-            # Scheduler reconcile 会按原 policy 与 gate 决定何时重新 admission。
-            self.enqueue_question_if_ready()
+            )
+            prompt_stream.update_recovery_works_created += 1
+            if state is not None:
+                state.last_admitted_token_ids = latest_update_token_ids
+                state.last_admitted_append_epoch = required_append_epoch
+        elif state is not None and latest_update_token_ids == ():
+            # 已完成的空快照无需 forward，但逻辑链尾仍应明确为空。
+            state.last_admitted_token_ids = ()
+            state.last_admitted_append_epoch = (
+                gate.append_epoch if gate is not None else 0
+            )
 
+        # Question 可以提前排在 recovery work 后面，但执行时仍受 FIFO、
+        # final Append epoch 和最新 Update committed 状态三重 barrier 保护。
+        self.enqueue_question_if_ready()
         self.prompt_stream_execution_view = None
         self.prompt_stream_needs_worker_refresh = True
         self._output_token_ids.clear()
         self.output_token_ids = ConstantList(self._output_token_ids)
         self.spec_token_ids.clear()
         self.num_computed_tokens = 0
+
+        return PromptStreamRecoveryDelta(
+            reason=reason,
+            cancelled_update_admission_ids=tuple(cancelled_admission_ids),
+            carried_update_admission_id=carried_admission_id,
+            prefix_append_tokens_discarded=prefix_append_tokens_discarded,
+            update_tokens_discarded=update_tokens_discarded,
+            question_tokens_discarded=question_tokens_discarded,
+        )
 
     @staticmethod
     def _get_common_prefix_len(

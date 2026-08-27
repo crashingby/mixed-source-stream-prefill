@@ -34,11 +34,35 @@ SERVER_COUNTER_FIELDS = (
     "update_events_accepted",
     "update_works_admitted",
     "update_works_completed",
+    "update_policy_works_admitted",
+    "update_policy_works_completed",
+    "update_policy_works_cancelled_by_recovery",
+    "update_policy_works_outstanding",
     "eager_update_prefill_tokens",
     "admitted_update_prefill_tokens",
     "scheduled_update_prefill_tokens",
     "saved_update_prefill_tokens",
     "extra_update_prefill_tokens",
+    "policy_admitted_update_prefill_tokens",
+    "policy_saved_update_prefill_tokens",
+    "policy_extra_update_prefill_tokens",
+    "update_execution_attempts_started",
+    "update_execution_attempts_completed",
+    "update_execution_attempts_preempted",
+    "update_recovery_works_created",
+    "update_tokens_scheduled_total",
+    "update_tokens_scheduled_for_recovery",
+    "prefix_append_tokens_scheduled_for_recovery",
+    "update_tokens_discarded_by_preemption",
+    "prefix_append_tokens_discarded_by_preemption",
+    "question_tokens_discarded_by_preemption",
+    "prompt_stream_running_preemptions",
+    "prompt_stream_dormant_evictions",
+    "prompt_stream_retained_waiting_evictions",
+    "prompt_stream_allocation_failures_running",
+    "prompt_stream_allocation_failures_waiting",
+    "prompt_stream_prefix_cache_resets",
+    "update_tokens_invalidated_by_snapshot",
     "update_tokens_invalidated",
 )
 
@@ -77,7 +101,17 @@ SUMMARY_METRIC_FIELDS = (
     "num_error",
     "num_valid_ttft",
     "num_stats_requests",
+    "num_transport_success",
+    "num_transport_error",
+    "num_first_token_success",
+    "num_stats_valid",
+    "num_formal_valid",
     "success_rate",
+    "transport_success_rate",
+    "first_token_success_rate",
+    "stats_valid_rate",
+    "formal_valid_rate",
+    "token_stats_coverage",
     "observation_duration_s",
     "completed_requests_per_s",
     "ttft_mean_ms",
@@ -85,15 +119,7 @@ SUMMARY_METRIC_FIELDS = (
     "ttft_p90_ms",
     "ttft_p95_ms",
     "ttft_p99_ms",
-    "total_update_events_accepted",
-    "total_update_works_admitted",
-    "total_update_works_completed",
-    "total_eager_update_prefill_tokens",
-    "total_admitted_update_prefill_tokens",
-    "total_scheduled_update_prefill_tokens",
-    "total_saved_update_prefill_tokens",
-    "total_extra_update_prefill_tokens",
-    "total_update_tokens_invalidated",
+    *(f"total_{field_name}" for field_name in SERVER_COUNTER_FIELDS),
     "coalescing_ratio",
     "token_saving_ratio",
     "mean_saved_update_prefill_tokens_per_counterfactual_request",
@@ -356,6 +382,57 @@ def _required_csv_bool(value: Any, *, context: str) -> bool:
     raise ValueError(f"Expected a CSV boolean for {context}: {value!r}.")
 
 
+def _row_first_token_received(
+    row: Mapping[str, str],
+    *,
+    context: str,
+) -> bool:
+    """读取首 token 状态，并兼容没有显式状态列的历史 CSV。"""
+    raw_status = row.get("first_token_received")
+    if raw_status not in (None, ""):
+        return _required_csv_bool(
+            raw_status,
+            context=f"{context}:first_token_received",
+        )
+
+    # 旧 replay 可能在 stats 后置校验失败后把 result_status 改成 error，
+    # 但已写入的 TTFT 和 completion_chunks 足以证明首 token 已经到达。
+    ttft_ms = _optional_float(
+        row.get("finish_to_first_token_ms"),
+        context=f"{context}:finish_to_first_token_ms",
+    )
+    completion_chunks = _optional_int(
+        row.get("completion_chunks"),
+        context=f"{context}:completion_chunks",
+    )
+    return ttft_ms is not None and (completion_chunks or 0) > 0
+
+
+def _row_transport_success(
+    row: Mapping[str, str],
+    *,
+    context: str,
+) -> bool:
+    """返回网络/SSE 链路是否成功；旧 CSV 回退到 result_status。"""
+    transport_status = row.get("transport_status")
+    if transport_status not in (None, ""):
+        return transport_status == "ok"
+    if row.get("result_status") == "ok":
+        return True
+    # 旧 replay 会在首 token 后因 lifecycle 校验失败覆盖 result_status。
+    return _row_first_token_received(row, context=context)
+
+
+def _row_stats_valid(row: Mapping[str, str]) -> bool:
+    """仅接受通过 recovery-aware schema v2 校验的统计。"""
+    return row.get("stats_validation_status") == "valid"
+
+
+def _row_formal_valid(row: Mapping[str, str]) -> bool:
+    """返回请求是否满足首 token、配置和 schema v2 的正式实验条件。"""
+    return row.get("formal_result_status") == "valid"
+
+
 def _canonical_sha256(value: Any) -> str:
     """返回一个 JSON 可表达对象的稳定 SHA-256。"""
     canonical_json = json.dumps(
@@ -396,20 +473,26 @@ def _validate_formal_prompt_stream_stats(
     """校验正式 run，并返回成功请求报告的唯一实际 P 配置。"""
     required_counter_fields = (
         "update_events_accepted",
-        "update_works_admitted",
-        "update_works_completed",
-        "admitted_update_prefill_tokens",
-        "scheduled_update_prefill_tokens",
-        "update_tokens_invalidated",
+        "update_policy_works_admitted",
+        "update_policy_works_completed",
+        "update_policy_works_cancelled_by_recovery",
+        "update_policy_works_outstanding",
+        "policy_admitted_update_prefill_tokens",
+        "update_execution_attempts_started",
+        "update_execution_attempts_completed",
+        "update_execution_attempts_preempted",
+        "update_tokens_scheduled_total",
+        "update_tokens_scheduled_for_recovery",
+        "update_tokens_invalidated_by_snapshot",
     )
     optional_counterfactual_fields = (
         "eager_update_prefill_tokens",
-        "saved_update_prefill_tokens",
-        "extra_update_prefill_tokens",
+        "policy_saved_update_prefill_tokens",
+        "policy_extra_update_prefill_tokens",
     )
     actual_config_jsons: set[str] = set()
     for row_index, row in enumerate(rows, start=2):
-        if row.get("result_status") != "ok":
+        if not _row_stats_valid(row):
             continue
         row_context = f"{context}:request row {row_index}"
         enabled = _required_csv_bool(
@@ -472,13 +555,29 @@ def _validate_formal_prompt_stream_stats(
         if any(value < 0 for value in counters.values()):
             raise ValueError(f"Negative Prompt Stream counter in {row_context}.")
         accepted = counters["update_events_accepted"]
-        admitted = counters["update_works_admitted"]
-        completed = counters["update_works_completed"]
-        if admitted > accepted or completed != admitted:
+        admitted = counters["update_policy_works_admitted"]
+        completed = counters["update_policy_works_completed"]
+        cancelled = counters["update_policy_works_cancelled_by_recovery"]
+        outstanding = counters["update_policy_works_outstanding"]
+        attempts_started = counters["update_execution_attempts_started"]
+        attempts_completed = counters["update_execution_attempts_completed"]
+        attempts_preempted = counters["update_execution_attempts_preempted"]
+        policy_is_valid = (
+            admitted <= accepted
+            and admitted == completed + cancelled + outstanding
+            and outstanding == 0
+        )
+        execution_is_valid = (
+            attempts_started == attempts_completed + attempts_preempted
+        )
+        if not policy_is_valid or not execution_is_valid:
             raise ValueError(
-                f"Invalid Update lifecycle counters in {row_context}: "
+                f"Invalid recovery-aware lifecycle counters in {row_context}: "
                 f"accepted={accepted}, admitted={admitted}, "
-                f"completed={completed}."
+                f"completed={completed}, cancelled={cancelled}, "
+                f"outstanding={outstanding}, attempts_started={attempts_started}, "
+                f"attempts_completed={attempts_completed}, "
+                f"attempts_preempted={attempts_preempted}."
             )
         optional_values = [
             _optional_int(
@@ -760,7 +859,7 @@ def _sum_server_counter(
     """对成功请求的一个服务端计数器求和，并返回有效值数量。"""
     values: list[int] = []
     for row_index, row in enumerate(rows, start=2):
-        if row.get("result_status") != "ok":
+        if not _row_stats_valid(row):
             continue
         value = _optional_int(
             row.get(field_name),
@@ -777,14 +876,23 @@ def _summarize_rows(
     observation_duration_s: float | None,
 ) -> dict[str, Any]:
     """按统一口径汇总一组逐请求记录。"""
-    successful_rows = [row for row in rows if row.get("result_status") == "ok"]
+    transport_successful_rows = [
+        row
+        for row_index, row in enumerate(rows, start=2)
+        if _row_transport_success(row, context=f"request row {row_index}")
+    ]
+    stats_valid_rows = [row for row in rows if _row_stats_valid(row)]
+    formal_valid_rows = [row for row in rows if _row_formal_valid(row)]
+    first_token_rows: list[Mapping[str, str]] = []
     ttft_values: list[float] = []
     for row_index, row in enumerate(rows, start=2):
-        if row.get("result_status") != "ok":
+        row_context = f"request row {row_index}"
+        if not _row_first_token_received(row, context=row_context):
             continue
+        first_token_rows.append(row)
         ttft_ms = _optional_float(
             row.get("finish_to_first_token_ms"),
-            context=f"request row {row_index}:finish_to_first_token_ms",
+            context=f"{row_context}:finish_to_first_token_ms",
         )
         if ttft_ms is not None:
             ttft_values.append(ttft_ms)
@@ -796,13 +904,13 @@ def _summarize_rows(
         counter_totals[field_name] = total
         counter_counts[field_name] = num_values
 
-    # stats request 数采用 accepted 字段；所有当前响应都会同时返回整组字段。
-    num_stats_requests = counter_counts["update_events_accepted"]
+    # token 聚合只使用通过 schema v2 recovery-aware 校验的请求。
+    num_stats_requests = len(stats_valid_rows)
     total_accepted = counter_totals["update_events_accepted"]
-    total_admitted = counter_totals["update_works_admitted"]
+    total_admitted = counter_totals["update_policy_works_admitted"]
     total_eager = counter_totals["eager_update_prefill_tokens"]
-    total_saved = counter_totals["saved_update_prefill_tokens"]
-    total_invalidated = counter_totals["update_tokens_invalidated"]
+    total_saved = counter_totals["policy_saved_update_prefill_tokens"]
+    total_invalidated = counter_totals["update_tokens_invalidated_by_snapshot"]
 
     coalescing_ratio = None
     if total_accepted is not None and total_admitted is not None:
@@ -815,15 +923,42 @@ def _summarize_rows(
 
     throughput = None
     if observation_duration_s is not None and observation_duration_s > 0:
-        throughput = len(successful_rows) / observation_duration_s
+        throughput = len(first_token_rows) / observation_duration_s
 
+    num_requests = len(rows)
+    num_first_token_success = len(first_token_rows)
     return {
-        "num_requests": len(rows),
-        "num_success": len(successful_rows),
-        "num_error": len(rows) - len(successful_rows),
+        "num_requests": num_requests,
+        # 旧 success_rate 继续表示可用于 TTFT 的首 token 成功率。
+        "num_success": num_first_token_success,
+        "num_error": num_requests - num_first_token_success,
         "num_valid_ttft": len(ttft_values),
         "num_stats_requests": num_stats_requests,
-        "success_rate": len(successful_rows) / len(rows) if rows else None,
+        "num_transport_success": len(transport_successful_rows),
+        "num_transport_error": num_requests - len(transport_successful_rows),
+        "num_first_token_success": num_first_token_success,
+        "num_stats_valid": len(stats_valid_rows),
+        "num_formal_valid": len(formal_valid_rows),
+        "success_rate": (
+            num_first_token_success / num_requests if num_requests else None
+        ),
+        "transport_success_rate": (
+            len(transport_successful_rows) / num_requests if num_requests else None
+        ),
+        "first_token_success_rate": (
+            num_first_token_success / num_requests if num_requests else None
+        ),
+        "stats_valid_rate": (
+            len(stats_valid_rows) / num_requests if num_requests else None
+        ),
+        "formal_valid_rate": (
+            len(formal_valid_rows) / num_requests if num_requests else None
+        ),
+        "token_stats_coverage": (
+            len(stats_valid_rows) / num_first_token_success
+            if num_first_token_success
+            else None
+        ),
         "observation_duration_s": observation_duration_s,
         "completed_requests_per_s": throughput,
         "ttft_mean_ms": statistics.fmean(ttft_values) if ttft_values else None,
@@ -838,15 +973,16 @@ def _summarize_rows(
         "coalescing_ratio": coalescing_ratio,
         "token_saving_ratio": token_saving_ratio,
         "mean_saved_update_prefill_tokens_per_counterfactual_request": (
-            total_saved / counter_counts["saved_update_prefill_tokens"]
+            total_saved / counter_counts["policy_saved_update_prefill_tokens"]
             if total_saved is not None
-            and counter_counts["saved_update_prefill_tokens"] > 0
+            and counter_counts["policy_saved_update_prefill_tokens"] > 0
             else None
         ),
         "mean_update_tokens_invalidated_per_stats_request": (
-            total_invalidated / counter_counts["update_tokens_invalidated"]
+            total_invalidated
+            / counter_counts["update_tokens_invalidated_by_snapshot"]
             if total_invalidated is not None
-            and counter_counts["update_tokens_invalidated"] > 0
+            and counter_counts["update_tokens_invalidated_by_snapshot"] > 0
             else None
         ),
     }

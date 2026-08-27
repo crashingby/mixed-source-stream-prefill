@@ -30,6 +30,12 @@ from typing import Any, Literal
 
 import httpx
 
+from prompt_stream_stats_v2 import (
+    PromptStreamStatsV2Error,
+    apply_prompt_stream_stats_v2,
+    read_metrics_schema_version,
+)
+
 logger = logging.getLogger(__name__)
 
 MIX_SOURCE_SCHEMA_VERSION = "prompt_stream_mixed/v2"
@@ -52,6 +58,13 @@ REQUEST_METRIC_FIELDS = (
     "sample_status",
     "result_status",
     "error",
+    "transport_status",
+    "first_token_received",
+    "stats_validation_status",
+    "stats_validation_error",
+    "formal_result_status",
+    "request_error_stage",
+    "metrics_schema_version",
     "planned_arrival_offset_ms",
     "queue_delay_ms",
     "request_start_wall_time",
@@ -75,11 +88,35 @@ REQUEST_METRIC_FIELDS = (
     "update_events_accepted",
     "update_works_admitted",
     "update_works_completed",
+    "update_policy_works_admitted",
+    "update_policy_works_completed",
+    "update_policy_works_cancelled_by_recovery",
+    "update_policy_works_outstanding",
     "eager_update_prefill_tokens",
     "admitted_update_prefill_tokens",
     "scheduled_update_prefill_tokens",
     "saved_update_prefill_tokens",
     "extra_update_prefill_tokens",
+    "policy_admitted_update_prefill_tokens",
+    "policy_saved_update_prefill_tokens",
+    "policy_extra_update_prefill_tokens",
+    "update_execution_attempts_started",
+    "update_execution_attempts_completed",
+    "update_execution_attempts_preempted",
+    "update_recovery_works_created",
+    "update_tokens_scheduled_total",
+    "update_tokens_scheduled_for_recovery",
+    "prefix_append_tokens_scheduled_for_recovery",
+    "update_tokens_discarded_by_preemption",
+    "prefix_append_tokens_discarded_by_preemption",
+    "question_tokens_discarded_by_preemption",
+    "prompt_stream_running_preemptions",
+    "prompt_stream_dormant_evictions",
+    "prompt_stream_retained_waiting_evictions",
+    "prompt_stream_allocation_failures_running",
+    "prompt_stream_allocation_failures_waiting",
+    "prompt_stream_prefix_cache_resets",
+    "update_tokens_invalidated_by_snapshot",
     "update_tokens_invalidated",
     "absorbed_update_events",
     "coalescing_ratio",
@@ -181,6 +218,14 @@ class RequestMetric:
     planned_arrival_offset_ms: float
     queue_delay_ms: float
     request_start_wall_time: float
+    # result_status 保持旧 CSV 兼容；以下字段拆分链路成功与统计可信度。
+    transport_status: str = "pending"
+    first_token_received: bool = False
+    stats_validation_status: str = "not_applicable"
+    stats_validation_error: str | None = None
+    formal_result_status: str = "not_evaluated"
+    request_error_stage: str | None = None
+    metrics_schema_version: int | None = None
     start_ack_ms: float | None = None
     source_dispatch_ms: float | None = None
     finish_to_first_token_ms: float | None = None
@@ -201,11 +246,35 @@ class RequestMetric:
     update_events_accepted: int | None = None
     update_works_admitted: int | None = None
     update_works_completed: int | None = None
+    update_policy_works_admitted: int | None = None
+    update_policy_works_completed: int | None = None
+    update_policy_works_cancelled_by_recovery: int | None = None
+    update_policy_works_outstanding: int | None = None
     eager_update_prefill_tokens: int | None = None
     admitted_update_prefill_tokens: int | None = None
     scheduled_update_prefill_tokens: int | None = None
     saved_update_prefill_tokens: int | None = None
     extra_update_prefill_tokens: int | None = None
+    policy_admitted_update_prefill_tokens: int | None = None
+    policy_saved_update_prefill_tokens: int | None = None
+    policy_extra_update_prefill_tokens: int | None = None
+    update_execution_attempts_started: int | None = None
+    update_execution_attempts_completed: int | None = None
+    update_execution_attempts_preempted: int | None = None
+    update_recovery_works_created: int | None = None
+    update_tokens_scheduled_total: int | None = None
+    update_tokens_scheduled_for_recovery: int | None = None
+    prefix_append_tokens_scheduled_for_recovery: int | None = None
+    update_tokens_discarded_by_preemption: int | None = None
+    prefix_append_tokens_discarded_by_preemption: int | None = None
+    question_tokens_discarded_by_preemption: int | None = None
+    prompt_stream_running_preemptions: int | None = None
+    prompt_stream_dormant_evictions: int | None = None
+    prompt_stream_retained_waiting_evictions: int | None = None
+    prompt_stream_allocation_failures_running: int | None = None
+    prompt_stream_allocation_failures_waiting: int | None = None
+    prompt_stream_prefix_cache_resets: int | None = None
+    update_tokens_invalidated_by_snapshot: int | None = None
     update_tokens_invalidated: int | None = None
     absorbed_update_events: int | None = None
     coalescing_ratio: float | None = None
@@ -248,6 +317,10 @@ class ReplayHttpError(RuntimeError):
     """包装 HTTP/SSE 上游错误，并保留有助定位的响应正文。"""
 
 
+class LegacyStatsSemanticsIncompatible(ReplayHttpError):
+    """表示 schema v1 无法表达抢占后的 recovery lifecycle。"""
+
+
 def _require_non_negative_stat(
     raw_stats: dict[str, Any],
     field_name: str,
@@ -281,7 +354,7 @@ def _require_optional_non_negative_stat(
     return value
 
 
-def apply_prompt_stream_stats(
+def _apply_prompt_stream_stats_or_raise(
     metric: RequestMetric,
     raw_stats: dict[str, Any] | None,
     *,
@@ -385,6 +458,17 @@ def apply_prompt_stream_stats(
             )
 
     metric.coalescing_enabled = coalescing_enabled
+    if metric.metrics_schema_version == 2:
+        apply_prompt_stream_stats_v2(
+            metric,
+            raw_stats,
+            num_sent_update_events=num_sent_update_events,
+            require_stats=require_stats,
+            coalescing_enabled=coalescing_enabled,
+        )
+        return
+
+    # 未声明 metrics schema 的历史响应继续按 v1 严格口径解析。
     metric.update_events_accepted = _require_non_negative_stat(
         raw_stats, "update_events_accepted"
     )
@@ -428,7 +512,7 @@ def apply_prompt_stream_stats(
             f"accepted={accepted}, admitted={admitted}, completed={completed}."
         )
     if require_stats and completed != admitted:
-        raise ReplayHttpError(
+        raise LegacyStatsSemanticsIncompatible(
             "A successful formal replay must finish every admitted Update work: "
             f"admitted={admitted}, completed={completed}."
         )
@@ -462,7 +546,7 @@ def apply_prompt_stream_stats(
     extra = metric.extra_update_prefill_tokens
     assert admitted_tokens is not None and scheduled_tokens is not None
     if scheduled_tokens < admitted_tokens:
-        raise ReplayHttpError(
+        raise LegacyStatsSemanticsIncompatible(
             "Scheduled Update tokens cannot be smaller than admitted tokens: "
             f"scheduled={scheduled_tokens}, admitted={admitted_tokens}."
         )
@@ -482,6 +566,70 @@ def apply_prompt_stream_stats(
     metric.scheduled_replay_overhead_tokens = max(
         0, scheduled_tokens - admitted_tokens
     )
+
+
+def apply_prompt_stream_stats(
+    metric: RequestMetric,
+    raw_stats: dict[str, Any] | None,
+    *,
+    num_sent_update_events: int,
+    require_stats: bool,
+    expected_coalescing: str,
+    expected_config_json: str | None,
+) -> None:
+    """结构化校验 finish stats，且不覆盖已经成功的首 token 链路。
+
+    schema v2 使用 recovery-aware 守恒式。未声明版本的旧响应仍走 v1
+    校验，但标记为 ``legacy``，避免把无法区分抢占的 token 数据纳入新的
+    正式结论。所有统计错误都写入 metric，而不会伪装成 HTTP/SSE 错误。
+
+    Args:
+        metric: 已记录首 token 的请求指标。
+        raw_stats: finish SSE 携带的 Prompt Stream stats。
+        num_sent_update_events: 客户端收到 ACK 的 Update 数据事件数量。
+        require_stats: 是否要求 stats 存在且通过正式守恒校验。
+        expected_coalescing: replay 期望的 P 节点开关状态。
+        expected_config_json: replay 期望的 P 节点合并配置。
+    """
+    if raw_stats is None:
+        metric.stats_validation_status = "missing"
+        metric.stats_validation_error = (
+            "Successful prompt-stream finish did not return "
+            "prompt_stream_stats."
+        )
+        metric.formal_result_status = (
+            "invalid" if require_stats else "not_evaluated"
+        )
+        return
+
+    try:
+        metric.metrics_schema_version = read_metrics_schema_version(raw_stats)
+        _apply_prompt_stream_stats_or_raise(
+            metric,
+            raw_stats,
+            num_sent_update_events=num_sent_update_events,
+            require_stats=require_stats,
+            expected_coalescing=expected_coalescing,
+            expected_config_json=expected_config_json,
+        )
+    except LegacyStatsSemanticsIncompatible as exc:
+        metric.stats_validation_status = "legacy_incompatible"
+        metric.stats_validation_error = str(exc)
+        metric.formal_result_status = "not_evaluated"
+        return
+    except (ReplayHttpError, PromptStreamStatsV2Error) as exc:
+        metric.stats_validation_status = "invalid"
+        metric.stats_validation_error = str(exc)
+        metric.formal_result_status = "invalid"
+        return
+
+    if metric.metrics_schema_version == 2:
+        metric.stats_validation_status = "valid"
+        metric.formal_result_status = "valid"
+    else:
+        # v1 无法表达 recovery cancellation/attempt，保留但不纳入 v2 token 聚合。
+        metric.stats_validation_status = "legacy"
+        metric.formal_result_status = "not_evaluated"
 
 
 def parse_args(mode: ReplayMode) -> argparse.Namespace:
@@ -679,7 +827,10 @@ def parse_args(mode: ReplayMode) -> argparse.Namespace:
     parser.add_argument(
         "--require-prompt-stream-stats",
         action="store_true",
-        help="Fail successful prompt-stream requests that omit engine statistics.",
+        help=(
+            "Mark a result formally invalid when a successful prompt-stream "
+            "request omits engine statistics; its TTFT remains usable."
+        ),
     )
     parser.add_argument(
         "--save-responses",
@@ -714,6 +865,11 @@ def parse_args(mode: ReplayMode) -> argparse.Namespace:
         "--fail-fast",
         action="store_true",
         help="Stop after the first request error instead of recording and continuing.",
+    )
+    parser.add_argument(
+        "--formal-fail-fast",
+        action="store_true",
+        help=("Stop after the first formally invalid result. Disabled by default."),
     )
     parser.add_argument(
         "--log-level",
@@ -1319,16 +1475,30 @@ async def _replay_requests(
                     queue_delay_ms,
                 )
 
+        def fail_fast_error(result: RequestMetric) -> str | None:
+            """返回当前请求触发的 fail-fast 错误；未触发时返回 None。"""
+            if args.fail_fast and result.result_status != "ok":
+                return result.error or "Replay request failed."
+            if (
+                args.formal_fail_fast
+                and result.formal_result_status == "invalid"
+            ):
+                return (
+                    result.stats_validation_error
+                    or "Replay result failed formal validation."
+                )
+            return None
+
         if args.qps == 0:
             results: list[RequestMetric] = []
             for sample in samples:
                 result = await run_one(sample, 0.0)
                 results.append(result)
-                if args.fail_fast and result.result_status != "ok":
-                    raise ReplayHttpError(result.error or "Replay request failed.")
+                if error := fail_fast_error(result):
+                    raise ReplayHttpError(error)
             return results
 
-        if not args.fail_fast:
+        if not (args.fail_fast or args.formal_fail_fast):
             tasks = [
                 asyncio.create_task(run_one(sample, planned_offset))
                 for sample, planned_offset in zip(samples, planned_offsets)
@@ -1353,8 +1523,8 @@ async def _replay_requests(
             for completed_task in asyncio.as_completed(tasks):
                 index, result = await completed_task
                 ordered_results[index] = result
-                if result.result_status != "ok":
-                    raise ReplayHttpError(result.error or "Replay request failed.")
+                if error := fail_fast_error(result):
+                    raise ReplayHttpError(error)
         except BaseException:
             for task in tasks:
                 if not task.done():
@@ -1393,19 +1563,28 @@ def _summarize_metrics(metrics: Sequence[RequestMetric]) -> dict[str, Any]:
         successful_ttfts = [
             metric.finish_to_first_token_ms
             for metric in mode_metrics
-            if metric.result_status == "ok"
+            if metric.first_token_received
             and metric.finish_to_first_token_ms is not None
         ]
         numeric_ttfts = [float(ttft) for ttft in successful_ttfts]
+        transport_success_metrics = [
+            metric
+            for metric in mode_metrics
+            if metric.transport_status == "ok"
+        ]
         stats_metrics = [
             metric
             for metric in mode_metrics
-            if metric.result_status == "ok"
-            and metric.coalescing_enabled is not None
+            if metric.stats_validation_status == "valid"
+        ]
+        formal_metrics = [
+            metric
+            for metric in mode_metrics
+            if metric.formal_result_status == "valid"
         ]
 
         def sum_stat(field_name: str) -> int:
-            """对当前模式中所有已返回的整数统计求和。"""
+            """对当前模式中通过 schema v2 校验的整数统计求和。"""
             values = [getattr(metric, field_name) for metric in stats_metrics]
             return sum(value for value in values if isinstance(value, int))
 
@@ -1418,11 +1597,39 @@ def _summarize_metrics(metrics: Sequence[RequestMetric]) -> dict[str, Any]:
             for metric in stats_metrics
             if metric.mean_update_lcp_ratio is not None
         ]
+        num_requests = len(mode_metrics)
+        num_first_token_success = sum(
+            metric.first_token_received for metric in mode_metrics
+        )
         summary_by_mode[mode] = {
-            "num_requests": len(mode_metrics),
-            "num_success": sum(metric.result_status == "ok" for metric in mode_metrics),
-            "num_error": sum(metric.result_status != "ok" for metric in mode_metrics),
+            "num_requests": num_requests,
+            "num_success": num_first_token_success,
+            "num_error": num_requests - num_first_token_success,
             "num_with_prompt_stream_stats": len(stats_metrics),
+            "num_transport_success": len(transport_success_metrics),
+            "num_transport_error": num_requests - len(transport_success_metrics),
+            "transport_success_rate": (
+                len(transport_success_metrics) / num_requests
+                if num_requests
+                else None
+            ),
+            "num_first_token_success": num_first_token_success,
+            "first_token_success_rate": (
+                num_first_token_success / num_requests if num_requests else None
+            ),
+            "num_stats_valid": len(stats_metrics),
+            "stats_valid_rate": (
+                len(stats_metrics) / num_requests if num_requests else None
+            ),
+            "num_formal_valid": len(formal_metrics),
+            "formal_valid_rate": (
+                len(formal_metrics) / num_requests if num_requests else None
+            ),
+            "token_stats_coverage": (
+                len(stats_metrics) / num_first_token_success
+                if num_first_token_success
+                else None
+            ),
             "ttft_ms": {
                 "mean": statistics.fmean(numeric_ttfts) if numeric_ttfts else None,
                 "min": min(numeric_ttfts) if numeric_ttfts else None,
@@ -1436,6 +1643,66 @@ def _summarize_metrics(metrics: Sequence[RequestMetric]) -> dict[str, Any]:
                 "update_events_accepted": total_accepted,
                 "update_works_admitted": total_admitted,
                 "update_works_completed": sum_stat("update_works_completed"),
+                "update_policy_works_admitted": sum_stat(
+                    "update_policy_works_admitted"
+                ),
+                "update_policy_works_completed": sum_stat(
+                    "update_policy_works_completed"
+                ),
+                "update_policy_works_cancelled_by_recovery": sum_stat(
+                    "update_policy_works_cancelled_by_recovery"
+                ),
+                "update_policy_works_outstanding": sum_stat(
+                    "update_policy_works_outstanding"
+                ),
+                "update_execution_attempts_started": sum_stat(
+                    "update_execution_attempts_started"
+                ),
+                "update_execution_attempts_completed": sum_stat(
+                    "update_execution_attempts_completed"
+                ),
+                "update_execution_attempts_preempted": sum_stat(
+                    "update_execution_attempts_preempted"
+                ),
+                "update_recovery_works_created": sum_stat(
+                    "update_recovery_works_created"
+                ),
+                "update_tokens_scheduled_total": sum_stat(
+                    "update_tokens_scheduled_total"
+                ),
+                "update_tokens_scheduled_for_recovery": sum_stat(
+                    "update_tokens_scheduled_for_recovery"
+                ),
+                "prefix_append_tokens_scheduled_for_recovery": sum_stat(
+                    "prefix_append_tokens_scheduled_for_recovery"
+                ),
+                "update_tokens_discarded_by_preemption": sum_stat(
+                    "update_tokens_discarded_by_preemption"
+                ),
+                "prefix_append_tokens_discarded_by_preemption": sum_stat(
+                    "prefix_append_tokens_discarded_by_preemption"
+                ),
+                "question_tokens_discarded_by_preemption": sum_stat(
+                    "question_tokens_discarded_by_preemption"
+                ),
+                "prompt_stream_running_preemptions": sum_stat(
+                    "prompt_stream_running_preemptions"
+                ),
+                "prompt_stream_dormant_evictions": sum_stat(
+                    "prompt_stream_dormant_evictions"
+                ),
+                "prompt_stream_retained_waiting_evictions": sum_stat(
+                    "prompt_stream_retained_waiting_evictions"
+                ),
+                "prompt_stream_allocation_failures_running": sum_stat(
+                    "prompt_stream_allocation_failures_running"
+                ),
+                "prompt_stream_allocation_failures_waiting": sum_stat(
+                    "prompt_stream_allocation_failures_waiting"
+                ),
+                "prompt_stream_prefix_cache_resets": sum_stat(
+                    "prompt_stream_prefix_cache_resets"
+                ),
                 "eager_update_prefill_tokens": total_eager,
                 "admitted_update_prefill_tokens": sum_stat(
                     "admitted_update_prefill_tokens"
@@ -1446,6 +1713,9 @@ def _summarize_metrics(metrics: Sequence[RequestMetric]) -> dict[str, Any]:
                 "saved_update_prefill_tokens": total_saved,
                 "extra_update_prefill_tokens": sum_stat(
                     "extra_update_prefill_tokens"
+                ),
+                "update_tokens_invalidated_by_snapshot": sum_stat(
+                    "update_tokens_invalidated_by_snapshot"
                 ),
                 "update_tokens_invalidated": sum_stat(
                     "update_tokens_invalidated"

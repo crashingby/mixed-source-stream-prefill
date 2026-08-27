@@ -54,6 +54,8 @@ class ConfigurationPoint:
     num_requests: int
     num_runs: int
     success_rate: float | None
+    token_stats_coverage: float | None
+    formal_valid_rate: float | None
     ttft_p50_ms: float | None
     ttft_p90_ms: float | None
     ttft_p95_ms: float | None
@@ -157,6 +159,15 @@ def parse_args() -> argparse.Namespace:
         help=(
             "Reject selected configuration points below this success rate. "
             "Set to 0 only when deliberately inspecting overload failures."
+        ),
+    )
+    parser.add_argument(
+        "--min-stats-coverage",
+        type=float,
+        default=0.95,
+        help=(
+            "Reject selected points whose recovery-safe token statistics cover "
+            "less than this fraction of first-token successes. Defaults to 0.95."
         ),
     )
     parser.add_argument(
@@ -289,6 +300,14 @@ def _point_from_row(
             row.get("success_rate"),
             context=f"{context_prefix}:success_rate",
         ),
+        token_stats_coverage=_optional_float(
+            row.get("token_stats_coverage"),
+            context=f"{context_prefix}:token_stats_coverage",
+        ),
+        formal_valid_rate=_optional_float(
+            row.get("formal_valid_rate"),
+            context=f"{context_prefix}:formal_valid_rate",
+        ),
         ttft_p50_ms=_optional_float(
             row.get("ttft_p50_ms"), context=f"{context_prefix}:ttft_p50_ms"
         ),
@@ -321,6 +340,8 @@ def load_configuration_points(summary_path: Path) -> list[ConfigurationPoint]:
         "num_requests",
         "num_runs",
         "success_rate",
+        "token_stats_coverage",
+        "formal_valid_rate",
         "ttft_p50_ms",
         "ttft_p90_ms",
         "ttft_p95_ms",
@@ -606,8 +627,35 @@ def plot_tradeoff(
         axes[0].legend(fontsize=8, frameon=True, framealpha=0.92)
     if frontier:
         axes[3].legend(fontsize=8, frameon=True, framealpha=0.92)
+    coverage_values = [
+        point.token_stats_coverage
+        for point in points
+        if point.token_stats_coverage is not None
+    ]
+    formal_values = [
+        point.formal_valid_rate
+        for point in points
+        if point.formal_valid_rate is not None
+    ]
+    coverage_label = (
+        f"{min(coverage_values):.1%}-{max(coverage_values):.1%}"
+        if coverage_values
+        else "unknown"
+    )
+    formal_label = (
+        f"{min(formal_values):.1%}-{max(formal_values):.1%}"
+        if formal_values
+        else "unknown"
+    )
     figure.suptitle(title, fontsize=15, fontweight="bold")
-    figure.tight_layout(rect=(0.0, 0.0, 1.0, 0.95))
+    figure.text(
+        0.5,
+        0.01,
+        f"Stats coverage: {coverage_label}; formal-valid rate: {formal_label}",
+        ha="center",
+        fontsize=9,
+    )
+    figure.tight_layout(rect=(0.0, 0.04, 1.0, 0.95))
     return figure
 
 
@@ -620,6 +668,10 @@ def _validate_args(args: argparse.Namespace) -> None:
     if not 0.0 <= args.min_success_rate <= 1.0:
         raise ValueError(
             "--min-success-rate must be between 0 and 1."
+        )
+    if not 0.0 <= args.min_stats_coverage <= 1.0:
+        raise ValueError(
+            "--min-stats-coverage must be between 0 and 1."
         )
     if args.qps and any(qps < 0 for qps in args.qps):
         raise ValueError("--qps filter values must be non-negative.")
@@ -661,12 +713,31 @@ def main() -> None:
     if low_success_points:
         descriptions = ", ".join(
             f"{point.profile}@qps={point.qps:g}:"
-            f"{point.success_rate!r}"
+            f"success={point.success_rate!r},"
+            f"coverage={point.token_stats_coverage!r},"
+            f"formal={point.formal_valid_rate!r}"
             for point in low_success_points[:8]
         )
         raise ValueError(
             "Selected points do not meet --min-success-rate="
             f"{args.min_success_rate:g}: {descriptions}."
+        )
+    low_coverage_points = [
+        point
+        for point in selected_points
+        if point.token_stats_coverage is None
+        or point.token_stats_coverage < args.min_stats_coverage
+    ]
+    if low_coverage_points:
+        descriptions = ", ".join(
+            f"{point.profile}@qps={point.qps:g}:"
+            f"coverage={point.token_stats_coverage!r},"
+            f"formal={point.formal_valid_rate!r}"
+            for point in low_coverage_points[:8]
+        )
+        raise ValueError(
+            "Selected points do not meet --min-stats-coverage="
+            f"{args.min_stats_coverage:g}: {descriptions}."
         )
 
     figure = plot_tradeoff(

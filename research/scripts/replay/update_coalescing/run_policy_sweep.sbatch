@@ -49,6 +49,7 @@ EVENT_PROGRESS_LOG_INTERVAL="${EVENT_PROGRESS_LOG_INTERVAL:-0}"
 WARMUP_REQUESTS="${WARMUP_REQUESTS:-0}"
 RUN_PREFIX="${RUN_PREFIX:-coalescing}"
 FAIL_FAST="${FAIL_FAST:-0}"
+FORMAL_FAIL_FAST="${FORMAL_FAIL_FAST:-0}"
 EXTRA_REPLAY_ARGS="${EXTRA_REPLAY_ARGS:-}"
 
 if [[ -z "${PROXY_URL}" ]]; then
@@ -125,6 +126,9 @@ run_replay() {
   fi
   if [[ "${FAIL_FAST}" == "1" ]]; then
     replay_args+=(--fail-fast)
+  fi
+  if [[ "${FORMAL_FAIL_FAST}" == "1" ]]; then
+    replay_args+=(--formal-fail-fast)
   fi
 
   echo "=== run ${run_name} ==="

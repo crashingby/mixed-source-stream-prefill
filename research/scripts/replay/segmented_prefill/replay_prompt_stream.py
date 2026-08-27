@@ -367,6 +367,7 @@ async def _replay_stream_sample(
     )
     request_id: str | None = None
     finish_sent_time: float | None = None
+    request_stage = "start"
     try:
         external_request_id = (
             f"replay-{run_id}-{sample.sample_id}-{uuid.uuid4().hex[:8]}"
@@ -393,6 +394,7 @@ async def _replay_stream_sample(
             len(sample.source_streams),
         )
 
+        request_stage = "source_dispatch"
         source_dispatch_start_time = time.perf_counter()
         source_tasks = [
             asyncio.create_task(
@@ -461,6 +463,7 @@ async def _replay_stream_sample(
             metric.num_event_acks,
         )
         finish_sent_time = time.perf_counter()
+        request_stage = "finish_sse"
         async with client.stream(
             "POST",
             _normalize_v1_url(args.proxy_url, _prompt_stream_finish_endpoint(args)),
@@ -479,6 +482,12 @@ async def _replay_stream_sample(
                 args.ttft_only,
                 args.sse_timeout,
             )
+
+        # 首 token 已经到达后，后置 stats 校验不能把网络成功改写成失败。
+        metric.transport_status = "ok"
+        metric.first_token_received = True
+        metric.result_status = "ok"
+        metric.request_error_stage = None
 
         metric.finish_to_first_token_ms = (
             sse_measurement.first_token_time - finish_sent_time
@@ -504,7 +513,15 @@ async def _replay_stream_sample(
             expected_coalescing=args.expected_coalescing,
             expected_config_json=args.p_node_coalescing_config_json,
         )
-        metric.result_status = "ok"
+        if metric.stats_validation_status == "invalid":
+            logger.warning(
+                "Replay stream STATS invalid: run_id=%s request_id=%s "
+                "sample_id=%s error=%s",
+                run_id,
+                request_id,
+                sample.sample_id,
+                metric.stats_validation_error,
+            )
         logger.info(
             "Replay stream FINISH ack: run_id=%s request_id=%s "
             "sample_id=%s query_id=%s ttft_ms=%.3f origin=%s",
@@ -532,6 +549,9 @@ async def _replay_stream_sample(
             sample.query_id,
             exc,
         )
+        metric.transport_status = "error"
+        metric.result_status = "error"
+        metric.request_error_stage = request_stage
         metric.error = str(exc)
         error_completed_time = time.perf_counter()
         metric.request_to_done_ms = (
@@ -541,7 +561,7 @@ async def _replay_stream_sample(
             metric.finish_to_done_ms = (
                 error_completed_time - finish_sent_time
             ) * 1000
-        if request_id is not None:
+        if request_id is not None and not metric.first_token_received:
             await _abort_prompt_stream(client, args.proxy_url, request_id)
     return metric
 

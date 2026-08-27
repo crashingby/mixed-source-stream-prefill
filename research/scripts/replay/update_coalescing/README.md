@@ -22,6 +22,7 @@ research/scripts/replay/update_coalescing/
 ├── run_policy_sweep.sbatch
 ├── summarize_coalescing.py
 ├── plot_coalescing_tradeoff.py
+├── plot_strategy_matrix.py
 └── results/
 ```
 
@@ -33,6 +34,7 @@ research/scripts/replay/update_coalescing/
 | `run_policy_sweep.sbatch` | 在一个已启动的 P 配置下扫描 QPS、Update interval 和重复次数。 | 正式采集时提交。 |
 | `summarize_coalescing.py` | 合并多个 run，生成 run 级、配置级和请求级汇总。 | 一组实验结束后运行。 |
 | `plot_coalescing_tradeoff.py` | 绘制 TTFT、saved token、invalidated token 和 Pareto 图。 | 汇总结束后运行。 |
+| `plot_strategy_matrix.py` | 按 Update interval 和 QPS 绘制策略 TTFT / token-saving 矩阵。 | 汇总结束后运行。 |
 
 ### `coalescing_profiles.sh`
 
@@ -266,7 +268,8 @@ offered QPS；这正是高负载结果必须同时报告成功率和完成吞吐
 | `TEMPERATURE` | `0` | 生成温度；延迟对比建议固定为 0。 |
 | `RUN_PREFIX` | `coalescing` | 自动生成 run name 的前缀。 |
 | `EVENT_PROGRESS_LOG_INTERVAL` | `0` | 每 N 个 event 打印一次进度；`0` 关闭。 |
-| `FAIL_FAST` | `0` | 设为 `1` 后任一请求失败即停止当前 job。 |
+| `FAIL_FAST` | `0` | 设为 `1` 后首个 HTTP/SSE 或首 token 失败即停止；stats invalid 不触发。 |
+| `FORMAL_FAIL_FAST` | `0` | 设为 `1` 后首个 `formal_result_status=invalid` 即停止。 |
 | `EXTRA_REPLAY_ARGS` | 空 | 追加给 Python replay 的简单参数；带空格的复杂值不适合通过它传递。 |
 
 `PROXY_URL=http://127.0.0.1:8000` 只在 replay job 与 proxy 位于同一节点时有效。
@@ -388,8 +391,10 @@ Update 合并不是简单地让所有 Update 等待更久，而是在有限等�
 #### 系统负载
 
 建议从 `QPS_LIST="0.5 1 2 4"` 开始，覆盖低负载、中负载和接近饱和但成功率仍
-可接受的高负载点。若某个 QPS 出现大量超时或错误，应标记为 overload，不能只
-删除失败请求后报告 TTFT。
+可接受的高负载点。若某个 QPS 出现大量 HTTP/SSE 或首 token 失败，应标记为
+overload，不能删除失败请求后只报告较低的 TTFT。已经收到首 token、但后置 stats
+校验失败的请求仍进入 TTFT 分布；其 token/work 指标不进入正式聚合，并由
+`token_stats_coverage` 单独报告覆盖率。
 
 #### Update 快照波动
 
@@ -418,10 +423,20 @@ $$
 | --- | --- |
 | `finish_to_first_token_ms` | `/finish_ttft` 发出到 P 返回首 token 的时间。 |
 | TTFT P50 / P90 / P95 / P99 | 中位数和尾延迟。 |
-| 成功率、错误数 | 防止策略通过丢弃或卡住请求获得较低 TTFT。 |
+| `transport_success_rate` | HTTP/SSE 链路成功率。 |
+| `first_token_success_rate` | 实际收到首 token 的请求比例，也是 TTFT 的样本口径。 |
+| `stats_valid_rate` | 通过 schema v2 recovery-aware 守恒校验的请求比例。 |
+| `formal_valid_rate` | 首 token、配置和 stats 全部满足正式实验条件的比例。 |
+| `token_stats_coverage` | stats-valid 请求数占首 token 成功请求数的比例。 |
 | `completed_requests_per_s` | 当前 offered load 下的完成吞吐。 |
 
 #### Update work 与 token
+
+正式实验使用 `metrics_schema_version=2`。下表中的 `update_works_*`、
+`admitted_update_prefill_tokens`、`saved_update_prefill_tokens`、
+`extra_update_prefill_tokens`、`scheduled_update_prefill_tokens` 和
+`update_tokens_invalidated` 是为了兼容旧 CSV 保留的别名；schema v2 的正式字段和
+恢复语义见后表。
 
 | 指标 | 含义 |
 | --- | --- |
@@ -434,6 +449,25 @@ $$
 | `saved_update_prefill_tokens` | `max(0, eager - admitted)`。 |
 | `extra_update_prefill_tokens` | `max(0, admitted - eager)`。 |
 | `update_tokens_invalidated` | 已物化、后来因新快照而失效的 Update KV token。 |
+
+| schema v2 指标 | 含义 |
+| --- | --- |
+| `update_policy_works_admitted` | 策略放行的逻辑 Update work 数。 |
+| `update_policy_works_completed` | 已完成的逻辑 Update work 数。 |
+| `update_policy_works_cancelled_by_recovery` | 被抢占恢复路径明确取消的逻辑 work 数。 |
+| `update_policy_works_outstanding` | finish 时仍未完成或取消的逻辑 work 数；正式结果必须为 0。 |
+| `update_execution_attempts_started` | 物理执行尝试次数；同一逻辑 work 可因抢占多次执行。 |
+| `update_execution_attempts_completed` | 正常完成的物理执行尝试次数。 |
+| `update_execution_attempts_preempted` | 被抢占中断的物理执行尝试次数。 |
+| `update_recovery_works_created` | 创建的恢复 work 数；可能尚未启动就被后续恢复替换。 |
+| `update_tokens_scheduled_total` | 原始执行与恢复重放累计调度的 Update token。 |
+| `update_tokens_scheduled_for_recovery` | 其中由恢复 work 重放的 Update token。 |
+| `prefix_append_tokens_scheduled_for_recovery` | 恢复时重算的 PREFIX_APPEND token。 |
+| `update_tokens_discarded_by_preemption` | 抢占时丢弃的 Update 已计算 token。 |
+| `prefix_append_tokens_discarded_by_preemption` | 抢占时丢弃的 PREFIX_APPEND 已计算 token。 |
+| `question_tokens_discarded_by_preemption` | 抢占时丢弃的 QUESTION 已计算 token。 |
+| `update_tokens_invalidated_by_snapshot` | 新 Update 快照造成的语义失效 token，不含抢占丢弃。 |
+| `prompt_stream_*preemptions/evictions/resets/failures*` | 请求压力、驱逐、prefix cache reset 和分配失败计数。 |
 
 跨请求汇总使用：
 
@@ -816,9 +850,15 @@ tail -f "research/scripts/logs/replay-coalescing-${REPLAY_JOB_ID}.out"
 
 成功结果应满足：
 
-- `num_success == num_requests`，或至少达到预设成功率阈值。
-- `num_stats_requests == num_success`。
-- `update_works_completed == update_works_admitted`。
+- `num_first_token_success == num_requests`，或至少达到预设首 token 成功率阈值；
+  TTFT 仅使用这些请求。
+- `token_stats_coverage` 达到实验要求；token/work 结论只使用 schema v2
+  `stats_validation_status=valid` 的请求。
+- 每个正式请求满足 `admitted = completed + cancelled_by_recovery + outstanding`，
+  且 finish 时 `outstanding == 0`。
+- 每个正式请求满足 `attempts_started = attempts_completed + attempts_preempted`。
+- `update_tokens_scheduled_for_recovery <= update_tokens_scheduled_total`。恢复 work
+  可能尚未启动就被替换，因此不要求 `recovery_works_created <= attempts_started`。
 - P 实际配置与 replay 审计配置一致。
 - run 目录存在 `config.json`、`request_metrics.csv`、`event_metrics.csv` 和
   `summary.json`。
@@ -876,7 +916,8 @@ scancel "${P_JOB_ID}"
 | `MAX_TOKENS` | `64` | 普通生成上限；TTFT-only 在 P 首 token 后结束。 |
 | `WARMUP_REQUESTS` | `0` | 正式矩阵前的 warmup 数；正式采集建议 `8`。 |
 | `EVENT_PROGRESS_LOG_INTERVAL` | `0` | 每 N 个 event 打印进度；`0` 关闭。 |
-| `FAIL_FAST` | `0` | 设为 `1` 后任一请求失败即结束 job。 |
+| `FAIL_FAST` | `0` | 设为 `1` 后首个 HTTP/SSE 或首 token 失败即结束；stats invalid 不触发。 |
+| `FORMAL_FAIL_FAST` | `0` | 设为 `1` 后首个 formal-invalid 结果即结束；默认关闭。 |
 | `EXTRA_REPLAY_ARGS` | 空 | 追加给 Python replay 的简单参数。 |
 
 warmup 使用矩阵中的第一个 Update interval，写入 `results/warmup/`，汇总默认跳过。
@@ -891,8 +932,11 @@ warmup 使用矩阵中的第一个 Update interval，写入 `results/warmup/`，
 - `summary.json`：当前 run 的 TTFT 分位数和全局 token/work 总量。
 - `responses/`：仅在显式使用 `--save-responses` 时生成。
 
-服务端统计缺失、类型错误、work 生命周期计数不一致、coalescing 状态与预期不一致，
-或 P 实际配置与审计 JSON 不一致时，请求会记录为错误，不会把缺失值填成 0。
+HTTP/SSE 或首 token 失败才会把网络结果标记为错误并触发必要的 abort。已经收到首
+token 后，服务端 stats 缺失、类型错误、recovery-aware 守恒不一致、coalescing
+状态与预期不一致，或 P 实际配置与审计 JSON 不一致，只会把 stats/formal 状态标为
+无效：该请求仍进入 TTFT 分布，不再 abort；其 token/work 数据不会填成 0，也不会
+进入正式 token 聚合。schema v1 只作为 legacy 读取，formal 状态为 `not_evaluated`。
 
 ## 汇总与绘图
 
@@ -917,8 +961,9 @@ warmup 使用矩阵中的第一个 Update interval，写入 `results/warmup/`，
 ```
 
 可用 `--qps`、`--update-chunk-interval`、`--profile` 和 `--workload-id` 过滤切片。
-绘图默认要求每个配置成功率至少为 `0.95`；只有分析 overload 时才使用
-`--min-success-rate 0`。
+绘图默认同时要求首 token 成功率和 recovery-safe stats 覆盖率至少为 `0.95`。
+只有分析 overload 或旧结果时，才分别使用 `--min-success-rate 0` 或
+`--min-stats-coverage 0` 放宽阈值；这类图不能作为正式 token trade-off 结论。
 
 只有过滤后剩下一个 `(workload_id, QPS, Update interval)` 切片时才计算 Pareto
 frontier。不同 offered load 不会互相计算支配关系。`disabled` 的 eager/saved 字段

@@ -59,6 +59,7 @@ from vllm.v1.metrics.stats import PrefixCacheStats, SchedulerStats
 from vllm.v1.outputs import DraftTokenIds, KVConnectorOutput, ModelRunnerOutput
 from vllm.v1.request import (
     PromptStreamKVSegment,
+    PromptStreamRecoveryReason,
     Request,
     RequestStatus,
     StreamingUpdate,
@@ -640,7 +641,9 @@ class Scheduler(SchedulerInterface):
         request: Request,
         timestamp: float,
         evicted_requests: list[Request],
+        recovery_reason: PromptStreamRecoveryReason,
     ) -> None:
+        """驱逐暂驻的 Prompt Stream KV，并记录准确的恢复原因。"""
         controller = self._prompt_stream_update_coalescer
         assert controller is not None
         controller.remove_request(request.request_id)
@@ -654,7 +657,7 @@ class Scheduler(SchedulerInterface):
         self._inflight_prefills.discard(request)
         self._prompt_stream_worker_removal_req_ids.add(request.request_id)
         request.status = RequestStatus.PREEMPTED
-        request.reset_prompt_stream_computed_state()
+        request.reset_prompt_stream_computed_state(reason=recovery_reason)
         request.spec_token_ids.clear()
         request.num_preemptions += 1
         if self.log_stats:
@@ -666,7 +669,21 @@ class Scheduler(SchedulerInterface):
         timestamp: float,
         evicted_requests: list[Request],
         excluded_request_id: str | None = None,
+        recovery_reason: PromptStreamRecoveryReason | None = None,
     ) -> bool:
+        """驱逐一个仍持有分段 KV 的暂驻 Prompt Stream 请求。
+
+        Args:
+            timestamp: 写入抢占事件的 Scheduler 时间戳。
+            evicted_requests: KV 释放后需要重新协调的请求列表。
+            excluded_request_id: 不允许被当前分配流程自我驱逐的等待请求。
+            recovery_reason: 调用方指定的恢复原因。Prefix cache reset 会
+                显式覆盖；普通分配压力则在本方法内区分 dormant 与
+                retained-waiting。
+
+        Returns:
+            成功驱逐一个请求时返回 ``True``，否则返回 ``False``。
+        """
         controller = self._prompt_stream_update_coalescer
         if controller is None:
             return False
@@ -675,8 +692,14 @@ class Scheduler(SchedulerInterface):
             if request is None or request.is_finished():
                 controller.remove_request(request_id)
                 continue
+            dormant_recovery_reason = (
+                recovery_reason or PromptStreamRecoveryReason.DORMANT_EVICTION
+            )
             self._evict_prompt_stream_request_kv(
-                request, timestamp, evicted_requests
+                request,
+                timestamp,
+                evicted_requests,
+                dormant_recovery_reason,
             )
             return True
 
@@ -696,8 +719,15 @@ class Scheduler(SchedulerInterface):
             )
             if not in_scheduler_queue:
                 continue
+            retained_recovery_reason = (
+                recovery_reason
+                or PromptStreamRecoveryReason.RETAINED_WAITING_EVICTION
+            )
             self._evict_prompt_stream_request_kv(
-                request, timestamp, evicted_requests
+                request,
+                timestamp,
+                evicted_requests,
+                retained_recovery_reason,
             )
             return True
         return False
@@ -1077,6 +1107,7 @@ class Scheduler(SchedulerInterface):
 
             # Schedule newly needed KV blocks for the request.
             with record_function_or_nullcontext("schedule: allocate_slots"):
+                running_allocation_failure_recorded = False
                 while True:
                     new_blocks = self.kv_cache_manager.allocate_slots(
                         request,
@@ -1087,6 +1118,17 @@ class Scheduler(SchedulerInterface):
                     if new_blocks is not None:
                         # The request can be scheduled.
                         break
+
+                    # 即使连续释放多个 dormant victim，本次运行态调度过程也只
+                    # 记录一次分配压力，避免按重试次数放大指标。
+                    if (
+                        request.is_prompt_streaming()
+                        and not running_allocation_failure_recorded
+                    ):
+                        request.record_prompt_stream_allocation_failure(
+                            is_running=True
+                        )
+                        running_allocation_failure_recorded = True
 
                     if (
                         self._prompt_stream_update_coalescer is not None
@@ -1468,6 +1510,7 @@ class Scheduler(SchedulerInterface):
                     # avoid deadlock and predictable preemptions.
                     reserved_blocks = self._inflight_prefill_reserved_blocks()
 
+                waiting_allocation_failure_recorded = False
                 while True:
                     new_blocks = self.kv_cache_manager.allocate_slots(
                         request,
@@ -1484,6 +1527,18 @@ class Scheduler(SchedulerInterface):
                     )
                     if new_blocks is not None:
                         break
+
+                    # 即使连续驱逐多个暂驻请求，本次等待态 admission 也只记录
+                    # 一次分配压力，避免按重试次数放大指标。
+                    if (
+                        request.is_prompt_streaming()
+                        and not waiting_allocation_failure_recorded
+                    ):
+                        request.record_prompt_stream_allocation_failure(
+                            is_running=False
+                        )
+                        waiting_allocation_failure_recorded = True
+
                     if (
                         self._prompt_stream_update_coalescer is None
                         or not self._evict_one_dormant_prompt_stream_request(
@@ -1749,11 +1804,24 @@ class Scheduler(SchedulerInterface):
     ) -> KVConnectorMetadata:
         return connector.build_connector_meta(scheduler_output)
 
-    def _preempt_request(self, request: Request, timestamp: float) -> None:
-        """Preempt a request and put it back to the waiting queue.
+    def _preempt_request(
+        self,
+        request: Request,
+        timestamp: float,
+        recovery_reason: PromptStreamRecoveryReason = (
+            PromptStreamRecoveryReason.RUNNING_PREEMPTION
+        ),
+    ) -> None:
+        """抢占一个请求、释放其 KV，并将其放回等待路径。
 
-        NOTE: The request should be popped from the running queue outside of this
-        method.
+        调用方必须在进入本方法前把请求从 running 队列移除。
+
+        Args:
+            request: 需要释放 KV 的运行态请求。
+            timestamp: 写入抢占事件的 Scheduler 时间戳。
+            recovery_reason: Prompt Stream 恢复统计使用的准确原因。普通
+                allocation pressure 使用 running preemption；显式 prefix
+                cache reset 传入独立原因。
         """
         assert request.status == RequestStatus.RUNNING, (
             "Only running requests can be preempted"
@@ -1765,7 +1833,7 @@ class Scheduler(SchedulerInterface):
         if request.is_prompt_streaming():
             # segment blocks 已整体释放，后续必须按 PA -> Update -> Question
             # 从逻辑 source 状态完整 replay，不能沿用旧 segment 进度。
-            request.reset_prompt_stream_computed_state()
+            request.reset_prompt_stream_computed_state(reason=recovery_reason)
         else:
             request.num_computed_tokens = 0
         if request.spec_token_ids:
@@ -2983,6 +3051,7 @@ class Scheduler(SchedulerInterface):
             while self._evict_one_dormant_prompt_stream_request(
                 timestamp,
                 evicted_dormant_reqs,
+                recovery_reason=PromptStreamRecoveryReason.PREFIX_CACHE_RESET,
             ):
                 pass
 
@@ -2993,7 +3062,11 @@ class Scheduler(SchedulerInterface):
             # running queue in FIFO order.
             while self.running:
                 request = self.running.pop()
-                self._preempt_request(request, timestamp)
+                self._preempt_request(
+                    request,
+                    timestamp,
+                    PromptStreamRecoveryReason.PREFIX_CACHE_RESET,
+                )
                 # For async scheduling, any output frames already in flight at
                 # preemption time are now stale and must be discarded when they
                 # return. num_output_placeholders is exactly that count: 0 if
