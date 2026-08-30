@@ -1609,7 +1609,11 @@ class Request:
                 ),
                 update_token_ids=target,
                 execution_base_token_ids=base,
-                execution_base_append_epoch=state.last_admitted_append_epoch,
+                # 空基准不复用任何 UPDATE KV，因此不绑定 Append epoch。
+                # 这也覆盖 empty snapshot 经 recovery 后再变为非空的路径。
+                execution_base_append_epoch=(
+                    state.last_admitted_append_epoch if base else None
+                ),
                 required_append_epoch=required_append_epoch,
                 update_common_prefix_len=common_prefix_len,
                 update_admission_id=admission_id,
@@ -2749,6 +2753,8 @@ class Request:
             execution_base = work_item.execution_base_token_ids
             if (
                 gate is not None
+                # 空基准没有 UPDATE KV 可以复用，Append epoch 与执行无关。
+                and execution_base
                 and work_item.execution_base_append_epoch
                 != gate.update_committed_append_epoch
             ):

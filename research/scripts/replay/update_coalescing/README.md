@@ -296,7 +296,10 @@ Slurm replay 通常运行在其它节点，应使用 proxy 所在节点 hostname
 - `combined_request_metrics.csv`：全部请求级记录与实验元数据。
 - `summary.json`：结构化汇总。
 
-`plot_coalescing_tradeoff.py` 使用 `configuration_summary.csv` 绘制四联图。
+- `plot_coalescing_tradeoff.py` 使用 `configuration_summary.csv` 绘制四联
+  trade-off 图。
+- `plot_strategy_matrix.py` 使用同一份汇总结果，按 Update interval 和 QPS
+  绘制 TTFT 与 Update Prefill token saving 策略矩阵。
 
 ## P 节点配置
 
@@ -960,14 +963,37 @@ token 后，服务端 stats 缺失、类型错误、recovery-aware 守恒不一�
   --ttft-percentile p95
 ```
 
-可用 `--qps`、`--update-chunk-interval`、`--profile` 和 `--workload-id` 过滤切片。
-绘图默认同时要求首 token 成功率和 recovery-safe stats 覆盖率至少为 `0.95`。
+四联图适合观察一个实验切片中的 TTFT、节省 token、失效 token 和 Pareto
+trade-off。若要同时比较不同 Update interval 和 QPS 下的策略表现，运行：
+
+```shell
+.venv/bin/python \
+  research/scripts/replay/update_coalescing/plot_strategy_matrix.py \
+  --summary-csv \
+    research/scripts/replay/update_coalescing/results/analysis/configuration_summary.csv \
+  --output \
+    research/scripts/replay/update_coalescing/results/analysis/coalescing_strategy_matrix.png \
+  --ttft-percentile p95 \
+  --baseline-profile disabled
+```
+
+策略矩阵的上半部分显示所选 TTFT 分位数，并以 `disabled` 计算每个单元格中的
+相对变化；下半部分显示 Update Prefill token saving。橙色边框表示同一
+`(Update interval, QPS)` 列中表现最好的可靠策略，灰色表示缺失、不适用或未达到
+可靠性阈值。策略矩阵要求输入中只包含一个 `workload_id`；若汇总结果含有多个
+workload，必须通过 `--workload-id <WORKLOAD_ID>` 选择一个。
+
+两个绘图脚本均可用 `--qps`、`--append-chunk-interval`、
+`--update-chunk-interval`、`--profile` 和 `--workload-id` 过滤数据。需要保留多个值
+时重复传入同一个参数，例如 `--qps 1 --qps 2 --qps 4`。绘图默认同时要求首 token
+成功率和 recovery-safe stats 覆盖率至少为 `0.95`。
 只有分析 overload 或旧结果时，才分别使用 `--min-success-rate 0` 或
 `--min-stats-coverage 0` 放宽阈值；这类图不能作为正式 token trade-off 结论。
 
-只有过滤后剩下一个 `(workload_id, QPS, Update interval)` 切片时才计算 Pareto
-frontier。不同 offered load 不会互相计算支配关系。`disabled` 的 eager/saved 字段
-为空，因此只进入 TTFT 和 invalidated 图。
+`plot_coalescing_tradeoff.py` 只有在过滤后剩下一个
+`(workload_id, QPS, Update interval)` 切片时才计算 Pareto frontier。不同 offered
+load 不会互相计算支配关系。`disabled` 的 eager/saved 字段为空，因此只进入 TTFT
+和 invalidated 图。
 
 ## 推荐执行顺序
 
