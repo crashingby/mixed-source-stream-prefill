@@ -97,3 +97,5 @@ class PromptStreamFinishResponse(OpenAIBaseModel):
     output_text: str = ""
     output_finish_reason: str | None = None
     output_stop_reason: int | str | None = None
+    # 统计与 KV 传输参数相互独立，由 proxy 原样返回给实验客户端。
+    prompt_stream_stats: dict[str, Any] | None = None

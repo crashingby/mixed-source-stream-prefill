@@ -562,6 +562,46 @@ def _should_finish_without_decode(
     return isinstance(max_tokens, int) and max_tokens <= num_prefill_output_tokens
 
 
+def _attach_prompt_stream_stats(
+    response_payload: dict[str, Any],
+    prefill_response: dict[str, Any],
+) -> dict[str, Any]:
+    """把 P 节点统计附加到返回客户端的 Prompt Stream 响应。
+
+    统计描述的是 P 节点内部的 Prompt Stream work 与 KV 状态，proxy 只做
+    透明透传，不能重新计算。该 helper 只作用于客户端响应 payload；调用方
+    不得把结果复用为 D 节点请求，从而保证研究统计不会进入
+    ``kv_transfer_params`` 或 decode request。
+
+    Args:
+        response_payload: 即将返回给客户端的 JSON 或 SSE payload。
+        prefill_response: P 节点 ``/prompt_stream/finish`` 返回的 JSON。
+
+    Returns:
+        已附加可选 ``prompt_stream_stats`` 字段的原 payload。
+
+    Raises:
+        HTTPException: P 节点返回了非对象类型的统计字段时抛出。
+    """
+    prompt_stream_stats = prefill_response.get("prompt_stream_stats")
+    if prompt_stream_stats is None:
+        # 兼容尚未导出统计的 P 节点；simple_test/replay 会对实验结果做
+        # fail-closed 校验，proxy 本身仍可服务旧版本节点。
+        return response_payload
+    if not isinstance(prompt_stream_stats, dict):
+        raise HTTPException(
+            status_code=502,
+            detail=(
+                "P node returned non-object prompt_stream_stats: "
+                f"{type(prompt_stream_stats).__name__}."
+            ),
+        )
+
+    # 保持 P 节点的字段和值不变，避免 proxy 产生第二套统计口径。
+    response_payload["prompt_stream_stats"] = prompt_stream_stats
+    return response_payload
+
+
 def _build_prefill_only_response(
     session: PromptStreamProxySession,
     response_json: dict[str, Any],
@@ -574,7 +614,7 @@ def _build_prefill_only_response(
     finish_reason = response_json.get("output_finish_reason")
     if finish_reason != "stop":
         finish_reason = "length"
-    return {
+    response_payload = {
         "id": f"cmpl-{session.request_id}",
         "object": "text_completion",
         "created": int(time.time()),
@@ -595,6 +635,7 @@ def _build_prefill_only_response(
             "total_tokens": prompt_tokens + completion_tokens,
         },
     }
+    return _attach_prompt_stream_stats(response_payload, response_json)
 
 
 def _merge_prefill_output(
@@ -604,7 +645,7 @@ def _merge_prefill_output(
 ) -> dict[str, Any]:
     """把 P 首 token 合并回 D 的非流式 completions 响应。"""
     if num_prefill_output_tokens <= 0:
-        return response_json
+        return _attach_prompt_stream_stats(response_json, prefill_response)
     choices = response_json.get("choices")
     if not isinstance(choices, list) or len(choices) != 1:
         raise HTTPException(
@@ -630,7 +671,7 @@ def _merge_prefill_output(
             )
         if isinstance(completion_tokens, int):
             usage["completion_tokens"] = completion_tokens + num_prefill_output_tokens
-    return response_json
+    return _attach_prompt_stream_stats(response_json, prefill_response)
 
 
 def _build_prefill_start_request(req_data: dict[str, Any]) -> dict[str, Any]:
@@ -962,7 +1003,7 @@ def _build_prefill_stream_chunk(
     finish_reason = prefill_response.get("output_finish_reason")
     if is_final_chunk and finish_reason != "stop":
         finish_reason = "length"
-    return {
+    response_payload = {
         "id": f"cmpl-{session.request_id}",
         "object": "text_completion",
         "created": int(time.time()),
@@ -979,6 +1020,9 @@ def _build_prefill_stream_chunk(
             }
         ],
     }
+    # 流式客户端会把这一帧作为真实首 token；统计必须和首帧一起返回，
+    # 不能放到尾帧，否则 TTFT-only 客户端可能已经结束读取。
+    return _attach_prompt_stream_stats(response_payload, prefill_response)
 
 
 async def _stream_decode_completion(

@@ -19,6 +19,7 @@ from replay_common import (
     RequestMetric,
     SampleReplayInput,
     SourceEventStream,
+    apply_prompt_stream_stats,
     _normalize_v1_url,
     _override_sampling_params,
     _post_json,
@@ -67,6 +68,37 @@ def _source_timing(
     raise ValueError(f"Unsupported source_type={source_type!r}.")
 
 
+def _longest_common_prefix_len(
+    previous_token_ids: tuple[int, ...],
+    current_token_ids: tuple[int, ...],
+) -> int:
+    """计算两个 source-local Update 快照的 token LCP 长度。
+
+    Args:
+        previous_token_ids: 同一 Update source 的上一代完整 token 快照。
+        current_token_ids: 本次 ACK 返回的完整 token 快照。
+
+    Returns:
+        两代快照从首 token 开始连续相同的 token 数。
+    """
+    common_prefix_len = 0
+    for previous_token_id, current_token_id in zip(
+        previous_token_ids,
+        current_token_ids,
+    ):
+        if previous_token_id != current_token_id:
+            break
+        common_prefix_len += 1
+    return common_prefix_len
+
+
+def _metric_mode(args: argparse.Namespace) -> str:
+    """按实验套件返回稳定的请求与事件指标标签。"""
+    if args.experiment_suite == "update_coalescing":
+        return "update_coalescing"
+    return "stream"
+
+
 async def _send_source_events(
     client: httpx.AsyncClient,
     proxy_url: str,
@@ -85,7 +117,8 @@ async def _send_source_events(
     initial_delay, chunk_interval = _source_timing(source_stream.source_type, args)
     event_metrics: list[EventMetric] = []
     num_data_events_sent = 0
-    previous_data_scheduled_offset = initial_delay
+    last_data_ack_time: float | None = None
+    previous_update_token_ids: tuple[int, ...] | None = None
 
     for event_index, record in enumerate(source_stream.event_records):
         stored_event = record["event"]
@@ -98,15 +131,15 @@ async def _send_source_events(
 
         if event_type in ("append", "update"):
             scheduled_offset = initial_delay + num_data_events_sent * chunk_interval
-            previous_data_scheduled_offset = scheduled_offset
+            scheduled_target_time = source_dispatch_start_time + scheduled_offset
             num_data_events_sent += 1
         else:
-            # barrier 在最后一条数据事件 ack 后按单独延迟发送。
-            scheduled_offset = previous_data_scheduled_offset + args.source_finish_delay
-            if num_data_events_sent == 0:
-                scheduled_offset = initial_delay + args.source_finish_delay
-
-        scheduled_target_time = source_dispatch_start_time + scheduled_offset
+            # SOURCE_FINISHED 严格从最后一条数据事件 ACK 完成时开始计时。
+            barrier_base_time = last_data_ack_time
+            if barrier_base_time is None:
+                barrier_base_time = source_dispatch_start_time + initial_delay
+            scheduled_target_time = barrier_base_time + args.source_finish_delay
+            scheduled_offset = scheduled_target_time - source_dispatch_start_time
         if should_log_event:
             wait_ms = max(0.0, scheduled_target_time - time.perf_counter()) * 1000
             logger.info(
@@ -166,7 +199,7 @@ async def _send_source_events(
 
         ack_start_time = time.perf_counter()
         try:
-            await _post_json(
+            ack_response = await _post_json(
                 client,
                 _normalize_v1_url(proxy_url, "/v1/prompt_stream/event"),
                 payload,
@@ -194,7 +227,7 @@ async def _send_source_events(
             event_metrics.append(
                 EventMetric(
                     run_id=run_id,
-                    mode="stream",
+                    mode=_metric_mode(args),
                     sample_id=sample.sample_id,
                     query_id=sample.query_id,
                     source_id=source_stream.source_id,
@@ -212,7 +245,45 @@ async def _send_source_events(
             )
             raise
 
-        ack_latency_ms = (time.perf_counter() - ack_start_time) * 1000
+        ack_completed_time = time.perf_counter()
+        if event_type in ("append", "update"):
+            last_data_ack_time = ack_completed_time
+
+        num_event_tokens: int | None = None
+        update_lcp_tokens: int | None = None
+        update_lcp_ratio: float | None = None
+        raw_token_ids = ack_response.get("token_ids")
+        if (
+            event_type == "update"
+            and args.experiment_suite == "update_coalescing"
+            and raw_token_ids is None
+        ):
+            raise ReplayHttpError(
+                "Formal Update coalescing replay requires token_ids in every "
+                "Update event ACK."
+            )
+        if raw_token_ids is not None:
+            if not isinstance(raw_token_ids, list) or not all(
+                type(token_id) is int for token_id in raw_token_ids
+            ):
+                raise ReplayHttpError(
+                    "Prompt-stream event token_ids must be a list of integers."
+                )
+            event_token_ids = tuple(raw_token_ids)
+            num_event_tokens = len(event_token_ids)
+            if event_type == "update":
+                if previous_update_token_ids is not None:
+                    update_lcp_tokens = _longest_common_prefix_len(
+                        previous_update_token_ids,
+                        event_token_ids,
+                    )
+                    update_lcp_ratio = update_lcp_tokens / max(
+                        1, num_event_tokens
+                    )
+                # 下一代只与同一 Update source 的本代完整 token 快照比较。
+                previous_update_token_ids = event_token_ids
+
+        ack_latency_ms = (ack_completed_time - ack_start_time) * 1000
         if should_log_event:
             logger.info(
                 "Replay stream ACK event: run_id=%s request_id=%s "
@@ -236,7 +307,7 @@ async def _send_source_events(
         event_metrics.append(
             EventMetric(
                 run_id=run_id,
-                mode="stream",
+                mode=_metric_mode(args),
                 sample_id=sample.sample_id,
                 query_id=sample.query_id,
                 source_id=source_stream.source_id,
@@ -249,6 +320,9 @@ async def _send_source_events(
                 actual_send_offset_ms=actual_send_offset_ms,
                 ack_latency_ms=ack_latency_ms,
                 result_status="ok",
+                num_event_tokens=num_event_tokens,
+                update_lcp_tokens=update_lcp_tokens,
+                update_lcp_ratio=update_lcp_ratio,
             )
         )
     return event_metrics
@@ -282,7 +356,7 @@ async def _replay_stream_sample(
     request_start_time = time.perf_counter()
     metric = RequestMetric(
         run_id=run_id,
-        mode="stream",
+        mode=_metric_mode(args),
         sample_id=sample.sample_id,
         query_id=sample.query_id,
         sample_status=sample.status,
@@ -292,6 +366,8 @@ async def _replay_stream_sample(
         request_start_wall_time=time.time(),
     )
     request_id: str | None = None
+    finish_sent_time: float | None = None
+    request_stage = "start"
     try:
         external_request_id = (
             f"replay-{run_id}-{sample.sample_id}-{uuid.uuid4().hex[:8]}"
@@ -318,6 +394,7 @@ async def _replay_stream_sample(
             len(sample.source_streams),
         )
 
+        request_stage = "source_dispatch"
         source_dispatch_start_time = time.perf_counter()
         source_tasks = [
             asyncio.create_task(
@@ -359,6 +436,15 @@ async def _replay_stream_sample(
         metric.num_update_snapshots = sum(
             event.event_type == "update" for event in metric.event_metrics
         )
+        update_lcp_ratios = [
+            event.update_lcp_ratio
+            for event in metric.event_metrics
+            if event.update_lcp_ratio is not None
+        ]
+        if update_lcp_ratios:
+            metric.mean_update_lcp_ratio = sum(update_lcp_ratios) / len(
+                update_lcp_ratios
+            )
 
         finish_event = dict(sample.finish_event)
         finish_event["arrival_time"] = time.time()
@@ -377,6 +463,7 @@ async def _replay_stream_sample(
             metric.num_event_acks,
         )
         finish_sent_time = time.perf_counter()
+        request_stage = "finish_sse"
         async with client.stream(
             "POST",
             _normalize_v1_url(args.proxy_url, _prompt_stream_finish_endpoint(args)),
@@ -396,6 +483,12 @@ async def _replay_stream_sample(
                 args.sse_timeout,
             )
 
+        # 首 token 已经到达后，后置 stats 校验不能把网络成功改写成失败。
+        metric.transport_status = "ok"
+        metric.first_token_received = True
+        metric.result_status = "ok"
+        metric.request_error_stage = None
+
         metric.finish_to_first_token_ms = (
             sse_measurement.first_token_time - finish_sent_time
         ) * 1000
@@ -412,7 +505,23 @@ async def _replay_stream_sample(
         metric.completion_chars = sse_measurement.completion_chars
         metric.completion_chunks = sse_measurement.completion_chunks
         metric.response_payloads = list(sse_measurement.payloads)
-        metric.result_status = "ok"
+        apply_prompt_stream_stats(
+            metric,
+            sse_measurement.prompt_stream_stats,
+            num_sent_update_events=metric.num_update_snapshots,
+            require_stats=args.require_prompt_stream_stats,
+            expected_coalescing=args.expected_coalescing,
+            expected_config_json=args.p_node_coalescing_config_json,
+        )
+        if metric.stats_validation_status == "invalid":
+            logger.warning(
+                "Replay stream STATS invalid: run_id=%s request_id=%s "
+                "sample_id=%s error=%s",
+                run_id,
+                request_id,
+                sample.sample_id,
+                metric.stats_validation_error,
+            )
         logger.info(
             "Replay stream FINISH ack: run_id=%s request_id=%s "
             "sample_id=%s query_id=%s ttft_ms=%.3f origin=%s",
@@ -440,8 +549,19 @@ async def _replay_stream_sample(
             sample.query_id,
             exc,
         )
+        metric.transport_status = "error"
+        metric.result_status = "error"
+        metric.request_error_stage = request_stage
         metric.error = str(exc)
-        if request_id is not None:
+        error_completed_time = time.perf_counter()
+        metric.request_to_done_ms = (
+            error_completed_time - request_start_time
+        ) * 1000
+        if finish_sent_time is not None:
+            metric.finish_to_done_ms = (
+                error_completed_time - finish_sent_time
+            ) * 1000
+        if request_id is not None and not metric.first_token_received:
             await _abort_prompt_stream(client, args.proxy_url, request_id)
     return metric
 

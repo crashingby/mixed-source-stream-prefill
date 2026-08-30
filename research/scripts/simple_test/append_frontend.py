@@ -8,6 +8,11 @@ from typing import Any
 
 import httpx
 
+from prompt_stream_stats import (
+    parse_prompt_stream_stats,
+    print_prompt_stream_stats,
+)
+
 
 DEFAULT_PREFIX = (
     "You are a helpful assistant. Read the streaming context first, "
@@ -295,6 +300,11 @@ def run_append_demo(args: argparse.Namespace) -> None:
             finish_payload,
         )
         _print_json("finish response", finish_response)
+        prompt_stream_stats = parse_prompt_stream_stats(
+            finish_response,
+            num_sent_update_events=0,
+        )
+        print_prompt_stream_stats(prompt_stream_stats)
 
 
 def main() -> None:

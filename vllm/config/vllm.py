@@ -865,6 +865,30 @@ class VllmConfig:
 
         self.try_verify_and_update_config()
 
+        if (
+            self.scheduler_config.prompt_stream_update_coalescing_config
+            is not None
+            and self.parallel_config.data_parallel_size > 1
+        ):
+            raise ValueError(
+                "Prompt stream Update coalescing does not support data "
+                "parallelism."
+            )
+        if (
+            self.scheduler_config.prompt_stream_update_coalescing_config
+            is not None
+            and self.kv_transfer_config is not None
+            and (
+                self.kv_transfer_config.kv_connector
+                not in ("NixlConnector", "NixlPullConnector")
+                or not self.kv_transfer_config.is_kv_producer
+            )
+        ):
+            raise ValueError(
+                "Prompt stream Update coalescing currently supports only a "
+                "NIXL pull-mode KV producer when KV transfer is configured."
+            )
+
         if self.model_config is not None:
             self.model_config.verify_with_parallel_config(self.parallel_config)
             self.model_config.verify_dual_chunk_attention_config(self.load_config)

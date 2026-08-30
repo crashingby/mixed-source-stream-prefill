@@ -173,6 +173,40 @@ class SchedulerInterface(ABC):
         internal queue."""
         return self.get_num_unfinished_requests() > 0
 
+    def has_prompt_stream_update_coalescer(self) -> bool:
+        """返回当前 scheduler 是否启用了 PromptStream Update 合并器。
+
+        默认值为 ``False``，使普通 scheduler 完全保留原有 EngineCore
+        轮询、阻塞与休眠路径。实现合并器的 scheduler 必须显式覆盖该接口。
+        """
+        return False
+
+    def has_runnable_engine_work(self) -> bool:
+        """判断当前是否存在需要 EngineCore 立即推进的工作。
+
+        默认实现保持既有 scheduler 语义。PromptStream Update 合并器可以
+        覆盖该接口，把只等待 source 事件或 deadline 的 dormant 请求排除，
+        避免 EngineCore 在没有 GPU work 时空转。
+        """
+        return self.has_requests()
+
+    def get_next_prompt_stream_deadline(self) -> float | None:
+        """返回最近的 PromptStream Update 合并绝对 deadline。"""
+        return None
+
+    def flush_due_update_coalescing(self, now: float | None = None) -> int:
+        """放行已经到期的 PromptStream Update 窗口。
+
+        不支持合并的 scheduler 使用 no-op 默认实现，确保 EngineCore 的
+        可选唤醒 hook 不会改变普通请求行为。
+        """
+        del now
+        return 0
+
+    def abort_dormant_prompt_stream_requests(self) -> list[tuple[str, int]]:
+        """在 EngineCore shutdown 时结束无法再由输入事件唤醒的请求。"""
+        return []
+
     @abstractmethod
     def has_finished_requests(self) -> bool:
         """Returns True if there are finished requests that need to be cleared.

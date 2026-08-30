@@ -156,6 +156,10 @@ class EngineCore:
             block_size=scheduler_block_size,
             hash_block_size=hash_block_size,
         )
+        # 缓存可选合并器能力，避免关闭实验功能时触碰新调度路径。
+        self.prompt_stream_update_coalescer_enabled = (
+            self.scheduler.has_prompt_stream_update_coalescer()
+        )
         self.use_spec_decode = vllm_config.speculative_config is not None
         self.check_for_draft_tokens = (
             self.use_spec_decode or vllm_config.model_config.is_diffusion
@@ -483,9 +487,19 @@ class EngineCore:
         was executed.
         """
 
-        # Check for any requests remaining in the scheduler - unfinished,
-        # or finished and not yet removed from the batch.
-        if not self.scheduler.has_requests():
+        # In-process EngineCore does not pass through run_busy_loop, so it
+        # must release due windows before checking whether scheduler work exists.
+        if self.prompt_stream_update_coalescer_enabled:
+            self.scheduler.flush_due_update_coalescing(time.monotonic())
+
+        # 关闭合并器时保留原有 has_requests() 判定；仅启用后才把 dormant
+        # Request 从立即可运行的 EngineCore work 中排除。
+        has_scheduler_work = (
+            self.scheduler.has_runnable_engine_work()
+            if self.prompt_stream_update_coalescer_enabled
+            else self.scheduler.has_requests()
+        )
+        if not has_scheduler_work:
             return {}, False
         scheduler_output = self.scheduler.schedule(self._should_throttle_prefills())
         future = self.model_executor.execute_model(scheduler_output, non_block=True)
@@ -1244,11 +1258,14 @@ class EngineCoreProc(EngineCore):
 
     def has_work(self) -> bool:
         """Returns true if the engine should be stepped."""
-        return (
-            self.engines_running
-            or self.scheduler.has_requests()
-            or bool(self.batch_queue)
+        # 普通 scheduler 保持原 has_requests() 语义；合并器启用后，dormant
+        # Request 只由 source event 或 deadline 唤醒，不应触发忙循环。
+        has_scheduler_work = (
+            self.scheduler.has_runnable_engine_work()
+            if self.prompt_stream_update_coalescer_enabled
+            else self.scheduler.has_requests()
         )
+        return self.engines_running or has_scheduler_work or bool(self.batch_queue)
 
     def is_running(self) -> bool:
         """Returns true if shutdown has not been requested."""
@@ -1259,7 +1276,10 @@ class EngineCoreProc(EngineCore):
         while self._handle_shutdown():
             # 1) Poll the input queue until there is work to do.
             self._process_input_queue()
-            # 2) Step the engine core and return the outputs.
+            # 2) 仅启用合并器时，同线程放行已经到期的 Update 窗口。
+            if self.prompt_stream_update_coalescer_enabled:
+                self.scheduler.flush_due_update_coalescing(time.monotonic())
+            # 3) Step the engine core and return the outputs.
             self._process_engine_step()
 
         raise SystemExit
@@ -1280,7 +1300,21 @@ class EngineCoreProc(EngineCore):
                     waited = True
             block = self.process_input_queue_block
             try:
-                req = self.input_queue.get(block=block)
+                if self.prompt_stream_update_coalescer_enabled:
+                    # deadline 使用单调时钟绝对时间；非阻塞轮询仍保持 timeout=0。
+                    deadline = self.scheduler.get_next_prompt_stream_deadline()
+                    timeout = (
+                        None
+                        if deadline is None
+                        else max(0.0, deadline - time.monotonic())
+                    )
+                    req = self.input_queue.get(
+                        block=block,
+                        timeout=timeout if block else None,
+                    )
+                else:
+                    # 关闭合并器时严格保留原有无限期阻塞调用路径。
+                    req = self.input_queue.get(block=block)
                 self._handle_client_request(*req)
             except queue.Empty:
                 break
@@ -1309,7 +1343,12 @@ class EngineCoreProc(EngineCore):
         # If no model execution happened but there is still scheduler work
         # (e.g. WAITING_FOR_REMOTE_KVS or delayed KV connector frees), yield
         # the GIL briefly to allow background transfer threads to make progress.
-        if not model_executed and self.scheduler.has_requests():
+        has_scheduler_work = (
+            self.scheduler.has_runnable_engine_work()
+            if self.prompt_stream_update_coalescer_enabled
+            else self.scheduler.has_requests()
+        )
+        if not model_executed and has_scheduler_work:
             time.sleep(0.001)
 
         return model_executed
@@ -1355,7 +1394,27 @@ class EngineCoreProc(EngineCore):
                         shutdown_timeout,
                     )
 
+                # shutdown 后不再接受 ADD，纯等待 source/deadline 的 dormant
+                # 请求无法自然封口；只终止这部分，请求队列中的可运行工作继续
+                # 按原 drain 语义完成。
+                aborted_reqs = (
+                    self.scheduler.abort_dormant_prompt_stream_requests()
+                )
+                self._send_abort_outputs(aborted_reqs)
+
             self.shutdown_state = EngineShutdownState.SHUTTING_DOWN
+
+        if (
+            self.shutdown_state == EngineShutdownState.SHUTTING_DOWN
+            and self.vllm_config.shutdown_timeout > 0
+            and self.prompt_stream_update_coalescer_enabled
+        ):
+            # A runnable stream request may become dormant only after its
+            # in-flight work completes during drain. No new source event can
+            # arrive after shutdown, so abort such requests before deciding
+            # that all runnable work has drained.
+            aborted_reqs = self.scheduler.abort_dormant_prompt_stream_requests()
+            self._send_abort_outputs(aborted_reqs)
 
         # Exit when no work remaining
         if not self.has_work():

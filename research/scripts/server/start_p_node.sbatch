@@ -6,7 +6,7 @@
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=16
 #SBATCH --mem=64G
-#SBATCH --time=04:00:00
+#SBATCH --time=24:00:00
 #SBATCH --output=research/scripts/logs/vllm-p-%j.out
 
 set -euo pipefail
@@ -26,6 +26,15 @@ NIXL_SIDE_CHANNEL_HOST="${VLLM_NIXL_SIDE_CHANNEL_HOST:-$(hostname)}"
 GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.65}"
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-4096}"
 MAX_NUM_SEQS="${MAX_NUM_SEQS:-16}"
+PROMPT_STREAM_UPDATE_COALESCING_CONFIG="${PROMPT_STREAM_UPDATE_COALESCING_CONFIG:-}"
+
+COALESCING_ARGS=()
+if [[ -n "${PROMPT_STREAM_UPDATE_COALESCING_CONFIG}" ]]; then
+  COALESCING_ARGS=(
+    --prompt-stream-update-coalescing-config
+    "${PROMPT_STREAM_UPDATE_COALESCING_CONFIG}"
+  )
+fi
 
 echo "SLURM_JOB_ID=${SLURM_JOB_ID:-}"
 echo "SLURM_JOB_NODELIST=${SLURM_JOB_NODELIST:-}"
@@ -39,6 +48,7 @@ echo "CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-}"
 echo "SLURM_JOB_GPUS=${SLURM_JOB_GPUS:-}"
 echo "MODEL_PATH=${MODEL_PATH}"
 echo "SERVED_MODEL_NAME=${SERVED_MODEL_NAME}"
+echo "PROMPT_STREAM_UPDATE_COALESCING_CONFIG=${PROMPT_STREAM_UPDATE_COALESCING_CONFIG:-disabled}"
 
 echo "=== nvidia-smi before vLLM startup ==="
 if command -v nvidia-smi >/dev/null 2>&1; then
@@ -64,4 +74,5 @@ VLLM_NIXL_SIDE_CHANNEL_PORT="${NIXL_SIDE_CHANNEL_PORT}" \
   --port "${PORT}" \
   --enforce-eager \
   --no-async-scheduling \
+  "${COALESCING_ARGS[@]}" \
   --kv-transfer-config '{"kv_connector":"NixlConnector","kv_role":"kv_producer","kv_load_failure_policy":"fail"}'

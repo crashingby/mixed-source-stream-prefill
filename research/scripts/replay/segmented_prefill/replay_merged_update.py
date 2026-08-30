@@ -705,6 +705,11 @@ async def _replay_merged_update_sample(
                 args.sse_timeout,
             )
 
+        metric.transport_status = "ok"
+        metric.first_token_received = True
+        metric.formal_result_status = "not_evaluated"
+        metric.request_error_stage = None
+
         metric.finish_to_first_token_ms = (
             sse_measurement.first_token_time - finish_sent_time
         ) * 1000
@@ -748,8 +753,11 @@ async def _replay_merged_update_sample(
             sample.query_id,
             exc,
         )
+        metric.transport_status = "error"
+        metric.result_status = "error"
+        metric.request_error_stage = "prompt_stream"
         metric.error = str(exc)
-        if request_id is not None:
+        if request_id is not None and not metric.first_token_received:
             await _abort_prompt_stream(client, args.proxy_url, request_id)
     return metric
 

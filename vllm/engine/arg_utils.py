@@ -55,6 +55,7 @@ from vllm.config import (
     PoolerConfig,
     PrefetchOffloadConfig,
     ProfilerConfig,
+    PromptStreamUpdateCoalescingConfig,
     ReasoningConfig,
     SchedulerConfig,
     SpeculativeConfig,
@@ -703,6 +704,11 @@ class EngineArgs:
     async_scheduling: bool | None = SchedulerConfig.async_scheduling
 
     stream_interval: int = SchedulerConfig.stream_interval
+
+    prompt_stream_update_coalescing_config: (
+        PromptStreamUpdateCoalescingConfig | None
+    ) = None
+    """流式 Prompt Update 合并配置；不传时保持原有调度语义。"""
 
     kv_sharing_fast_prefill: bool = CacheConfig.kv_sharing_fast_prefill
     optimization_level: OptimizationLevel = VllmConfig.optimization_level
@@ -1435,6 +1441,10 @@ class EngineArgs:
         scheduler_group.add_argument(
             "--stream-interval", **scheduler_kwargs["stream_interval"]
         )
+        scheduler_group.add_argument(
+            "--prompt-stream-update-coalescing-config",
+            **scheduler_kwargs["prompt_stream_update_coalescing_config"],
+        )
 
         # Compilation arguments
         compilation_kwargs = get_kwargs(CompilationConfig)
@@ -1735,6 +1745,14 @@ class EngineArgs:
         NOTE: If VllmConfig is incompatible, we raise an error.
         """
         current_platform.pre_register_and_update()
+        if (
+            self.prompt_stream_update_coalescing_config is not None
+            and self.data_parallel_size > 1
+        ):
+            raise ValueError(
+                "Prompt stream Update coalescing does not support data "
+                "parallelism."
+            )
 
         device_config = DeviceConfig(device=cast(Device, current_platform.device_type))
 
@@ -2076,6 +2094,9 @@ class EngineArgs:
             disable_hybrid_kv_cache_manager=self.disable_hybrid_kv_cache_manager,
             async_scheduling=self.async_scheduling,
             stream_interval=self.stream_interval,
+            prompt_stream_update_coalescing_config=(
+                self.prompt_stream_update_coalescing_config
+            ),
         )
 
         if not model_config.is_multimodal_model and self.default_mm_loras:

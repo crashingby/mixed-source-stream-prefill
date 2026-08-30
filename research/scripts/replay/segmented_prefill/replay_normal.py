@@ -121,6 +121,11 @@ async def _replay_normal_sample(
                 args.sse_timeout,
             )
 
+        metric.transport_status = "ok"
+        metric.first_token_received = True
+        metric.formal_result_status = "not_evaluated"
+        metric.request_error_stage = None
+
         metric.finish_to_first_token_ms = (
             sse_measurement.first_token_time - request_start_time
         ) * 1000
@@ -135,6 +140,9 @@ async def _replay_normal_sample(
         metric.response_payloads = list(sse_measurement.payloads)
         metric.result_status = "ok"
     except Exception as exc:
+        metric.transport_status = "error"
+        metric.result_status = "error"
+        metric.request_error_stage = "completion_sse"
         metric.error = str(exc)
     return metric
 

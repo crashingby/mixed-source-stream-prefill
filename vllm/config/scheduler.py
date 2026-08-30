@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Any, ClassVar, Literal, cast
 from pydantic import Field, field_validator
 from typing_extensions import Self
 
+from vllm.config.prompt_stream import PromptStreamUpdateCoalescingConfig
 from vllm.config.utils import config
 from vllm.logger import init_logger
 from vllm.utils.hashing import safe_hash
@@ -165,6 +166,15 @@ class SchedulerConfig:
     A smaller value (1) makes streaming smoother by sending each token immediately,
     while a larger value (e.g., 10) reduces host overhead and may increase throughput
     by batching multiple tokens before sending."""
+
+    prompt_stream_update_coalescing_config: (
+        PromptStreamUpdateCoalescingConfig | None
+    ) = None
+    """流式 Prompt Update 合并配置。
+
+    ``None`` 保持现有的逐事件 Update 行为；传入配置对象后，EngineCore 与
+    Scheduler 才创建请求级合并状态并处理相应 deadline。
+    """
 
     @staticmethod
     def default_factory(**kwargs):

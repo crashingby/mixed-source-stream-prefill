@@ -104,6 +104,7 @@ class RequestOutput:
                                   None if decoder-only.
         num_cached_tokens: The number of tokens with prefix cache hit.
         kv_transfer_params: The params for remote K/V transfer.
+        prompt_stream_stats: Prompt Stream 请求的最终实验统计。普通请求为 None。
     """
 
     def __init__(
@@ -121,6 +122,7 @@ class RequestOutput:
         num_cached_tokens: int | None = None,
         *,
         kv_transfer_params: dict[str, Any] | None = None,
+        prompt_stream_stats: dict[str, Any] | None = None,
         # Forward compatibility, code that uses args added in new release can
         # still run with older versions of vLLM without breaking.
         **kwargs: Any,
@@ -141,12 +143,20 @@ class RequestOutput:
         self.encoder_prompt_token_ids = encoder_prompt_token_ids
         self.num_cached_tokens = num_cached_tokens
         self.kv_transfer_params = kv_transfer_params
+        # 该字段仅随 Prompt Stream 的最终 P 节点输出返回，不属于 usage 或
+        # KV connector 参数，普通生成请求始终保持为 None。
+        self.prompt_stream_stats = prompt_stream_stats
 
     def add(self, next_output: "RequestOutput", aggregate: bool) -> None:
         """Merge subsequent RequestOutput into this one"""
 
         self.finished |= next_output.finished
         self.kv_transfer_params = next_output.kv_transfer_params
+
+        # collector 可能在消费者读取前合并多个增量输出。统计只在最终输出
+        # 上产生，因此只有非空值才能覆盖，避免后续无统计增量把它清除。
+        if next_output.prompt_stream_stats is not None:
+            self.prompt_stream_stats = next_output.prompt_stream_stats
 
         for next_completion in next_output.outputs:
             for i, completion in enumerate(self.outputs):
@@ -184,7 +194,8 @@ class RequestOutput:
             f"finished={self.finished}, "
             f"metrics={self.metrics}, "
             f"lora_request={self.lora_request}, "
-            f"num_cached_tokens={self.num_cached_tokens})"
+            f"num_cached_tokens={self.num_cached_tokens}, "
+            f"prompt_stream_stats={self.prompt_stream_stats})"
         )
 
 
