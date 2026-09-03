@@ -102,11 +102,12 @@ SSE token 计 TTFT，不会启动 D 节点。
 回放脚本不再在请求开始前请求服务端做完整 prompt 预检。这样更贴近在线 RAG
 场景：真正处理流式请求时，系统只知道已经到达的 chunk，不提前知道完整请求。
 
-样本长度应在数据构建阶段控制，例如使用
-`build_mixed_source_dataset.py` 的 `--max-web-chunk-tokens`、
-`--max-anns-document-tokens` 和 `--max-update-snapshot-tokens`。回放阶段如果仍然
-遇到超出 P/D `max_model_len` 的样本，该请求会沿正常 start/event/finish 链路
-失败，并按实验错误记录处理。
+样本长度应在数据构建阶段控制。当前
+`build_mixed_source_dataset.py` 固定保留完整 SQuAD context 作为两个 Append
+chunk，并通过 `--max-anns-document-tokens` 和
+`--max-update-snapshot-tokens` 控制 ANNS Update 内容。回放阶段如果仍然遇到
+超出 P/D `max_model_len` 的样本，该请求会沿正常 start/event/finish 链路失败，
+并按实验错误记录处理。
 
 ## 离线检查
 

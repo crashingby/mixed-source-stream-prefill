@@ -1,18 +1,18 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-"""从 Stream2LLM ANNS trace 构造 Append/Update 混合来源数据。
+"""从 SQuAD v2 context 与 Stream2LLM ANNS trace 构造混合来源数据。
 
-脚本以 ANNS 原始问题为查询：
+每个请求包含两个来源：
 
-1. 将每一行 ``PipelinePool`` 物化为完整的 Update 文本快照；
-2. 使用 DDGS 检索相同问题，并用 Trafilatura 抽取网页正文；
-3. 分别保存 ANNS Update 和网页 Append 的来源内事件序列；
-4. 输出与 prompt-stream RESTFUL 事件同构的一请求一 JSON 数据。
+1. 根据 ANNS 问题自动定位 SQuAD v2 的官方 context，并把完整 context
+   确定性地切成两个连续 Append chunk；
+2. 将 ANNS trace 中每一行 PipelinePool 物化为完整 Update 快照；
+3. 为两个来源分别追加 source_finished，最后保存 prompt_finished。
 
-数据集不保存真实检索耗时或事件间隔。跨来源交错顺序和发送等待时间由后续
-实验回放脚本控制。网页搜索和抓取结果会按 query 缓存在输出目录的
-``.cache/web`` 中，已有请求默认跳过，因此中断后可以直接续跑。
+脚本完全离线，不执行网页搜索，也不保存事件到达时间。两个来源如何交错以及
+事件间隔由回放脚本控制。输出继续使用 prompt_stream_mixed/v2，因此现有
+normal、segmented-prefill 和 update-coalescing 回放器可以直接读取。
 """
 
 from __future__ import annotations
@@ -21,46 +21,37 @@ import argparse
 import ast
 import csv
 import hashlib
-import ipaddress
+import html
 import json
 import logging
 import os
-import random
 import re
-import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import asdict, dataclass
+import unicodedata
+from collections import Counter, defaultdict
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
-from urllib.parse import SplitResult, urlsplit, urlunsplit
-
-import httpx
-import trafilatura
-from ddgs import DDGS
 
 logger = logging.getLogger(__name__)
 
 SCHEMA_VERSION = "prompt_stream_mixed/v2"
-WEB_CACHE_SCHEMA_VERSION = "mixed_source_web_cache/v2"
+DATA_REVISION = "squad_append_v1"
 ANNS_SOURCE_TYPE: Literal["update"] = "update"
-WEB_SOURCE_TYPE: Literal["append"] = "append"
+SQUAD_SOURCE_TYPE: Literal["append"] = "append"
+NUM_SQUAD_APPEND_CHUNKS = 2
+SQUAD_SPLIT_FILES = {
+    "train": "train-v2.0.json",
+    "dev": "dev-v2.0.json",
+}
 DEFAULT_PREFIX = (
     "You are a helpful assistant. Read the streamed retrieval context first. "
     "Some sources append stable evidence, while other sources publish mutable "
     "snapshots. Answer the final user question using the latest available "
     "evidence.\n\n"
 )
-DEFAULT_USER_AGENT = (
-    "vLLM-MixedSource-DatasetBuilder/1.0 "
-    "(research data collection; contact the dataset maintainer)"
-)
-HTML_CONTENT_TYPES = (
-    "text/html",
-    "application/xhtml+xml",
-    "text/plain",
-)
 
 SourceType = Literal["append", "update"]
+SquadMatchMethod = Literal["exact", "normalized"]
 
 
 @dataclass(frozen=True)
@@ -69,8 +60,8 @@ class AnnsTraceRow:
 
     Args:
         row_index: CSV 中从零开始的原始行号。
-        start_iteration: 当前区间的起始迭代。
-        end_iteration: 当前区间的结束迭代。
+        start_iteration: 当前区间的起始 ANNS 迭代。
+        end_iteration: 当前区间的结束 ANNS 迭代。
         document_ids: PipelinePool 中按原顺序排列的文档 id。
     """
 
@@ -81,62 +72,65 @@ class AnnsTraceRow:
 
 
 @dataclass(frozen=True)
-class SearchHit:
-    """DDGS 返回的一条候选网页。"""
+class SquadAnswer:
+    """SQuAD context 中的一条官方答案标注。"""
 
-    rank: int
-    title: str
-    url: str
-    snippet: str
-
-
-@dataclass(frozen=True)
-class WebPage:
-    """成功抓取并抽取正文的一条网页结果。"""
-
-    rank: int
-    title: str
-    url: str
-    final_url: str
-    snippet: str
     text: str
-    status_code: int
-    content_sha256: str
+    answer_start: int
 
 
 @dataclass(frozen=True)
-class WebFailure:
-    """一条未能形成 Append chunk 的网页抓取结果。"""
+class SquadContextRecord:
+    """一个问题对应的 SQuAD 官方 context 与来源信息。"""
 
-    rank: int
+    split: str
     title: str
-    url: str
-    snippet: str
-    reason: str
+    paragraph_index: int
+    squad_id: str
+    question: str
+    context: str
+    is_impossible: bool
+    answers: tuple[SquadAnswer, ...]
 
 
 @dataclass(frozen=True)
-class WebCollection:
-    """一个问题对应的完整在线网页采集结果。"""
+class SquadContextIndex:
+    """同时支持精确问题和归一化问题查找的 SQuAD context 索引。"""
 
-    query: str
-    search_provider: str
-    configuration: dict[str, Any]
-    search_hits: int
-    pages: tuple[WebPage, ...]
-    failures: tuple[WebFailure, ...]
+    exact_question_to_records: dict[str, tuple[SquadContextRecord, ...]]
+    normalized_question_to_records: dict[str, tuple[SquadContextRecord, ...]]
+    num_indexed_records: int
+
+
+@dataclass(frozen=True)
+class SquadContextMatch:
+    """一个 ANNS 问题与 SQuAD context 的确定性匹配。"""
+
+    method: SquadMatchMethod
+    record: SquadContextRecord
+
+
+@dataclass(frozen=True)
+class SquadContextChunk:
+    """SQuAD 官方 context 中的一个连续 Append chunk。"""
+
+    chunk_index: int
+    char_start: int
+    char_end: int
+    text: str
+    contains_gold_answer: bool
 
 
 def parse_args() -> argparse.Namespace:
-    """解析数据生成参数。
+    """解析混合来源数据生成参数。
 
     Returns:
         命令行参数命名空间。
     """
     parser = argparse.ArgumentParser(
         description=(
-            "Build prompt-stream mixed-source samples from ANNS traces and "
-            "fresh web search results."
+            "Build prompt-stream mixed-source samples from SQuAD v2 "
+            "contexts and Stream2LLM ANNS traces."
         )
     )
     parser.add_argument(
@@ -144,6 +138,12 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         default=Path("research/data/anns"),
         help="Directory containing query_trace_map_5k.json, res/, and corpus.",
+    )
+    parser.add_argument(
+        "--squad-dir",
+        type=Path,
+        default=Path("research/data/squad_v2"),
+        help="Directory containing train-v2.0.json and dev-v2.0.json.",
     )
     parser.add_argument(
         "--output-dir",
@@ -156,7 +156,7 @@ def parse_args() -> argparse.Namespace:
         action="append",
         dest="query_ids",
         default=None,
-        help="ANNS query id to build. Repeat this option to select several ids.",
+        help="ANNS query id to build; repeat to select multiple ids.",
     )
     parser.add_argument(
         "--start-index",
@@ -169,119 +169,18 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=1,
         help=(
-            "Maximum queries to build when --query-id is omitted. Use 0 for "
-            "all remaining queries; default 1 prevents accidental mass crawl."
+            "Maximum queries to build when --query-id is omitted; use 0 for "
+            "all remaining queries."
         ),
-    )
-    parser.add_argument(
-        "--max-web-results",
-        type=int,
-        default=5,
-        help="Maximum DDGS search results fetched for each question.",
-    )
-    parser.add_argument(
-        "--min-successful-web-pages",
-        type=int,
-        default=1,
-        help="Minimum extracted pages required for a sample to be complete.",
-    )
-    parser.add_argument(
-        "--fetch-workers",
-        type=int,
-        default=4,
-        help="Maximum concurrent page downloads within one query.",
-    )
-    parser.add_argument(
-        "--search-timeout",
-        type=float,
-        default=20.0,
-        help="DDGS search timeout in seconds.",
-    )
-    parser.add_argument(
-        "--fetch-timeout",
-        type=float,
-        default=20.0,
-        help="Timeout for one page HTTP request in seconds.",
-    )
-    parser.add_argument(
-        "--max-search-retries",
-        type=int,
-        default=2,
-        help="Additional DDGS attempts after the initial search fails.",
-    )
-    parser.add_argument(
-        "--max-fetch-retries",
-        type=int,
-        default=1,
-        help="Additional HTTP attempts after the initial page fetch fails.",
-    )
-    parser.add_argument(
-        "--retry-backoff",
-        type=float,
-        default=1.0,
-        help="Initial exponential retry backoff in seconds.",
-    )
-    parser.add_argument(
-        "--query-delay",
-        type=float,
-        default=1.0,
-        help=(
-            "Collection-only delay between live searches in seconds; never "
-            "stored as an experiment event interval."
-        ),
-    )
-    parser.add_argument(
-        "--region",
-        type=str,
-        default="wt-wt",
-        help="DDGS search region.",
-    )
-    parser.add_argument(
-        "--safesearch",
-        choices=("on", "moderate", "off"),
-        default="moderate",
-        help="DDGS SafeSearch mode.",
-    )
-    parser.add_argument(
-        "--search-backend",
-        type=str,
-        default="auto",
-        help="DDGS text-search backend.",
-    )
-    parser.add_argument(
-        "--max-page-bytes",
-        type=int,
-        default=5 * 1024 * 1024,
-        help="Reject a response after this many downloaded bytes.",
-    )
-    parser.add_argument(
-        "--min-web-chars",
-        type=int,
-        default=200,
-        help="Reject extracted page text shorter than this many characters.",
-    )
-    parser.add_argument(
-        "--max-web-chars",
-        type=int,
-        default=12_000,
-        help="Truncate each extracted web page to this many characters; 0 disables.",
     )
     parser.add_argument(
         "--tokenizer-model",
         type=str,
         default=None,
         help=(
-            "Tokenizer path or HuggingFace repo used for token-level truncation. "
-            "Required when any --max-*-tokens content budget is enabled."
-        ),
-    )
-    parser.add_argument(
-        "--max-web-chunk-tokens",
-        type=int,
-        default=0,
-        help=(
-            "Truncate each formatted web Append chunk to this many tokenizer "
-            "tokens; 0 disables token-level web truncation."
+            "Local tokenizer path or locally cached HuggingFace repo used "
+            "only for ANNS token budgets. Required when a --max-*-tokens "
+            "budget is enabled."
         ),
     )
     parser.add_argument(
@@ -289,9 +188,8 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=0,
         help=(
-            "Truncate each formatted ANNS document inside Update snapshots to "
-            "this many tokenizer tokens; 0 disables token-level document "
-            "truncation."
+            "Truncate each formatted ANNS document to this many tokenizer "
+            "tokens; 0 disables per-document token truncation."
         ),
     )
     parser.add_argument(
@@ -299,9 +197,8 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=0,
         help=(
-            "Truncate each complete ANNS Update snapshot to this many tokenizer "
-            "tokens after per-document formatting; 0 disables snapshot-level "
-            "truncation."
+            "Truncate each complete ANNS Update snapshot to this many "
+            "tokenizer tokens; 0 disables snapshot-level truncation."
         ),
     )
     parser.add_argument(
@@ -329,49 +226,17 @@ def parse_args() -> argparse.Namespace:
         help="Fixed prompt prefix stored in each start request.",
     )
     parser.add_argument(
-        "--offline",
-        action="store_true",
-        help="Never access the network; require an existing per-query web cache.",
-    )
-    parser.add_argument(
-        "--only-cached-web",
-        action="store_true",
-        help=(
-            "Only build queries whose per-query web cache already exists. This "
-            "is useful after a partial crawl when rebuilding short request JSON."
-        ),
-    )
-    parser.add_argument(
-        "--refresh-web",
-        action="store_true",
-        help=("Ignore web caches and search/fetch again; requires --overwrite."),
-    )
-    parser.add_argument(
         "--overwrite",
         action="store_true",
-        help="Rebuild request JSON files that already exist.",
-    )
-    parser.add_argument(
-        "--require-web",
-        action="store_true",
-        help=("Fail when successful pages are below --min-successful-web-pages."),
+        help="Rebuild current SQuAD-based request JSON files that already exist.",
     )
     parser.add_argument(
         "--fail-fast",
         action="store_true",
-        help="Stop at the first query failure.",
-    )
-    parser.add_argument(
-        "--random-seed",
-        type=int,
-        default=0,
-        help="Seed used only for deterministic retry jitter.",
-    )
-    parser.add_argument(
-        "--user-agent",
-        type=str,
-        default=DEFAULT_USER_AGENT,
-        help="User-Agent used for page downloads.",
+        help=(
+            "Stop at the first trace, corpus, SQuAD match, or construction "
+            "failure."
+        ),
     )
     parser.add_argument(
         "--log-level",
@@ -383,7 +248,9 @@ def parse_args() -> argparse.Namespace:
 
 
 def _atomic_write_text(path: Path, text: str) -> None:
-    """原子写入文本文件，避免中断留下半个 JSON。
+    """原子写入文本，避免中断留下半个输出文件。
+
+    函数会在目标目录创建临时文件，并原子替换目标文件。
 
     Args:
         path: 最终文件路径。
@@ -396,12 +263,7 @@ def _atomic_write_text(path: Path, text: str) -> None:
 
 
 def _atomic_write_json(path: Path, value: Any) -> None:
-    """以稳定格式原子写入 JSON。
-
-    Args:
-        path: 最终 JSON 文件路径。
-        value: 可 JSON 序列化的对象。
-    """
+    """以稳定、可读格式原子写入 JSON。"""
     serialized = json.dumps(
         value,
         ensure_ascii=False,
@@ -412,7 +274,7 @@ def _atomic_write_json(path: Path, value: Any) -> None:
 
 
 def _load_json(path: Path) -> Any:
-    """读取 UTF-8 JSON 文件。"""
+    """读取一个 UTF-8 JSON 文件。"""
     return json.loads(path.read_text(encoding="utf-8"))
 
 
@@ -427,14 +289,7 @@ def _select_query_ids(
     query_map: dict[str, dict[str, str]],
     args: argparse.Namespace,
 ) -> list[str]:
-    """根据显式 id 或切片参数选择本次处理的问题。
-
-    Args:
-        query_map: ANNS query-to-trace 映射。
-        args: 命令行参数。
-
-    Returns:
-        按稳定顺序排列的 query id。
+    """根据显式 id 或位置切片选择本次处理的问题。
 
     Raises:
         ValueError: 参数越界或显式 query id 不存在。
@@ -459,23 +314,357 @@ def _select_query_ids(
     return query_ids
 
 
-def _parse_pipeline_pool(raw_pool: str) -> tuple[str, ...]:
-    """解析 ANNS ``PipelinePool``，包括空池和单元素池。
+def _normalize_question(question: str) -> str:
+    """生成只用于 SQuAD 安全回退匹配的稳定问题键。
+
+    归一化会消除大小写、重音、标点和重复空白，但不会修改最终请求中的原始
+    问题。只有所有候选都指向同一个 context 时，归一化匹配才会被接受。
+    """
+    decomposed = unicodedata.normalize("NFKD", question).casefold()
+    without_marks = "".join(
+        character
+        for character in decomposed
+        if not unicodedata.combining(character)
+    )
+    alphanumeric_only = re.sub(
+        r"[^\w]+",
+        " ",
+        without_marks,
+        flags=re.UNICODE,
+    )
+    return " ".join(alphanumeric_only.split())
+
+
+def _load_squad_context_index(
+    squad_dir: Path,
+    target_questions: set[str],
+) -> SquadContextIndex:
+    """只为本批 ANNS 问题构建 SQuAD context 索引。
 
     Args:
-        raw_pool: CSV 中形如 ``(12,34)``、``(12)`` 或 ``()`` 的字段。
+        squad_dir: 包含 SQuAD v2 train/dev JSON 的目录。
+        target_questions: 本批实际需要匹配的 ANNS 问题原文。
 
     Returns:
-        保持原始顺序的字符串文档 id。
+        同时支持精确和归一化问题查找的只读索引。
 
     Raises:
-        ValueError: 字段不是合法的整数 id 序列。
+        FileNotFoundError: 任一 SQuAD split 文件不存在。
+        ValueError: SQuAD 文件结构或字段类型非法。
     """
+    exact_targets = set(target_questions)
+    normalized_targets = {
+        _normalize_question(question) for question in target_questions
+    }
+    exact_records: dict[str, list[SquadContextRecord]] = defaultdict(list)
+    normalized_records: dict[str, list[SquadContextRecord]] = defaultdict(list)
+    num_indexed_records = 0
+
+    # SQuAD 按 split -> article -> paragraph -> question 展开，只保留目标问题。
+    for split, filename in SQUAD_SPLIT_FILES.items():
+        split_path = squad_dir / filename
+        if not split_path.is_file():
+            raise FileNotFoundError(f"Missing SQuAD {split} split: {split_path}")
+        split_payload = _load_json(split_path)
+        articles = (
+            split_payload.get("data")
+            if isinstance(split_payload, dict)
+            else None
+        )
+        if not isinstance(articles, list):
+            raise ValueError(
+                f"SQuAD split has no list-valued data: {split_path}"
+            )
+
+        for article in articles:
+            if not isinstance(article, dict):
+                raise ValueError(f"Invalid SQuAD article in {split_path}")
+            title = article.get("title")
+            paragraphs = article.get("paragraphs")
+            if not isinstance(title, str) or not isinstance(paragraphs, list):
+                raise ValueError(f"Invalid SQuAD article fields in {split_path}")
+
+            for paragraph_index, paragraph in enumerate(paragraphs):
+                if not isinstance(paragraph, dict):
+                    raise ValueError(
+                        f"Invalid SQuAD paragraph in {split_path}"
+                    )
+                context = paragraph.get("context")
+                questions = paragraph.get("qas")
+                if not isinstance(context, str) or not isinstance(
+                    questions, list
+                ):
+                    raise ValueError(
+                        f"Invalid SQuAD paragraph fields in {split_path}"
+                    )
+
+                for question_payload in questions:
+                    if not isinstance(question_payload, dict):
+                        raise ValueError(
+                            f"Invalid SQuAD question in {split_path}"
+                        )
+                    question = question_payload.get("question")
+                    squad_id = question_payload.get("id")
+                    if not isinstance(question, str) or not isinstance(
+                        squad_id, str
+                    ):
+                        raise ValueError(
+                            f"Invalid SQuAD question fields in {split_path}"
+                        )
+
+                    normalized_question = _normalize_question(question)
+                    if (
+                        question not in exact_targets
+                        and normalized_question not in normalized_targets
+                    ):
+                        continue
+
+                    is_impossible = question_payload.get(
+                        "is_impossible", False
+                    )
+                    raw_answers = question_payload.get("answers", [])
+                    if not isinstance(is_impossible, bool) or not isinstance(
+                        raw_answers, list
+                    ):
+                        raise ValueError(
+                            f"Invalid SQuAD answer fields in {split_path}"
+                        )
+
+                    answers: list[SquadAnswer] = []
+                    for raw_answer in raw_answers:
+                        if not isinstance(raw_answer, dict):
+                            raise ValueError(
+                                f"Invalid SQuAD answer in {split_path}"
+                            )
+                        answer_text = raw_answer.get("text")
+                        answer_start = raw_answer.get("answer_start")
+                        if not isinstance(answer_text, str) or not isinstance(
+                            answer_start, int
+                        ):
+                            raise ValueError(
+                                f"Invalid SQuAD answer fields in {split_path}"
+                            )
+                        answer_end = answer_start + len(answer_text)
+                        if context[answer_start:answer_end] != answer_text:
+                            raise ValueError(
+                                "SQuAD answer span does not match context: "
+                                f"split={split}, squad_id={squad_id}."
+                            )
+                        answers.append(
+                            SquadAnswer(
+                                text=answer_text,
+                                answer_start=answer_start,
+                            )
+                        )
+
+                    record = SquadContextRecord(
+                        split=split,
+                        title=title,
+                        paragraph_index=paragraph_index,
+                        squad_id=squad_id,
+                        question=question,
+                        context=context,
+                        is_impossible=is_impossible,
+                        answers=tuple(answers),
+                    )
+                    exact_records[question].append(record)
+                    normalized_records[normalized_question].append(record)
+                    num_indexed_records += 1
+
+    return SquadContextIndex(
+        exact_question_to_records={
+            question: tuple(records)
+            for question, records in exact_records.items()
+        },
+        normalized_question_to_records={
+            question: tuple(records)
+            for question, records in normalized_records.items()
+        },
+        num_indexed_records=num_indexed_records,
+    )
+
+
+def _resolve_squad_context(
+    question: str,
+    squad_index: SquadContextIndex,
+) -> SquadContextMatch:
+    """为一个 ANNS 问题选择唯一的 SQuAD 官方 context。
+
+    精确匹配优先。只有精确匹配为空时才使用归一化问题键；若多个候选来自
+    不同 context，函数会拒绝静默选择。
+
+    Raises:
+        ValueError: 问题未匹配，或候选指向多个不同 context。
+    """
+    candidates = squad_index.exact_question_to_records.get(question, ())
+    match_method: SquadMatchMethod = "exact"
+    if not candidates:
+        candidates = squad_index.normalized_question_to_records.get(
+            _normalize_question(question),
+            (),
+        )
+        match_method = "normalized"
+    if not candidates:
+        raise ValueError(f"No SQuAD context matched question {question!r}.")
+
+    context_keys = {
+        (
+            record.split,
+            record.title,
+            record.paragraph_index,
+            record.context,
+        )
+        for record in candidates
+    }
+    if len(context_keys) != 1:
+        candidate_ids = sorted(record.squad_id for record in candidates)
+        raise ValueError(
+            "Ambiguous SQuAD contexts for question "
+            f"{question!r}: squad_ids={candidate_ids}."
+        )
+
+    # 相同 context 下若有重复 QA，按 split 和 squad_id 稳定选择 provenance。
+    selected_record = min(
+        candidates,
+        key=lambda record: (record.split, record.squad_id),
+    )
+    return SquadContextMatch(
+        method=match_method,
+        record=selected_record,
+    )
+
+
+def _answer_intervals(
+    record: SquadContextRecord,
+) -> tuple[tuple[int, int], ...]:
+    """返回 context 内所有官方答案的半开字符区间。"""
+    return tuple(
+        (answer.answer_start, answer.answer_start + len(answer.text))
+        for answer in record.answers
+    )
+
+
+def _is_safe_context_boundary(
+    context: str,
+    boundary: int,
+    answer_intervals: tuple[tuple[int, int], ...],
+) -> bool:
+    """判断切分点能否形成两个非空 chunk 且不切断答案。"""
+    if not context[:boundary].strip() or not context[boundary:].strip():
+        return False
+    return not any(
+        answer_start < boundary < answer_end
+        for answer_start, answer_end in answer_intervals
+    )
+
+
+def _choose_context_split_boundary(record: SquadContextRecord) -> int:
+    """选择靠近 context 中点且不切断答案的稳定句子边界。
+
+    优先使用段落或句末后的空白；如果没有可用句子边界，再退回普通空白。
+    两个候选距中点相同时选择较早位置，使结果跨运行稳定。
+
+    Raises:
+        ValueError: context 无法切成两个非空且不破坏答案 span 的部分。
+    """
+    context = record.context
+    target_boundary = len(context) / NUM_SQUAD_APPEND_CHUNKS
+    answer_intervals = _answer_intervals(record)
+
+    paragraph_boundaries = [
+        match.end() for match in re.finditer(r"\n\s*\n", context)
+    ]
+    sentence_boundaries = [
+        match.end()
+        for match in re.finditer(r"""[.!?]["')\]]*\s+""", context)
+    ]
+    safe_boundaries = [
+        boundary
+        for boundary in paragraph_boundaries + sentence_boundaries
+        if _is_safe_context_boundary(context, boundary, answer_intervals)
+    ]
+
+    # 极短或格式异常的 context 可能没有句末；此时只在普通空白处回退。
+    if not safe_boundaries:
+        safe_boundaries = [
+            match.end()
+            for match in re.finditer(r"\s+", context)
+            if _is_safe_context_boundary(
+                context,
+                match.end(),
+                answer_intervals,
+            )
+        ]
+    if not safe_boundaries:
+        raise ValueError(
+            "SQuAD context cannot be split into two safe chunks: "
+            f"squad_id={record.squad_id}."
+        )
+
+    return min(
+        safe_boundaries,
+        key=lambda boundary: (abs(boundary - target_boundary), boundary),
+    )
+
+
+def _split_squad_context(
+    record: SquadContextRecord,
+) -> tuple[SquadContextChunk, SquadContextChunk]:
+    """把完整 SQuAD context 切成前后两个连续 Append chunk。
+
+    两个 chunk 合起来覆盖完整官方 context，且边界不会切断官方答案。
+    """
+    boundary = _choose_context_split_boundary(record)
+    answer_intervals = _answer_intervals(record)
+    raw_segments = (
+        (0, boundary, record.context[:boundary]),
+        (boundary, len(record.context), record.context[boundary:]),
+    )
+
+    chunks: list[SquadContextChunk] = []
+    for chunk_index, (char_start, char_end, text) in enumerate(raw_segments):
+        contains_gold_answer = any(
+            char_start <= answer_start and answer_end <= char_end
+            for answer_start, answer_end in answer_intervals
+        )
+        chunks.append(
+            SquadContextChunk(
+                chunk_index=chunk_index,
+                char_start=char_start,
+                char_end=char_end,
+                text=text,
+                contains_gold_answer=contains_gold_answer,
+            )
+        )
+
+    if len(chunks) != NUM_SQUAD_APPEND_CHUNKS:
+        raise AssertionError("SQuAD split must produce exactly two chunks.")
+    return (chunks[0], chunks[1])
+
+
+def _format_squad_context_chunk(
+    record: SquadContextRecord,
+    chunk: SquadContextChunk,
+) -> str:
+    """把一个 SQuAD context 片段包装为独立 Append 文本。"""
+    split = html.escape(record.split, quote=True)
+    title = html.escape(record.title, quote=True)
+    squad_id = html.escape(record.squad_id, quote=True)
+    header = (
+        f'<squad_context split="{split}" title="{title}" '
+        f'squad_id="{squad_id}" segment="{chunk.chunk_index + 1}/'
+        f'{NUM_SQUAD_APPEND_CHUNKS}">\n'
+    )
+    return f"{header}{chunk.text}\n</squad_context>\n"
+
+
+def _parse_pipeline_pool(raw_pool: str) -> tuple[str, ...]:
+    """解析 PipelinePool 的空池、单元素池和多元素池。"""
     normalized = raw_pool.strip()
     if normalized in ("", "()"):
         return ()
 
-    # 优先按逗号解析，避免 Python 把 ``(123)`` 当成整数而不是单元素 tuple。
+    # 先显式按逗号解析，避免 Python 把 (123) 当成整数。
     inner = normalized
     if normalized.startswith("(") and normalized.endswith(")"):
         inner = normalized[1:-1]
@@ -483,7 +672,7 @@ def _parse_pipeline_pool(raw_pool: str) -> tuple[str, ...]:
     if parts and all(re.fullmatch(r"[+-]?\d+", part) for part in parts):
         return tuple(str(int(part)) for part in parts)
 
-    # 保留兼容性：若未来 trace 改成 JSON/Python list，仍给出清晰的解析结果。
+    # 保留对未来 list/tuple 格式的兼容，但拒绝其它 Python 对象。
     try:
         parsed = ast.literal_eval(normalized)
     except (SyntaxError, ValueError) as exc:
@@ -496,19 +685,23 @@ def _parse_pipeline_pool(raw_pool: str) -> tuple[str, ...]:
 
 
 def _load_trace_rows(anns_dir: Path, trace_file: str) -> list[AnnsTraceRow]:
-    """读取一个问题的全部 ANNS Update 快照。
-
-    Args:
-        anns_dir: ANNS 数据根目录。
-        trace_file: query map 中记录的 trace 文件名。
-
-    Returns:
-        按 CSV 原始顺序排列的快照。真实时间列不写入生成数据。
-    """
+    """读取一个问题的全部 ANNS Update 快照。"""
     trace_path = anns_dir / "res" / trace_file
+    if not trace_path.is_file():
+        raise FileNotFoundError(f"Missing ANNS trace: {trace_path}")
+
     rows: list[AnnsTraceRow] = []
     with trace_path.open(encoding="utf-8", newline="") as trace_stream:
         reader = csv.DictReader(trace_stream)
+        required_columns = {
+            "StartIteration",
+            "EndIteration",
+            "PipelinePool",
+        }
+        if reader.fieldnames is None or not required_columns.issubset(
+            reader.fieldnames
+        ):
+            raise ValueError(f"ANNS trace has invalid columns: {trace_path}")
         for row_index, row in enumerate(reader):
             rows.append(
                 AnnsTraceRow(
@@ -518,22 +711,16 @@ def _load_trace_rows(anns_dir: Path, trace_file: str) -> list[AnnsTraceRow]:
                     document_ids=_parse_pipeline_pool(row["PipelinePool"]),
                 )
             )
-
     return rows
 
 
 def _find_corpus_shards(anns_dir: Path) -> list[Path]:
-    """只选择两套重复 corpus 中的一套。
-
-    Args:
-        anns_dir: ANNS 数据根目录。
-
-    Returns:
-        排序后的四个 corpus shard 路径。
-    """
+    """只选择两套重复 ANNS corpus shard 中的一套。"""
     shards = sorted(anns_dir.glob("retrieved_corpus_content.part.*.json"))
     if not shards:
-        shards = sorted(anns_dir.glob("retrieved_corpus_content.[0-9]*.json"))
+        shards = sorted(
+            anns_dir.glob("retrieved_corpus_content.[0-9]*.json")
+        )
     if not shards:
         raise FileNotFoundError(f"No ANNS corpus shards found in {anns_dir}.")
     return shards
@@ -542,24 +729,24 @@ def _find_corpus_shards(anns_dir: Path) -> list[Path]:
 def _load_required_documents(
     anns_dir: Path,
     required_document_ids: set[str],
-) -> dict[str, str]:
-    """从 corpus shard 中只保留本批问题实际引用的文档。
-
-    Args:
-        anns_dir: ANNS 数据根目录。
-        required_document_ids: 所有待处理 trace 引用的文档 id。
+) -> tuple[dict[str, str], set[str]]:
+    """从 corpus shard 中只保留本批 trace 实际引用的文档。
 
     Returns:
-        文档 id 到原始正文的映射。
-
-    Raises:
-        KeyError: corpus 未覆盖全部 trace 引用。
+        已找到的文档映射，以及 corpus 中缺失的文档 id。
     """
+    if not required_document_ids:
+        return {}, set()
+
     remaining_ids = set(required_document_ids)
     documents: dict[str, str] = {}
     for shard_path in _find_corpus_shards(anns_dir):
         logger.info("Loading required documents from %s.", shard_path)
         shard = _load_json(shard_path)
+        if not isinstance(shard, dict):
+            raise ValueError(
+                f"ANNS corpus shard is not an object: {shard_path}"
+            )
         for document_id in remaining_ids.intersection(shard):
             documents[document_id] = str(shard[document_id])
         remaining_ids.difference_update(shard)
@@ -568,16 +755,18 @@ def _load_required_documents(
 
     if remaining_ids:
         example_ids = sorted(remaining_ids)[:10]
-        raise KeyError(
-            f"ANNS corpus is missing {len(remaining_ids)} document ids, "
-            f"for example {example_ids}."
+        logger.warning(
+            "ANNS corpus is missing %d referenced document ids, for "
+            "example %s. Affected queries will fail independently.",
+            len(remaining_ids),
+            example_ids,
         )
-    return documents
+    return documents, remaining_ids
 
 
-def _normalize_text(text: str) -> str:
-    """压缩行内空白，同时保留正文段落边界。"""
-    normalized_lines = []
+def _normalize_document_text(text: str) -> str:
+    """压缩 ANNS 文档的行内空白，同时保留非空行边界。"""
+    normalized_lines: list[str] = []
     for line in text.replace("\x00", " ").splitlines():
         normalized_line = re.sub(r"\s+", " ", line).strip()
         if normalized_line:
@@ -586,7 +775,7 @@ def _normalize_text(text: str) -> str:
 
 
 def _truncate_text(text: str, max_chars: int) -> str:
-    """按字符上限截断文本，并显式标记截断。"""
+    """按字符上限截断文本，并显式写入截断标记。"""
     if max_chars <= 0 or len(text) <= max_chars:
         return text
     marker = "\n[truncated]"
@@ -595,33 +784,27 @@ def _truncate_text(text: str, max_chars: int) -> str:
 
 
 def _load_tokenizer(tokenizer_model: str | None) -> Any | None:
-    """按需加载 tokenizer，用于离线构造更短的实验数据。
-
-    Args:
-        tokenizer_model: 本地 tokenizer 路径或 HuggingFace repo 名称。
-
-    Returns:
-        transformers tokenizer；未启用 token 预算时返回 ``None``。
-    """
+    """按需加载 tokenizer，只用于 ANNS 内容预算。"""
     if tokenizer_model is None:
         return None
 
-    # 延迟导入，避免只做字符裁剪或复用旧数据时强制依赖 transformers。
+    # 未启用 token 预算时生成器只依赖 Python 标准库。
     from transformers import AutoTokenizer
 
     return AutoTokenizer.from_pretrained(
         tokenizer_model,
         trust_remote_code=True,
+        local_files_only=True,
     )
 
 
 def _encode_text(tokenizer: Any, text: str) -> list[int]:
-    """用运行时 tokenizer 计算不含 special token 的 token 序列。"""
+    """计算不含 special token 的文本 token ids。"""
     return list(tokenizer.encode(text, add_special_tokens=False))
 
 
 def _decode_token_ids(tokenizer: Any, token_ids: list[int]) -> str:
-    """把截断后的 token 序列还原为文本。"""
+    """把截断后的 token ids 稳定还原为文本。"""
     return str(
         tokenizer.decode(
             token_ids,
@@ -636,16 +819,7 @@ def _truncate_text_by_tokens(
     max_tokens: int,
     tokenizer: Any | None,
 ) -> str:
-    """按 tokenizer token 上限截断文本，并保留显式截断标记。
-
-    Args:
-        text: 待截断文本。
-        max_tokens: 最大 token 数；小于等于零表示不启用。
-        tokenizer: 运行时 tokenizer。
-
-    Returns:
-        不超过 token 预算的文本。若预算太小，会只保留截断标记自身。
-    """
+    """按 tokenizer token 上限裁剪文本并保留截断标记。"""
     if max_tokens <= 0:
         return text
     if tokenizer is None:
@@ -658,8 +832,11 @@ def _truncate_text_by_tokens(
     marker = "\n[truncated]"
     marker_ids = _encode_text(tokenizer, marker)
     if len(marker_ids) >= max_tokens:
-        return _decode_token_ids(tokenizer, marker_ids[:max_tokens]).rstrip()
-    content_budget = max(0, max_tokens - len(marker_ids))
+        return _decode_token_ids(
+            tokenizer,
+            marker_ids[:max_tokens],
+        ).rstrip()
+    content_budget = max_tokens - len(marker_ids)
     truncated_ids = token_ids[:content_budget] + marker_ids
     return _decode_token_ids(tokenizer, truncated_ids).rstrip()
 
@@ -671,7 +848,7 @@ def _truncate_wrapped_body_by_tokens(
     max_tokens: int,
     tokenizer: Any | None,
 ) -> str:
-    """在固定包装文本内裁剪正文，使整个 chunk 尽量满足 token 预算。"""
+    """在固定包装文本内裁剪正文，使整个文档满足 token 预算。"""
     if max_tokens <= 0:
         return f"{header}{body}{footer}"
     if tokenizer is None:
@@ -679,14 +856,11 @@ def _truncate_wrapped_body_by_tokens(
 
     wrapper_tokens = len(_encode_text(tokenizer, f"{header}{footer}"))
     body_budget = max(0, max_tokens - wrapper_tokens)
-    if body_budget == 0:
-        truncated_body = ""
-    else:
-        truncated_body = _truncate_text_by_tokens(
-            body,
-            body_budget,
-            tokenizer,
-        )
+    truncated_body = (
+        _truncate_text_by_tokens(body, body_budget, tokenizer)
+        if body_budget
+        else ""
+    )
     return f"{header}{truncated_body}{footer}"
 
 
@@ -696,11 +870,7 @@ def _limit_joined_text_by_tokens(
     max_tokens: int,
     tokenizer: Any | None,
 ) -> str:
-    """按 token 预算拼接若干文本片段，保留能放下的前缀片段。
-
-    这个函数用于 Update 快照整体预算。它优先保留完整文档片段；当第一个或
-    下一个文档超过剩余预算时，只截断该文档的前缀，避免继续塞入更多来源。
-    """
+    """按 token 预算拼接 ANNS 文档，优先保留完整前序文档。"""
     if not parts:
         return ""
     if max_tokens <= 0:
@@ -743,13 +913,9 @@ def _format_anns_document(
     max_document_tokens: int,
     tokenizer: Any | None,
 ) -> str:
-    """把单个 ANNS 文档格式化为稳定的快照片段。
-
-    文档标签只包含稳定 id，不包含 snapshot 版本或动态排名，避免无谓破坏
-    Update 源内 LCP。
-    """
+    """把单个 ANNS 文档格式化为跨 Update 版本稳定的片段。"""
     normalized_text = _truncate_text(
-        _normalize_text(text),
+        _normalize_document_text(text),
         max_document_chars,
     )
     header = f'<retrieved_document id="{document_id}">\n'
@@ -771,10 +937,9 @@ def _materialize_anns_snapshot(
     max_snapshot_tokens: int,
     tokenizer: Any | None,
 ) -> str:
-    """按 PipelinePool 原顺序物化完整 Update 快照。
+    """按 PipelinePool 原顺序物化一份完整 Update 快照。
 
-    空 PipelinePool 返回空字符串。它不是坏数据，而是“清空当前 Update
-    source”的合法事件。
+    空 PipelinePool 返回空字符串，表示合法的清空 Update source 事件。
     """
     formatted_documents = [
         _format_anns_document(
@@ -794,455 +959,13 @@ def _materialize_anns_snapshot(
     )
 
 
-def _canonicalize_url(raw_url: str) -> str:
-    """规范化公开 HTTP(S) URL，并拒绝明显的本地地址。
-
-    Args:
-        raw_url: 搜索结果中的 URL。
-
-    Returns:
-        去除 fragment 后的 URL。
-
-    Raises:
-        ValueError: URL scheme/host 非法或指向本地保留地址。
-    """
-    parsed = urlsplit(raw_url.strip())
-    if parsed.scheme.lower() not in ("http", "https"):
-        raise ValueError("unsupported_url_scheme")
-    if not parsed.hostname:
-        raise ValueError("missing_url_host")
-    if parsed.username is not None or parsed.password is not None:
-        raise ValueError("url_credentials_not_allowed")
-
-    hostname = parsed.hostname.lower()
-    if hostname == "localhost" or hostname.endswith(".localhost"):
-        raise ValueError("local_url_not_allowed")
-    try:
-        address = ipaddress.ip_address(hostname)
-    except ValueError:
-        pass
-    else:
-        if (
-            address.is_private
-            or address.is_loopback
-            or address.is_link_local
-            or address.is_multicast
-            or address.is_reserved
-            or address.is_unspecified
-        ):
-            raise ValueError("non_public_ip_not_allowed")
-
-    host = hostname
-    if parsed.port is not None:
-        is_default_port = (parsed.scheme.lower() == "http" and parsed.port == 80) or (
-            parsed.scheme.lower() == "https" and parsed.port == 443
-        )
-        if not is_default_port:
-            host = f"{host}:{parsed.port}"
-    normalized = SplitResult(
-        scheme=parsed.scheme.lower(),
-        netloc=host,
-        path=parsed.path or "/",
-        query=parsed.query,
-        fragment="",
-    )
-    return urlunsplit(normalized)
-
-
-def _web_collection_config(args: argparse.Namespace) -> dict[str, Any]:
-    """返回会影响网页 chunk 内容的缓存配置。"""
-    return {
-        "max_web_results": args.max_web_results,
-        "region": args.region,
-        "safesearch": args.safesearch,
-        "search_backend": args.search_backend,
-        "max_page_bytes": args.max_page_bytes,
-        "min_web_chars": args.min_web_chars,
-        "max_web_chars": args.max_web_chars,
-    }
-
-
-def _search_web(
-    query: str,
-    args: argparse.Namespace,
-    rng: random.Random,
-) -> list[SearchHit]:
-    """调用 DDGS，并对临时搜索失败进行有限重试。
-
-    Args:
-        query: ANNS 原始问题。
-        args: 命令行参数。
-        rng: 确定性 retry jitter 随机源。
-
-    Returns:
-        按搜索排名排列、URL 去重后的候选网页。
-
-    Raises:
-        RuntimeError: 全部搜索尝试均失败。
-    """
-    last_error: Exception | None = None
-    for attempt in range(args.max_search_retries + 1):
-        try:
-            results = DDGS(timeout=args.search_timeout).text(
-                query,
-                region=args.region,
-                safesearch=args.safesearch,
-                max_results=args.max_web_results,
-                backend=args.search_backend,
-            )
-            hits: list[SearchHit] = []
-            seen_urls: set[str] = set()
-            for result in results:
-                raw_url = str(result.get("href") or result.get("url") or "")
-                try:
-                    url = _canonicalize_url(raw_url)
-                except ValueError as exc:
-                    logger.debug("Skipping search URL %r: %s.", raw_url, exc)
-                    continue
-                if url in seen_urls:
-                    continue
-                seen_urls.add(url)
-                hits.append(
-                    SearchHit(
-                        rank=len(hits),
-                        title=str(result.get("title") or ""),
-                        url=url,
-                        snippet=str(result.get("body") or ""),
-                    )
-                )
-            return hits
-        except Exception as exc:
-            last_error = exc
-            if attempt >= args.max_search_retries:
-                break
-            delay = args.retry_backoff * (2**attempt)
-            delay += rng.uniform(0, max(0.0, args.retry_backoff * 0.2))
-            logger.warning(
-                "Web search attempt %d failed: %s; retrying in %.2fs.",
-                attempt + 1,
-                exc,
-                delay,
-            )
-            time.sleep(delay)
-    raise RuntimeError(f"DDGS search failed for query {query!r}.") from last_error
-
-
-def _read_response_bytes(
-    response: httpx.Response,
-    max_page_bytes: int,
-) -> bytes:
-    """流式读取响应，并在页面过大时立即停止。"""
-    content_length = response.headers.get("content-length")
-    if content_length is not None:
-        try:
-            declared_length = int(content_length)
-        except ValueError:
-            declared_length = None
-        if declared_length is not None and declared_length > max_page_bytes:
-            raise ValueError("page_too_large")
-
-    chunks: list[bytes] = []
-    total_bytes = 0
-    for chunk in response.iter_bytes():
-        total_bytes += len(chunk)
-        if total_bytes > max_page_bytes:
-            raise ValueError("page_too_large")
-        chunks.append(chunk)
-    return b"".join(chunks)
-
-
-def _extract_page_text(
-    html: str,
-    final_url: str,
-    args: argparse.Namespace,
-) -> str:
-    """使用 Trafilatura 提取并裁剪网页正文。"""
-    extracted = trafilatura.extract(
-        html,
-        url=final_url,
-        output_format="txt",
-        include_comments=False,
-        include_tables=True,
-        deduplicate=True,
-        favor_precision=True,
-    )
-    if extracted is None:
-        raise ValueError("no_extractable_content")
-    normalized = _normalize_text(extracted)
-    if len(normalized) < args.min_web_chars:
-        raise ValueError("extracted_content_too_short")
-    return _truncate_text(normalized, args.max_web_chars)
-
-
-def _fetch_search_hit(
-    hit: SearchHit,
-    args: argparse.Namespace,
-) -> WebPage | WebFailure:
-    """下载并解析一个搜索结果。
-
-    Args:
-        hit: 规范化后的搜索结果。
-        args: 命令行参数。
-
-    Returns:
-        成功的网页正文，或带结构化原因的失败记录。数据中不保存抓取耗时。
-    """
-    last_error: Exception | None = None
-    for attempt in range(args.max_fetch_retries + 1):
-        try:
-            with (
-                httpx.Client(
-                    follow_redirects=True,
-                    max_redirects=5,
-                    timeout=args.fetch_timeout,
-                    headers={"User-Agent": args.user_agent},
-                ) as client,
-                client.stream("GET", hit.url) as response,
-            ):
-                response.raise_for_status()
-                content_type = response.headers.get(
-                    "content-type",
-                    "",
-                ).lower()
-                if content_type and not any(
-                    content_type.startswith(allowed_type)
-                    for allowed_type in HTML_CONTENT_TYPES
-                ):
-                    raise ValueError("unsupported_content_type")
-                final_url = _canonicalize_url(str(response.url))
-                body = _read_response_bytes(
-                    response,
-                    args.max_page_bytes,
-                )
-                encoding = response.encoding or "utf-8"
-                html = body.decode(encoding, errors="replace")
-                text = _extract_page_text(html, final_url, args)
-                status_code = response.status_code
-
-            return WebPage(
-                rank=hit.rank,
-                title=hit.title,
-                url=hit.url,
-                final_url=final_url,
-                snippet=hit.snippet,
-                text=text,
-                status_code=status_code,
-                content_sha256=hashlib.sha256(text.encode("utf-8")).hexdigest(),
-            )
-        except Exception as exc:
-            last_error = exc
-            if attempt >= args.max_fetch_retries:
-                break
-            time.sleep(args.retry_backoff * (2**attempt))
-
-    reason = type(last_error).__name__
-    if isinstance(last_error, ValueError) and str(last_error):
-        reason = str(last_error)
-    elif isinstance(last_error, httpx.HTTPStatusError):
-        reason = f"http_status_{last_error.response.status_code}"
-    elif last_error is not None and str(last_error):
-        reason = f"{type(last_error).__name__}: {last_error}"
-    return WebFailure(
-        rank=hit.rank,
-        title=hit.title,
-        url=hit.url,
-        snippet=hit.snippet,
-        reason=reason,
-    )
-
-
-def _collect_web(
-    query: str,
-    args: argparse.Namespace,
-    rng: random.Random,
-) -> WebCollection:
-    """搜索并并发抓取一个问题的网页结果。
-
-    并发只用于加快数据构造。最终 Append 顺序固定为搜索排名，与网页真实
-    完成时间无关，因此相同缓存可以得到确定性的 source-local 事件序列。
-    """
-    hits = _search_web(query, args, rng)
-    pages: list[WebPage] = []
-    failures: list[WebFailure] = []
-
-    with ThreadPoolExecutor(max_workers=args.fetch_workers) as executor:
-        futures = [
-            executor.submit(
-                _fetch_search_hit,
-                hit,
-                args,
-            )
-            for hit in hits
-        ]
-        for future in as_completed(futures):
-            result = future.result()
-            if isinstance(result, WebPage):
-                pages.append(result)
-            else:
-                failures.append(result)
-
-    # 并发完成顺序不进入数据集；先恢复搜索排名，再按正文 hash 去重。
-    pages.sort(key=lambda page: page.rank)
-    unique_pages: list[WebPage] = []
-    seen_content_hashes: set[str] = set()
-    for page in pages:
-        if page.content_sha256 in seen_content_hashes:
-            failures.append(
-                WebFailure(
-                    rank=page.rank,
-                    title=page.title,
-                    url=page.url,
-                    snippet=page.snippet,
-                    reason="duplicate_extracted_content",
-                )
-            )
-            continue
-        seen_content_hashes.add(page.content_sha256)
-        unique_pages.append(page)
-
-    failures.sort(key=lambda failure: failure.rank)
-    return WebCollection(
-        query=query,
-        search_provider="ddgs",
-        configuration=_web_collection_config(args),
-        search_hits=len(hits),
-        pages=tuple(unique_pages),
-        failures=tuple(failures),
-    )
-
-
-def _serialize_web_collection(collection: WebCollection) -> dict[str, Any]:
-    """把网页采集结果转成不含时间字段的缓存对象。"""
-    return {
-        "schema_version": WEB_CACHE_SCHEMA_VERSION,
-        "query": collection.query,
-        "search_provider": collection.search_provider,
-        "configuration": collection.configuration,
-        "search_hits": collection.search_hits,
-        "pages": [asdict(page) for page in collection.pages],
-        "failures": [asdict(failure) for failure in collection.failures],
-    }
-
-
-def _deserialize_web_collection(
-    value: dict[str, Any],
-    configuration: dict[str, Any],
-) -> WebCollection:
-    """从新旧 query 级缓存恢复网页结果，并忽略 v1 时间字段。"""
-    pages = tuple(
-        WebPage(
-            rank=int(page["rank"]),
-            title=str(page["title"]),
-            url=str(page["url"]),
-            final_url=str(page["final_url"]),
-            snippet=str(page["snippet"]),
-            text=str(page["text"]),
-            status_code=int(page["status_code"]),
-            content_sha256=str(page["content_sha256"]),
-        )
-        for page in value["pages"]
-    )
-    failures = tuple(
-        WebFailure(
-            rank=int(failure["rank"]),
-            title=str(failure["title"]),
-            url=str(failure["url"]),
-            snippet=str(failure["snippet"]),
-            reason=str(failure["reason"]),
-        )
-        for failure in value["failures"]
-    )
-    return WebCollection(
-        query=str(value["query"]),
-        search_provider=str(value["search_provider"]),
-        configuration=configuration,
-        search_hits=int(value["search_hits"]),
-        pages=pages,
-        failures=failures,
-    )
-
-
-def _get_web_collection(
-    query_id: str,
-    question: str,
-    args: argparse.Namespace,
-    rng: random.Random,
-) -> WebCollection:
-    """优先读取 query 级网页缓存，否则执行在线采集。"""
-    cache_path = args.output_dir / ".cache" / "web" / f"query_{query_id}.json"
-    expected_config = _web_collection_config(args)
-    if cache_path.exists() and not args.refresh_web:
-        cached_value = _load_json(cache_path)
-        cached_config = cached_value.get("configuration")
-        if cached_config is not None and cached_config != expected_config:
-            raise ValueError(
-                f"Web cache configuration mismatch for query {query_id}. "
-                "Use the original options or pass --refresh-web --overwrite."
-            )
-        cached = _deserialize_web_collection(cached_value, expected_config)
-        if cached.query != question:
-            raise ValueError(
-                f"Cached query text does not match ANNS query id {query_id}."
-            )
-        # 读取 v1 缓存时立即迁移，确保 output-dir 中也不再保留时间字段。
-        if cached_value.get("schema_version") != WEB_CACHE_SCHEMA_VERSION:
-            _atomic_write_json(cache_path, _serialize_web_collection(cached))
-        logger.info("Using cached web collection for query %s.", query_id)
-        return cached
-    if args.offline:
-        raise FileNotFoundError(f"Offline mode requires web cache {cache_path}.")
-
-    collection = _collect_web(question, args, rng)
-    _atomic_write_json(cache_path, _serialize_web_collection(collection))
-    return collection
-
-
-def _filter_query_ids_with_web_cache(
-    query_ids: list[str],
-    output_dir: Path,
-) -> list[str]:
-    """只保留已有网页缓存的问题 id。
-
-    Args:
-        query_ids: 参数选择出的候选问题 id。
-        output_dir: mixed-source 数据输出目录。
-
-    Returns:
-        仍然保持原顺序、且存在 `.cache/web/query_<id>.json` 的问题 id。
-    """
-    cached_query_ids: list[str] = []
-    for query_id in query_ids:
-        cache_path = output_dir / ".cache" / "web" / f"query_{query_id}.json"
-        if cache_path.exists():
-            cached_query_ids.append(query_id)
-    return cached_query_ids
-
-
-def _format_web_chunk(
-    page: WebPage,
-    max_chunk_tokens: int,
-    tokenizer: Any | None,
-) -> str:
-    """把网页正文格式化为一个独立 Append chunk。"""
-    title = _normalize_text(page.title)
-    header = f"<web_document>\nTitle: {title}\nURL: {page.final_url}\nContent:\n"
-    footer = "\n</web_document>\n"
-    return _truncate_wrapped_body_by_tokens(
-        header=header,
-        body=page.text,
-        footer=footer,
-        max_tokens=max_chunk_tokens,
-        tokenizer=tokenizer,
-    )
-
-
 def _build_source_finished_event(
     source_id: str,
     source_type: SourceType,
     sequence_no: int,
     version: int,
 ) -> dict[str, Any]:
-    """构造与 RESTFUL 协议同构的 source_finished 事件。"""
+    """构造与 prompt-stream RESTFUL 协议同构的来源 barrier。"""
     return {
         "event": {
             "source_id": source_id,
@@ -1265,27 +988,74 @@ def _build_sample(
     trace_file: str,
     trace_rows: list[AnnsTraceRow],
     documents: dict[str, str],
-    web_collection: WebCollection,
+    squad_match: SquadContextMatch,
     args: argparse.Namespace,
     tokenizer: Any | None,
 ) -> dict[str, Any]:
-    """把 ANNS 与网页内容保存为两个独立的 source-local 事件序列。
+    """构造一个 SQuAD Append + ANNS Update 混合来源请求。
 
-    ``events[].event`` 可直接作为 ``/v1/prompt_stream/event`` 的内层 event。
-    列表按来源分组仅用于稳定存储；source 内顺序由 ``sequence_no`` 定义，
-    跨来源交错和发送间隔必须由实验回放策略决定。
+    events[].event 可以直接作为 /v1/prompt_stream/event 的内层 event。
+    列表按来源分组只为稳定落盘；跨来源到达顺序仍由 replay 决定。
     """
     sample_id = (
         f"anns-query-{int(query_id):06d}"
         if query_id.isdigit()
-        else (f"anns-query-{query_id}")
+        else f"anns-query-{query_id}"
     )
+    squad_source_id = f"squad:{query_id}"
     anns_source_id = f"anns:{query_id}"
-    web_source_id = f"web:{query_id}"
-    anns_events: list[dict[str, Any]] = []
-    web_events: list[dict[str, Any]] = []
+    squad_record = squad_match.record
+    squad_chunks = _split_squad_context(squad_record)
+    context_sha256 = hashlib.sha256(
+        squad_record.context.encode("utf-8")
+    ).hexdigest()
 
-    # ANNS CSV 行序就是 Update 来源内部版本顺序；每行始终物化完整快照。
+    squad_events: list[dict[str, Any]] = []
+    for chunk in squad_chunks:
+        squad_events.append(
+            {
+                "event": {
+                    "source_id": squad_source_id,
+                    "event_type": "append",
+                    "source_type": SQUAD_SOURCE_TYPE,
+                    "chunk_id": (
+                        f"{squad_source_id}-context-{chunk.chunk_index}"
+                    ),
+                    "version": chunk.chunk_index,
+                    "sequence_no": chunk.chunk_index,
+                    "text": _format_squad_context_chunk(
+                        squad_record,
+                        chunk,
+                    ),
+                },
+                "provenance": {
+                    "kind": "squad_context_segment",
+                    "split": squad_record.split,
+                    "title": squad_record.title,
+                    "paragraph_index": squad_record.paragraph_index,
+                    "squad_id": squad_record.squad_id,
+                    "match_method": squad_match.method,
+                    "context_sha256": context_sha256,
+                    "segment_index": chunk.chunk_index,
+                    "num_segments": NUM_SQUAD_APPEND_CHUNKS,
+                    "char_start": chunk.char_start,
+                    "char_end": chunk.char_end,
+                    "contains_gold_answer": (
+                        chunk.contains_gold_answer
+                    ),
+                },
+            }
+        )
+    squad_events.append(
+        _build_source_finished_event(
+            source_id=squad_source_id,
+            source_type=SQUAD_SOURCE_TYPE,
+            sequence_no=NUM_SQUAD_APPEND_CHUNKS,
+            version=NUM_SQUAD_APPEND_CHUNKS - 1,
+        )
+    )
+
+    anns_events: list[dict[str, Any]] = []
     for sequence_no, row in enumerate(trace_rows):
         snapshot_text = _materialize_anns_snapshot(
             row,
@@ -1301,7 +1071,9 @@ def _build_sample(
                     "source_id": anns_source_id,
                     "event_type": "update",
                     "source_type": ANNS_SOURCE_TYPE,
-                    "chunk_id": f"{anns_source_id}-snapshot-{sequence_no}",
+                    "chunk_id": (
+                        f"{anns_source_id}-snapshot-{sequence_no}"
+                    ),
                     "version": sequence_no,
                     "sequence_no": sequence_no,
                     "text": snapshot_text,
@@ -1325,54 +1097,16 @@ def _build_sample(
         )
     )
 
-    # 网页按搜索 rank 保存。并发抓取的实际完成先后不会影响数据顺序。
-    for sequence_no, page in enumerate(web_collection.pages):
-        web_events.append(
-            {
-                "event": {
-                    "source_id": web_source_id,
-                    "event_type": "append",
-                    "source_type": WEB_SOURCE_TYPE,
-                    "chunk_id": f"{web_source_id}-page-{sequence_no}",
-                    "version": sequence_no,
-                    "sequence_no": sequence_no,
-                    "text": _format_web_chunk(
-                        page,
-                        args.max_web_chunk_tokens,
-                        tokenizer,
-                    ),
-                },
-                "provenance": {
-                    "kind": "web_page",
-                    "search_rank": page.rank,
-                    "title": page.title,
-                    "url": page.url,
-                    "final_url": page.final_url,
-                    "snippet": page.snippet,
-                    "status_code": page.status_code,
-                    "content_sha256": page.content_sha256,
-                },
-            }
-        )
-    web_events.append(
-        _build_source_finished_event(
-            source_id=web_source_id,
-            source_type=WEB_SOURCE_TYPE,
-            sequence_no=len(web_collection.pages),
-            version=max(0, len(web_collection.pages) - 1),
-        )
-    )
-
-    num_web_pages = len(web_collection.pages)
-    sample_status = (
-        "complete" if num_web_pages >= args.min_successful_web_pages else "partial"
+    gold_answers = list(
+        dict.fromkeys(answer.text for answer in squad_record.answers)
     )
     return {
         "schema_version": SCHEMA_VERSION,
+        "data_revision": DATA_REVISION,
         "sample_id": sample_id,
         "query_id": query_id,
         "question": question,
-        "status": sample_status,
+        "status": "complete",
         "start": {
             "api": "completions",
             "prompt": args.prefix,
@@ -1382,14 +1116,14 @@ def _build_sample(
         },
         "sources": [
             {
+                "source_id": squad_source_id,
+                "source_type": SQUAD_SOURCE_TYPE,
+                "semantics": "monotonic_append",
+            },
+            {
                 "source_id": anns_source_id,
                 "source_type": ANNS_SOURCE_TYPE,
                 "semantics": "full_snapshot",
-            },
-            {
-                "source_id": web_source_id,
-                "source_type": WEB_SOURCE_TYPE,
-                "semantics": "monotonic_append",
             },
         ],
         "event_order": {
@@ -1397,9 +1131,9 @@ def _build_sample(
             "within_source": "sequence_no",
             "across_sources": "unspecified",
         },
-        "events": anns_events + web_events,
+        "events": squad_events + anns_events,
         "finish": {
-            "after_source_ids": [anns_source_id, web_source_id],
+            "after_source_ids": [squad_source_id, anns_source_id],
             "event": {
                 "source_id": "final_question",
                 "event_type": "prompt_finished",
@@ -1410,23 +1144,29 @@ def _build_sample(
                 "text": f"\nUser question: {question}\nAnswer:",
             },
         },
-        "web_collection": {
-            "provider": web_collection.search_provider,
-            "configuration": web_collection.configuration,
-            "search_hits": web_collection.search_hits,
-            "successful_pages": num_web_pages,
-            "failed_pages": [asdict(failure) for failure in web_collection.failures],
+        "squad_context": {
+            "split": squad_record.split,
+            "title": squad_record.title,
+            "paragraph_index": squad_record.paragraph_index,
+            "squad_id": squad_record.squad_id,
+            "match_method": squad_match.method,
+            "is_impossible": squad_record.is_impossible,
+            "gold_answers": gold_answers,
+            "context_sha256": context_sha256,
+            "num_append_chunks": NUM_SQUAD_APPEND_CHUNKS,
+            "context_chars": len(squad_record.context),
         },
         "provenance": {
             "base_dataset": "stream2llm-data/anns",
             "base_query_id": query_id,
             "trace_file": trace_file,
+            "append_dataset": "squad_v2",
         },
     }
 
 
 def _validate_no_timing_fields(value: Any, path: str = "$") -> None:
-    """递归拒绝 v1 中遗留的真实时间或耗时字段。"""
+    """递归拒绝数据构建或旧 schema 遗留的真实时间字段。"""
     forbidden_keys = {
         "ready_offset_ms",
         "fetch_duration_ms",
@@ -1441,7 +1181,7 @@ def _validate_no_timing_fields(value: Any, path: str = "$") -> None:
     if isinstance(value, dict):
         for key, child in value.items():
             if key in forbidden_keys:
-                raise ValueError(f"Timing field {path}.{key} is not allowed in v2.")
+                raise ValueError(f"Timing field {path}.{key} is not allowed.")
             _validate_no_timing_fields(child, f"{path}.{key}")
     elif isinstance(value, list):
         for index, child in enumerate(value):
@@ -1449,54 +1189,102 @@ def _validate_no_timing_fields(value: Any, path: str = "$") -> None:
 
 
 def _validate_sample(sample: dict[str, Any]) -> None:
-    """检查回放所依赖的核心 schema 与 source 内顺序约束。
-
-    Raises:
-        ValueError: 样本缺少关键字段、事件 id 重复或 source 序号不连续。
-    """
+    """检查现有回放器依赖的 schema、来源和顺序约束。"""
     if sample.get("schema_version") != SCHEMA_VERSION:
         raise ValueError("Unexpected mixed-source schema version.")
+    if sample.get("data_revision") != DATA_REVISION:
+        raise ValueError("Unexpected mixed-source data revision.")
     if not sample.get("start", {}).get("prompt"):
         raise ValueError("Sample start.prompt must be non-empty.")
     if not sample.get("finish", {}).get("event", {}).get("text"):
         raise ValueError("Sample finish question must be non-empty.")
-    event_order = sample.get("event_order", {})
-    if event_order.get("across_sources") != "unspecified":
+    if sample.get("event_order", {}).get(
+        "across_sources"
+    ) != "unspecified":
         raise ValueError("Cross-source event order must remain unspecified.")
     _validate_no_timing_fields(sample)
 
+    source_definitions = sample.get("sources")
+    if not isinstance(source_definitions, list) or len(
+        source_definitions
+    ) != 2:
+        raise ValueError("Sample must declare one Append and one Update source.")
+    source_types = {
+        source.get("source_type")
+        for source in source_definitions
+        if isinstance(source, dict)
+    }
+    if source_types != {SQUAD_SOURCE_TYPE, ANNS_SOURCE_TYPE}:
+        raise ValueError(f"Unexpected source types: {source_types}.")
+
     seen_chunk_ids: set[str] = set()
-    source_events: dict[str, list[dict[str, Any]]] = {}
-    for record in sample["events"]:
-        event = record["event"]
-        chunk_id = event["chunk_id"]
+    source_events: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    num_append_events = 0
+    for record in sample.get("events", []):
+        event = record.get("event") if isinstance(record, dict) else None
+        if not isinstance(event, dict):
+            raise ValueError("Every event record must contain an event object.")
+        source_id = event.get("source_id")
+        chunk_id = event.get("chunk_id")
+        if not isinstance(source_id, str) or not isinstance(chunk_id, str):
+            raise ValueError("Every source event requires string ids.")
         if chunk_id in seen_chunk_ids:
             raise ValueError(f"Duplicate chunk_id={chunk_id}.")
         seen_chunk_ids.add(chunk_id)
-        source_events.setdefault(event["source_id"], []).append(event)
-        if event["event_type"] == "append" and not event["text"]:
-            raise ValueError(f"Append chunk {chunk_id} must be non-empty.")
-        # Update 的空字符串具有“清空当前 snapshot”的明确语义，必须允许。
-        if event["event_type"] == "update" and event["text"] is None:
-            raise ValueError(f"Update snapshot {chunk_id} must carry text.")
+        source_events[source_id].append(event)
 
+        event_type = event.get("event_type")
+        if event_type == "append":
+            num_append_events += 1
+            if not event.get("text"):
+                raise ValueError(
+                    f"Append chunk {chunk_id} must be non-empty."
+                )
+        # 空字符串是合法的清空 Update snapshot，只有 None 才是坏数据。
+        if event_type == "update" and event.get("text") is None:
+            raise ValueError(
+                f"Update snapshot {chunk_id} must carry text."
+            )
+
+    if num_append_events != NUM_SQUAD_APPEND_CHUNKS:
+        raise ValueError(
+            "SQuAD Append source must contain exactly "
+            f"{NUM_SQUAD_APPEND_CHUNKS} data events."
+        )
+
+    declared_source_ids = {
+        source["source_id"] for source in source_definitions
+    }
+    if set(source_events) != declared_source_ids:
+        raise ValueError("Declared sources and event source ids do not match.")
     for source_id, events in source_events.items():
         sequences = [int(event["sequence_no"]) for event in events]
         if sequences != list(range(len(events))):
             raise ValueError(
-                f"Non-contiguous sequence numbers for {source_id}: {sequences}."
+                f"Non-contiguous sequence numbers for {source_id}: "
+                f"{sequences}."
             )
-        if events[-1]["event_type"] != "source_finished":
-            raise ValueError(f"Source {source_id} must end with source_finished.")
+        if events[-1].get("event_type") != "source_finished":
+            raise ValueError(
+                f"Source {source_id} must end with source_finished."
+            )
         versions = [
             int(event["version"])
             for event in events
-            if event["event_type"] in ("append", "update")
+            if event.get("event_type") in ("append", "update")
         ]
         if versions != list(range(len(versions))):
             raise ValueError(
                 f"Non-contiguous data versions for {source_id}: {versions}."
             )
+
+    finish_source_ids = set(
+        sample["finish"].get("after_source_ids", [])
+    )
+    if finish_source_ids != declared_source_ids:
+        raise ValueError(
+            "finish.after_source_ids must contain both sources."
+        )
 
 
 def _request_path(output_dir: Path, query_id: str) -> Path:
@@ -1509,21 +1297,43 @@ def _request_path(output_dir: Path, query_id: str) -> Path:
     return output_dir / "requests" / filename
 
 
-def _rebuild_manifest(output_dir: Path) -> int:
-    """从全部请求文件确定性重建 manifest.jsonl。
+def _is_current_squad_sample(sample: Any) -> bool:
+    """判断已有请求是否已经由当前 SQuAD Append 生成器构造。"""
+    return (
+        isinstance(sample, dict)
+        and sample.get("schema_version") == SCHEMA_VERSION
+        and sample.get("data_revision") == DATA_REVISION
+        and sample.get("provenance", {}).get("append_dataset") == "squad_v2"
+    )
+
+
+def _rebuild_manifest(output_dir: Path) -> tuple[int, Counter[str]]:
+    """从全部当前版本请求确定性重建 manifest.jsonl。
 
     Returns:
-        manifest 中的请求数量。
+        manifest 样本数及全部样本的 SQuAD 匹配方式计数。
     """
     entries: list[dict[str, Any]] = []
-    for request_path in sorted((output_dir / "requests").glob("*.json")):
+    legacy_paths: list[Path] = []
+    match_method_counts: Counter[str] = Counter()
+    request_directory = output_dir / "requests"
+    request_directory.mkdir(parents=True, exist_ok=True)
+
+    for request_path in sorted(request_directory.glob("*.json")):
         sample = _load_json(request_path)
+        if not _is_current_squad_sample(sample):
+            legacy_paths.append(request_path)
+            continue
         _validate_sample(sample)
+        match_method = sample["squad_context"]["match_method"]
+        match_method_counts[match_method] += 1
         num_append_events = sum(
-            record["event"]["event_type"] == "append" for record in sample["events"]
+            record["event"]["event_type"] == "append"
+            for record in sample["events"]
         )
         num_update_events = sum(
-            record["event"]["event_type"] == "update" for record in sample["events"]
+            record["event"]["event_type"] == "update"
+            for record in sample["events"]
         )
         entries.append(
             {
@@ -1534,29 +1344,46 @@ def _rebuild_manifest(output_dir: Path) -> int:
                 "question": sample["question"],
                 "num_append_events": num_append_events,
                 "num_update_events": num_update_events,
+                "squad_id": sample["squad_context"]["squad_id"],
+                "squad_title": sample["squad_context"]["title"],
             }
+        )
+
+    if legacy_paths:
+        logger.warning(
+            "Ignoring %d legacy non-SQuAD request files while rebuilding "
+            "manifest; run the full --overwrite command before replay.",
+            len(legacy_paths),
         )
     entries.sort(key=lambda entry: _numeric_query_sort_key(entry["query_id"]))
     manifest_text = "".join(
         f"{json.dumps(entry, ensure_ascii=False)}\n" for entry in entries
     )
     _atomic_write_text(output_dir / "manifest.jsonl", manifest_text)
-    return len(entries)
+    return len(entries), match_method_counts
 
 
 def _write_dataset_metadata(
     output_dir: Path,
     args: argparse.Namespace,
     num_samples: int,
+    num_failed: int,
+    match_method_counts: Counter[str],
 ) -> None:
-    """写入不包含机器绝对路径的数据集级元信息。"""
+    """写入 SQuAD Append 数据集级元信息。"""
     metadata = {
         "schema_version": SCHEMA_VERSION,
+        "data_revision": DATA_REVISION,
         "description": (
-            "Mixed prompt-stream dataset using ANNS full snapshots as Update "
-            "events and freshly collected web pages as Append events."
+            "Mixed prompt-stream dataset using two deterministic segments "
+            "of the matched SQuAD v2 context as Append events and ANNS "
+            "PipelinePool snapshots as Update events."
         ),
         "num_samples": num_samples,
+        "num_failed_in_last_build": num_failed,
+        "squad_match_method_counts": dict(
+            sorted(match_method_counts.items())
+        ),
         "event_order": {
             "within_source": "sequence_no",
             "across_sources": "controlled_by_replay",
@@ -1564,13 +1391,19 @@ def _write_dataset_metadata(
         "layout": {
             "manifest": "manifest.jsonl",
             "requests": "requests/*.json",
-            "web_cache": ".cache/web/query_<id>.json",
+        },
+        "append_source": {
+            "dataset": "squad_v2",
+            "num_chunks_per_request": NUM_SQUAD_APPEND_CHUNKS,
+            "split_strategy": "balanced_sentence_boundary",
+            "preserve_complete_context": True,
+            "preserve_answer_spans": True,
+        },
+        "update_source": {
+            "dataset": "stream2llm-data/anns",
+            "semantics": "full_snapshot",
         },
         "generation_defaults": {
-            "max_web_results": args.max_web_results,
-            "min_successful_web_pages": args.min_successful_web_pages,
-            "max_web_chars": args.max_web_chars,
-            "max_web_chunk_tokens": args.max_web_chunk_tokens,
             "max_anns_document_chars": args.max_anns_document_chars,
             "max_anns_document_tokens": args.max_anns_document_tokens,
             "max_update_snapshot_tokens": args.max_update_snapshot_tokens,
@@ -1583,187 +1416,177 @@ def _write_dataset_metadata(
 
 
 def _validate_args(args: argparse.Namespace) -> None:
-    """在访问大文件或网络前检查参数范围。"""
-    positive_fields = (
-        "max_web_results",
-        "min_successful_web_pages",
-        "fetch_workers",
-        "search_timeout",
-        "fetch_timeout",
-        "max_page_bytes",
-        "min_web_chars",
-        "max_tokens",
-    )
-    for field_name in positive_fields:
-        if getattr(args, field_name) <= 0:
-            raise ValueError(f"--{field_name.replace('_', '-')} must be positive.")
+    """在读取大文件前校验参数范围与依赖关系。"""
+    if args.max_tokens <= 0:
+        raise ValueError("--max-tokens must be positive.")
+    if args.temperature < 0.0:
+        raise ValueError("--temperature must be non-negative.")
     non_negative_fields = (
-        "max_search_retries",
-        "max_fetch_retries",
-        "retry_backoff",
-        "query_delay",
-        "max_web_chars",
         "max_anns_document_chars",
-        "max_web_chunk_tokens",
         "max_anns_document_tokens",
         "max_update_snapshot_tokens",
     )
     for field_name in non_negative_fields:
         if getattr(args, field_name) < 0:
-            raise ValueError(f"--{field_name.replace('_', '-')} must be non-negative.")
+            option_name = field_name.replace("_", "-")
+            raise ValueError(f"--{option_name} must be non-negative.")
+
     token_budget_fields = (
-        "max_web_chunk_tokens",
         "max_anns_document_tokens",
         "max_update_snapshot_tokens",
     )
     if (
-        any(getattr(args, field_name) > 0 for field_name in token_budget_fields)
+        any(getattr(args, name) > 0 for name in token_budget_fields)
         and args.tokenizer_model is None
     ):
         raise ValueError(
-            "--tokenizer-model is required when token-level content "
-            "budgets are enabled."
+            "--tokenizer-model is required when token-level ANNS budgets "
+            "are enabled."
         )
-    if args.min_successful_web_pages > args.max_web_results:
-        raise ValueError("--min-successful-web-pages cannot exceed --max-web-results.")
-    if args.offline and args.refresh_web:
-        raise ValueError("--offline cannot be combined with --refresh-web.")
-    if args.only_cached_web and args.refresh_web:
-        raise ValueError("--only-cached-web cannot be combined with --refresh-web.")
-    if args.refresh_web and not args.overwrite:
-        raise ValueError("--refresh-web requires --overwrite.")
+    if not args.prefix:
+        raise ValueError("--prefix must be non-empty.")
 
 
 def run(args: argparse.Namespace) -> None:
-    """执行一次可恢复的小批量混合数据生成。
+    """执行一次确定性、可恢复的混合来源数据生成。
 
-    Args:
-        args: 已解析并校验的命令行参数。
+    该函数会写入选中请求、重建只包含当前 SQuAD 版本请求的 manifest，并更新
+    dataset 元信息。它不会访问网络，也不会删除旧网页缓存。
     """
     _validate_args(args)
     tokenizer = _load_tokenizer(args.tokenizer_model)
+
     query_map_path = args.anns_dir / "query_trace_map_5k.json"
-    query_map: dict[str, dict[str, str]] = _load_json(query_map_path)
-    query_ids = _select_query_ids(query_map, args)
-    if args.only_cached_web:
-        original_num_query_ids = len(query_ids)
-        query_ids = _filter_query_ids_with_web_cache(query_ids, args.output_dir)
-        logger.info(
-            "Selected %d/%d queries with existing web cache.",
-            len(query_ids),
-            original_num_query_ids,
+    query_map = _load_json(query_map_path)
+    if not isinstance(query_map, dict):
+        raise ValueError(
+            f"ANNS query map is not an object: {query_map_path}"
         )
+    query_ids = _select_query_ids(query_map, args)
     if not query_ids:
         raise ValueError("No ANNS queries selected.")
 
-    # 先解析本批 trace，再一次性加载所需 corpus 文档，避免把约 200 MiB
-    # 的完整 corpus 长期驻留在 Python 字典中。
+    target_questions = {
+        str(query_map[query_id]["query"]) for query_id in query_ids
+    }
+    squad_index = _load_squad_context_index(
+        args.squad_dir,
+        target_questions,
+    )
+    logger.info(
+        "Indexed %d candidate SQuAD records for %d selected ANNS queries.",
+        squad_index.num_indexed_records,
+        len(query_ids),
+    )
+
+    # 当前版本请求默认可续跑；旧网页请求必须自动进入重建集合。
+    query_ids_to_build: list[str] = []
+    num_skipped = 0
+    for query_id in query_ids:
+        request_path = _request_path(args.output_dir, query_id)
+        if request_path.exists() and not args.overwrite:
+            existing_sample = _load_json(request_path)
+            if _is_current_squad_sample(existing_sample):
+                logger.info(
+                    "Skipping current SQuAD request %s; use --overwrite "
+                    "to rebuild it.",
+                    request_path,
+                )
+                num_skipped += 1
+                continue
+            logger.info("Rebuilding legacy web request %s.", request_path)
+        query_ids_to_build.append(query_id)
+
+    # 只为确实需要重建的 query 解析 trace 和加载 corpus。
     traces: dict[str, list[AnnsTraceRow]] = {}
     required_document_ids: set[str] = set()
-    for query_id in query_ids:
-        trace_file = query_map[query_id]["trace_file"]
-        trace_rows = _load_trace_rows(args.anns_dir, trace_file)
+    num_failed = 0
+    for query_id in query_ids_to_build:
+        trace_file = str(query_map[query_id]["trace_file"])
+        try:
+            trace_rows = _load_trace_rows(args.anns_dir, trace_file)
+        except Exception:
+            num_failed += 1
+            logger.exception(
+                "Failed to load ANNS trace for query %s.",
+                query_id,
+            )
+            if args.fail_fast:
+                raise
+            continue
         traces[query_id] = trace_rows
         for row in trace_rows:
             required_document_ids.update(row.document_ids)
-    documents = _load_required_documents(
+    documents, _ = _load_required_documents(
         args.anns_dir,
         required_document_ids,
     )
 
-    succeeded = 0
-    failed = 0
-    for query_index, query_id in enumerate(query_ids):
+    num_succeeded = num_skipped
+    for query_index, query_id in enumerate(query_ids_to_build):
+        trace_rows = traces.get(query_id)
+        if trace_rows is None:
+            continue
+        question = str(query_map[query_id]["query"])
+        trace_file = str(query_map[query_id]["trace_file"])
         request_path = _request_path(args.output_dir, query_id)
-        if request_path.exists() and not args.overwrite:
-            existing_sample = _load_json(request_path)
-            if existing_sample.get("schema_version") == SCHEMA_VERSION:
-                logger.info(
-                    "Skipping existing request %s; use --overwrite to rebuild.",
-                    request_path,
-                )
-                succeeded += 1
-                continue
-            logger.info(
-                "Rebuilding legacy request %s as schema %s.",
-                request_path,
-                SCHEMA_VERSION,
-            )
-
-        question = query_map[query_id]["query"]
-        trace_file = query_map[query_id]["trace_file"]
         logger.info(
             "Building query %s (%d/%d): %s",
             query_id,
             query_index + 1,
-            len(query_ids),
+            len(query_ids_to_build),
             question,
         )
         try:
-            rng_seed = args.random_seed + (
-                int(query_id) if query_id.isdigit() else query_index
-            )
-            web_collection = _get_web_collection(
-                query_id,
-                question,
-                args,
-                random.Random(rng_seed),
-            )
-            if (
-                args.require_web
-                and len(web_collection.pages) < args.min_successful_web_pages
-            ):
-                raise RuntimeError(
-                    f"Only {len(web_collection.pages)} usable web pages were "
-                    f"collected for query {query_id}; "
-                    f"{args.min_successful_web_pages} required."
-                )
+            squad_match = _resolve_squad_context(question, squad_index)
             sample = _build_sample(
                 query_id=query_id,
                 question=question,
                 trace_file=trace_file,
-                trace_rows=traces[query_id],
+                trace_rows=trace_rows,
                 documents=documents,
-                web_collection=web_collection,
+                squad_match=squad_match,
                 args=args,
                 tokenizer=tokenizer,
             )
             _validate_sample(sample)
             _atomic_write_json(request_path, sample)
-            succeeded += 1
-            logger.info(
-                "Wrote %s with %d ANNS snapshots and %d web pages (%s).",
-                request_path,
-                len(traces[query_id]),
-                len(web_collection.pages),
-                sample["status"],
-            )
+            num_succeeded += 1
         except Exception:
-            failed += 1
+            num_failed += 1
             logger.exception("Failed to build query %s.", query_id)
             if args.fail_fast:
                 raise
 
-        is_last_query = query_index == len(query_ids) - 1
-        if not args.offline and not is_last_query and args.query_delay > 0:
-            time.sleep(args.query_delay)
-
-    num_samples = _rebuild_manifest(args.output_dir)
-    _write_dataset_metadata(args.output_dir, args, num_samples)
-    logger.info(
-        "Finished: %d selected, %d succeeded/skipped, %d failed, "
-        "%d total samples in manifest.",
-        len(query_ids),
-        succeeded,
-        failed,
-        num_samples,
+    (
+        num_manifest_samples,
+        manifest_match_method_counts,
+    ) = _rebuild_manifest(args.output_dir)
+    _write_dataset_metadata(
+        output_dir=args.output_dir,
+        args=args,
+        num_samples=num_manifest_samples,
+        num_failed=num_failed,
+        match_method_counts=manifest_match_method_counts,
     )
-    if failed:
-        raise RuntimeError(f"Failed to build {failed} selected queries.")
+    logger.info(
+        "Build finished: selected=%d, built_or_skipped=%d, failed=%d, "
+        "manifest_samples=%d.",
+        len(query_ids),
+        num_succeeded,
+        num_failed,
+        num_manifest_samples,
+    )
+
+    if num_failed:
+        raise RuntimeError(
+            f"Failed to build {num_failed} of "
+            f"{len(query_ids)} selected queries."
+        )
 
 
 def main() -> None:
-    """脚本入口。"""
+    """配置日志并运行数据生成入口。"""
     args = parse_args()
     logging.basicConfig(
         level=getattr(logging, args.log_level),

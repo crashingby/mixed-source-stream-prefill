@@ -257,3 +257,4 @@ csrc/cpu/cpu_attn_dispatch_generated.h
 research/scripts/logs
 research/scripts/replay/segmented_prefill/results
 research/scripts/replay/update_coalescing/results
+research/scripts/replay/generation_quality/results

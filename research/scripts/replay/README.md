@@ -11,6 +11,8 @@
 - `update_coalescing/`：第二个创新点的实验目录，用于评估 Update 合并策略。
   已包含 P 节点 profile 启动、正式回放、QPS/Update interval sweep、结果汇总和
   权衡图脚本。
+- `generation_quality/`：完整生成质量实验，低压力比较普通 Prefill 与混合来源
+  分段流式 Prefill，并使用 SQuAD v2 官方 EM/F1 和逐请求配对回退率评分。
 
 ## 使用入口
 
@@ -18,8 +20,10 @@
   [segmented_prefill/README.md](segmented_prefill/README.md)。
 - 设计或执行 Update 合并实验：阅读
   [update_coalescing/README.md](update_coalescing/README.md)。
+- 运行答案质量与 SQuAD EM/F1 实验：阅读
+  [generation_quality/README.md](generation_quality/README.md)。
 
-两个实验包应分别设置自己的 `--output-dir`。目录迁移后，第一个实验的默认
+各实验包应分别设置自己的 `--output-dir`。目录迁移后，第一个实验的默认
 结果路径为：
 
 ```text
@@ -30,6 +34,12 @@ Update 合并实验统一使用：
 
 ```text
 research/scripts/replay/update_coalescing/results
+```
+
+生成质量实验统一使用：
+
+```text
+research/scripts/replay/generation_quality/results
 ```
 
 迁移前生成的历史 `config.json` 和绘图 summary 仍记录旧的

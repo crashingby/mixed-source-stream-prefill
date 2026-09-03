@@ -48,6 +48,8 @@
 ```shell
 export MODEL_PATH=/workplace/home/huangxinying/Models/Qwen2.5-3B/
 export SERVED_MODEL_NAME=qwen2.5-3b
+export MODEL_PATH=/workplace/home/huangxinying/Models/Llama-3.1-8B-Instruct
+export SERVED_MODEL_NAME=llama-3.1-8b-instruct
 export GPU_MEMORY_UTILIZATION=0.6
 export MAX_MODEL_LEN=4096
 export MAX_NUM_SEQS=16
