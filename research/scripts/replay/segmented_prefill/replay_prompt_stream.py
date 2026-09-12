@@ -14,7 +14,9 @@ from typing import Any
 
 import httpx
 from replay_common import (
+    ChatTemplateRenderer,
     EventMetric,
+    RenderedReplayPrompt,
     ReplayHttpError,
     RequestMetric,
     SampleReplayInput,
@@ -24,6 +26,7 @@ from replay_common import (
     _override_sampling_params,
     _post_json,
     _prompt_stream_finish_endpoint,
+    _prompt_stream_start_endpoint,
     _sleep_until,
     consume_sse_response,
     main,
@@ -35,6 +38,7 @@ logger = logging.getLogger(__name__)
 
 def _make_stream_start_payload(
     sample: SampleReplayInput,
+    rendered_prompt: RenderedReplayPrompt,
     args: argparse.Namespace,
     external_request_id: str,
 ) -> dict[str, Any]:
@@ -48,6 +52,7 @@ def _make_stream_start_payload(
         {
             "api": "completions",
             "model": args.model,
+            "prompt": list(rendered_prompt.start_token_ids),
             "stream": True,
             "request_id": external_request_id,
         }
@@ -104,6 +109,7 @@ async def _send_source_events(
     proxy_url: str,
     request_id: str,
     sample: SampleReplayInput,
+    renderer: ChatTemplateRenderer,
     source_stream: SourceEventStream,
     source_dispatch_start_time: float,
     args: argparse.Namespace,
@@ -170,6 +176,10 @@ async def _send_source_events(
             actual_send_time - source_dispatch_start_time
         ) * 1000
         outbound_event = dict(stored_event)
+        if event_type in ("append", "update"):
+            outbound_event["token_ids"] = list(
+                renderer.encode_content(str(outbound_event.get("text") or ""))
+            )
         # 数据集没有实验时间；每次真正发 REST 请求时才附加 arrival_time。
         outbound_event["arrival_time"] = time.time()
         payload = {
@@ -347,6 +357,8 @@ async def _abort_prompt_stream(
 async def _replay_stream_sample(
     client: httpx.AsyncClient,
     sample: SampleReplayInput,
+    rendered_prompt: RenderedReplayPrompt,
+    renderer: ChatTemplateRenderer,
     args: argparse.Namespace,
     run_id: str,
     planned_arrival_offset_ms: float,
@@ -364,6 +376,9 @@ async def _replay_stream_sample(
         planned_arrival_offset_ms=planned_arrival_offset_ms,
         queue_delay_ms=queue_delay_ms,
         request_start_wall_time=time.time(),
+        append_chars=rendered_prompt.append_chars,
+        final_update_chars=rendered_prompt.final_update_chars,
+        normal_prompt_chars=len(rendered_prompt.logical_prompt_text),
     )
     request_id: str | None = None
     finish_sent_time: float | None = None
@@ -372,11 +387,19 @@ async def _replay_stream_sample(
         external_request_id = (
             f"replay-{run_id}-{sample.sample_id}-{uuid.uuid4().hex[:8]}"
         )
-        start_payload = _make_stream_start_payload(sample, args, external_request_id)
+        start_payload = _make_stream_start_payload(
+            sample,
+            rendered_prompt,
+            args,
+            external_request_id,
+        )
         start_ack_start_time = time.perf_counter()
         start_response = await _post_json(
             client,
-            _normalize_v1_url(args.proxy_url, "/v1/prompt_stream/start"),
+            _normalize_v1_url(
+                args.proxy_url,
+                _prompt_stream_start_endpoint(args),
+            ),
             start_payload,
         )
         metric.start_ack_ms = (time.perf_counter() - start_ack_start_time) * 1000
@@ -403,6 +426,7 @@ async def _replay_stream_sample(
                     proxy_url=args.proxy_url,
                     request_id=request_id,
                     sample=sample,
+                    renderer=renderer,
                     source_stream=source_stream,
                     source_dispatch_start_time=source_dispatch_start_time,
                     args=args,
@@ -447,6 +471,8 @@ async def _replay_stream_sample(
             )
 
         finish_event = dict(sample.finish_event)
+        finish_event["text"] = rendered_prompt.finish_text
+        finish_event["token_ids"] = list(rendered_prompt.finish_token_ids)
         finish_event["arrival_time"] = time.time()
         finish_payload = {
             "request_id": request_id,

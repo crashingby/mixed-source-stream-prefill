@@ -26,7 +26,8 @@ class PromptStreamProxySession:
 
     request_id: str
     prefill_client_info: dict[str, Any]
-    decode_client_info: dict[str, Any]
+    # TTFT-only 会话从创建时起就是 P-only，因此不会选择 D 节点客户端。
+    decode_client_info: dict[str, Any] | None
     api_endpoint: str
     base_request: dict[str, Any]
     decode_prompt_text: str | None
@@ -674,17 +675,33 @@ def _merge_prefill_output(
     return _attach_prompt_stream_stats(response_json, prefill_response)
 
 
-def _build_prefill_start_request(req_data: dict[str, Any]) -> dict[str, Any]:
-    """构造发给 P 节点的 start 请求。"""
+def _build_prefill_start_request(
+    req_data: dict[str, Any], *, enable_kv_transfer: bool
+) -> dict[str, Any]:
+    """构造发给 P 节点的单 token prefill 请求。
+
+    Args:
+        req_data: 客户端发给 proxy 的原始请求体。
+        enable_kv_transfer: 是否为后续 D 节点 decode 准备 NIXL KV transfer。
+            TTFT-only 为 ``False``，P 节点不建立任何远端 KV 生命周期。
+
+    Returns:
+        发送给 P 节点的非流式、单 token prefill 请求。
+    """
     prefill_request = dict(req_data)
-    prefill_request["kv_transfer_params"] = {
-        "do_remote_decode": True,
-        "do_remote_prefill": False,
-        "remote_engine_id": None,
-        "remote_block_ids": None,
-        "remote_host": None,
-        "remote_port": None,
-    }
+
+    # proxy 决定 P/D 生命周期，不能让客户端残留的参数绕过 TTFT-only 隔离。
+    prefill_request.pop("kv_transfer_params", None)
+    if enable_kv_transfer:
+        # 完整 P/D 请求由 P 节点持有 KV，等待 D 节点稍后按 block manifest 拉取。
+        prefill_request["kv_transfer_params"] = {
+            "do_remote_decode": True,
+            "do_remote_prefill": False,
+            "remote_engine_id": None,
+            "remote_block_ids": None,
+            "remote_host": None,
+            "remote_port": None,
+        }
     prefill_request["stream"] = False
     prefill_request["max_tokens"] = 1
     prefill_request.pop("stream_options", None)
@@ -693,7 +710,9 @@ def _build_prefill_start_request(req_data: dict[str, Any]) -> dict[str, Any]:
     return prefill_request
 
 
-def _build_normal_pd_prefill_request(req_data: dict[str, Any]) -> dict[str, Any]:
+def _build_normal_pd_prefill_request(
+    req_data: dict[str, Any], *, enable_kv_transfer: bool
+) -> dict[str, Any]:
     """构造普通 completions 的 P 节点首 token 请求。
 
     P 节点必须返回 prompt 与首个输出 token 的精确 token ids。D 节点随后以
@@ -702,6 +721,7 @@ def _build_normal_pd_prefill_request(req_data: dict[str, Any]) -> dict[str, Any]
 
     Args:
         req_data: 客户端发给 proxy 的原始 completions 请求体。
+        enable_kv_transfer: 是否为后续 D decode 保留 P 节点 KV。
 
     Returns:
         发给 P 节点的非流式、单 token completions 请求体。
@@ -719,7 +739,10 @@ def _build_normal_pd_prefill_request(req_data: dict[str, Any]) -> dict[str, Any]
 
     # 复用 prompt-stream P 请求的 KV 配置、非流式 collector 和单 token
     # budget；额外要求返回 token ids，保证 D 的 token view 和 P 完全一致。
-    prefill_request = _build_prefill_start_request(req_data)
+    prefill_request = _build_prefill_start_request(
+        req_data,
+        enable_kv_transfer=enable_kv_transfer,
+    )
     prefill_request["return_token_ids"] = True
     return prefill_request
 
@@ -1313,7 +1336,12 @@ async def _handle_normal_pd_completions(
         request_id = f"normal-pd-{time.time_ns()}"
 
     # 常规 PD 只处理一个 choice；多 choice 的 P/D KV 绑定不在本实验范围内。
-    prefill_request = _build_normal_pd_prefill_request(req_data)
+    # TTFT-only 在 P 节点产出首 token 后立即结束，不能建立虚假的 D 侧 KV
+    # transfer 生命周期；完整 PD 路径则保留既有的 producer 配置。
+    prefill_request = _build_normal_pd_prefill_request(
+        req_data,
+        enable_kv_transfer=not ttft_only,
+    )
     prefill_request["request_id"] = request_id
     prefill_client_info = get_next_client(request.app, "prefill")
     prefill_response = await _post_json(
@@ -1338,17 +1366,11 @@ async def _handle_normal_pd_completions(
         ) + b"data: [DONE]\n\n"
         logger.info(
             "Proxy normal PD TTFT-only completed: request_id=%s "
-            "prompt_tokens=%s output_tokens=%s remote_num_tokens=%s",
+            "prompt_tokens=%s output_tokens=%s kv_transfer_enabled=%s",
             request_id,
             len(prefill_choice["prompt_token_ids"]),
             num_prefill_output_tokens,
-            (
-                prefill_response.get("kv_transfer_params", {}).get(
-                    "remote_num_tokens"
-                )
-                if isinstance(prefill_response.get("kv_transfer_params"), dict)
-                else None
-            ),
+            False,
         )
         return Response(
             content=sse_body,
@@ -1456,9 +1478,19 @@ async def forward_normal_responses(
     return await _forward_normal_request(request, "/responses")
 
 
-@app.post("/v1/prompt_stream/start")
-async def start_prompt_stream(request: Request):
-    """创建 P/D prompt stream 会话。"""
+async def _start_prompt_stream(
+    request: Request, *, enable_kv_transfer: bool
+) -> JSONResponse:
+    """创建完整 P/D 或 P-only 的 prompt-stream 会话。
+
+    Args:
+        request: 客户端的 prompt-stream start 请求。
+        enable_kv_transfer: ``True`` 时为后续 D decode 建立 NIXL producer
+            生命周期；``False`` 时创建严格 P-only 的 TTFT 会话。
+
+    Returns:
+        P 节点 start 响应，其中包含后续事件所需的内部 request id。
+    """
     req_data = await request.json()
     api_endpoint = _get_api_endpoint(req_data)
     if api_endpoint != "/completions":
@@ -1468,16 +1500,21 @@ async def start_prompt_stream(request: Request):
                 "Prompt stream segment KV currently supports only the completions API."
             ),
         )
-    # stream=true 使用 P 首 token + D 后续 token 的 SSE 路径；P 节点自身
-    # 的 start 仍由 _build_prefill_start_request 强制为非流式 collector。
+    # P 节点自身的 start 始终由 _build_prefill_start_request 强制使用非流式
+    # collector；是否建立 D 侧 KV 生命周期由独立的 start 路由决定。
     prefill_client_info = get_next_client(request.app, "prefill")
-    decode_client_info = get_next_client(request.app, "decode")
+    decode_client_info = (
+        get_next_client(request.app, "decode") if enable_kv_transfer else None
+    )
 
     # P 节点会返回内部 request_id；后续事件必须使用这个 id。
     response_json = await _post_json(
         prefill_client_info,
         "/prompt_stream/start",
-        _build_prefill_start_request(req_data),
+        _build_prefill_start_request(
+            req_data,
+            enable_kv_transfer=enable_kv_transfer,
+        ),
         req_data.get("request_id", "prompt-stream-start"),
     )
     request_id = response_json["request_id"]
@@ -1495,6 +1532,22 @@ async def start_prompt_stream(request: Request):
         ),
     )
     return JSONResponse(content=response_json)
+
+
+@app.post("/v1/prompt_stream/start")
+async def start_prompt_stream(request: Request):
+    """创建需要把 P 节点 KV 交给 D 节点的完整 P/D 会话。"""
+    return await _start_prompt_stream(request, enable_kv_transfer=True)
+
+
+@app.post("/v1/prompt_stream/start_ttft")
+async def start_prompt_stream_ttft(request: Request):
+    """创建严格 P-only 的 prompt-stream TTFT 会话。
+
+    该路由不会向 P 传递 ``kv_transfer_params``。因此即使 P 已启用 NIXL，
+    请求也不会注册为待 D 拉取的 producer request。
+    """
+    return await _start_prompt_stream(request, enable_kv_transfer=False)
 
 
 @app.post("/v1/prompt_stream/event")
@@ -1516,14 +1569,16 @@ async def add_prompt_stream_event(request: Request):
         req_data,
         session.request_id,
     )
-    _append_decode_prompt_token_ids(session, response_json)
-    _append_decode_prompt_text(session, req_data.get("event", {}))
+    # 只有完整 P/D 会话需要维护 D 请求的精确 token/text 镜像。
+    if session.decode_client_info is not None:
+        _append_decode_prompt_token_ids(session, response_json)
+        _append_decode_prompt_text(session, req_data.get("event", {}))
     return JSONResponse(content=response_json)
 
 
 @app.post("/v1/prompt_stream/finish")
 async def finish_prompt_stream(request: Request):
-    """完成 P 节点 prefill，并把 kv_transfer_params 交给 D 节点 decode。"""
+    """完成 P 节点 prefill，并把必需的 KV 参数交给 D 节点 decode。"""
     req_data = await request.json()
     request_id = req_data.get("request_id")
     session = request.app.state.prompt_stream_sessions.get(request_id)
@@ -1543,8 +1598,25 @@ async def finish_prompt_stream(request: Request):
     # P finish 成功后长期 Request 与 P session 已经结束；proxy 也采用
     # at-most-once finish，后续 D/校验失败不再保留一个无法重试的空壳会话。
     request.app.state.prompt_stream_sessions.pop(request_id, None)
-    _finish_decode_prompt_token_ids(session, prefill_response)
-    _finish_decode_prompt_text(session, req_data.get("event", {}))
+    # TTFT-only 没有 D 请求，避免为无消费者的 decode 镜像继续做状态更新。
+    if session.decode_client_info is not None:
+        _finish_decode_prompt_token_ids(session, prefill_response)
+        _finish_decode_prompt_text(session, req_data.get("event", {}))
+
+    # 完整 `/finish` 一定会进入 D decode。即使 proxy 的 debug 选项关闭了
+    # KV load，P 仍必须导出完整物理 prompt 视图，避免把仅适用于 TTFT-only
+    # 的无 connector P 输出错误地用于完整 P/D 请求。
+    kv_transfer_params = prefill_response.get("kv_transfer_params")
+    if not isinstance(kv_transfer_params, dict) or not kv_transfer_params:
+        raise HTTPException(
+            status_code=502,
+            detail=(
+                "P node full prompt-stream finish requires "
+                "kv_transfer_params; use /v1/prompt_stream/finish_ttft "
+                "when KV transfer is disabled."
+            ),
+        )
+
     num_prefill_output_tokens = 0
     if not global_args.disable_kv_transfer:
         num_prefill_output_tokens = _append_prefill_output_token_ids(
@@ -1614,8 +1686,20 @@ async def finish_prompt_stream(request: Request):
         response_json = _build_prefill_only_response(session, prefill_response)
         return JSONResponse(content=response_json)
 
+    # `/finish` 只能作用于完整 P/D 会话；P-only TTFT 会话必须调用
+    # `/finish_ttft`，否则不能在没有 D client 的情况下继续 decode。
+    decode_client_info = session.decode_client_info
+    if decode_client_info is None:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Prompt-stream TTFT-only session must use "
+                "/v1/prompt_stream/finish_ttft."
+            ),
+        )
+
     decode_response = await _post_json(
-        session.decode_client_info,
+        decode_client_info,
         session.api_endpoint,
         decode_request,
         session.request_id,

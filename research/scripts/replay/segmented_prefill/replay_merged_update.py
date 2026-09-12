@@ -22,7 +22,9 @@ from typing import Any, Literal
 
 import httpx
 from replay_common import (
+    ChatTemplateRenderer,
     EventMetric,
+    RenderedReplayPrompt,
     ReplayHttpError,
     RequestMetric,
     SampleReplayInput,
@@ -31,6 +33,7 @@ from replay_common import (
     _override_sampling_params,
     _post_json,
     _prompt_stream_finish_endpoint,
+    _prompt_stream_start_endpoint,
     _sleep_until,
     consume_sse_response,
     main,
@@ -64,6 +67,7 @@ class ScheduledSourceEvent:
 
 def _make_merged_update_start_payload(
     sample: SampleReplayInput,
+    rendered_prompt: RenderedReplayPrompt,
     args: argparse.Namespace,
     external_request_id: str,
 ) -> dict[str, Any]:
@@ -77,6 +81,7 @@ def _make_merged_update_start_payload(
         {
             "api": "completions",
             "model": args.model,
+            "prompt": list(rendered_prompt.start_token_ids),
             "stream": True,
             "request_id": external_request_id,
         }
@@ -207,6 +212,7 @@ def _merged_context_text(
 
 def _make_merged_update_event(
     text: str,
+    token_ids: tuple[int, ...],
     sequence_no: int,
 ) -> dict[str, Any]:
     """把当前完整上下文封装成一个 Update 事件。
@@ -223,6 +229,7 @@ def _make_merged_update_event(
         "version": sequence_no,
         "sequence_no": sequence_no,
         "text": text,
+        "token_ids": list(token_ids),
         "arrival_time": time.time(),
     }
 
@@ -276,6 +283,7 @@ async def _abort_prompt_stream(
 async def _dispatch_merged_update_events(
     client: httpx.AsyncClient,
     sample: SampleReplayInput,
+    renderer: ChatTemplateRenderer,
     args: argparse.Namespace,
     request_id: str,
     run_id: str,
@@ -349,7 +357,11 @@ async def _dispatch_merged_update_events(
             for source_id in update_source_order
         ]
         merged_text = _merged_context_text(append_text_parts, update_text_parts)
-        outbound_event = _make_merged_update_event(merged_text, sequence_no)
+        outbound_event = _make_merged_update_event(
+            merged_text,
+            renderer.encode_content(merged_text),
+            sequence_no,
+        )
         actual_send_time = time.perf_counter()
         actual_send_offset_ms = (
             actual_send_time - source_dispatch_start_time
@@ -593,6 +605,8 @@ async def _dispatch_merged_update_events(
 async def _replay_merged_update_sample(
     client: httpx.AsyncClient,
     sample: SampleReplayInput,
+    rendered_prompt: RenderedReplayPrompt,
+    renderer: ChatTemplateRenderer,
     args: argparse.Namespace,
     run_id: str,
     planned_arrival_offset_ms: float,
@@ -618,13 +632,17 @@ async def _replay_merged_update_sample(
         )
         start_payload = _make_merged_update_start_payload(
             sample,
+            rendered_prompt,
             args,
             external_request_id,
         )
         start_ack_start_time = time.perf_counter()
         start_response = await _post_json(
             client,
-            _normalize_v1_url(args.proxy_url, "/v1/prompt_stream/start"),
+            _normalize_v1_url(
+                args.proxy_url,
+                _prompt_stream_start_endpoint(args),
+            ),
             start_payload,
         )
         metric.start_ack_ms = (time.perf_counter() - start_ack_start_time) * 1000
@@ -647,12 +665,13 @@ async def _replay_merged_update_sample(
             event_metrics,
             num_append_chunks,
             num_update_snapshots,
-            append_chars,
-            final_update_chars,
-            normal_prompt_chars,
+            _append_chars,
+            _final_update_chars,
+            _normal_prompt_chars,
         ) = await _dispatch_merged_update_events(
             client=client,
             sample=sample,
+            renderer=renderer,
             args=args,
             request_id=request_id,
             run_id=run_id,
@@ -665,11 +684,13 @@ async def _replay_merged_update_sample(
         metric.num_event_acks = len(event_metrics)
         metric.num_append_chunks = num_append_chunks
         metric.num_update_snapshots = num_update_snapshots
-        metric.append_chars = append_chars
-        metric.final_update_chars = final_update_chars
-        metric.normal_prompt_chars = normal_prompt_chars
+        metric.append_chars = rendered_prompt.append_chars
+        metric.final_update_chars = rendered_prompt.final_update_chars
+        metric.normal_prompt_chars = len(rendered_prompt.logical_prompt_text)
 
         finish_event = dict(sample.finish_event)
+        finish_event["text"] = rendered_prompt.finish_text
+        finish_event["token_ids"] = list(rendered_prompt.finish_token_ids)
         finish_event["arrival_time"] = time.time()
         finish_payload = {
             "request_id": request_id,

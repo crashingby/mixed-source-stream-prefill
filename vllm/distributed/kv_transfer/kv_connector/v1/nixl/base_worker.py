@@ -845,6 +845,9 @@ class NixlBaseConnectorWorker:
 
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
         """Register the KV Cache data in nixl."""
+        # 记录整个注册阶段的耗时，便于区分 Python 侧 region 构造与 NIXL native
+        # 调用（例如 UCX GPU memory registration）是否发生阻塞。
+        registration_start_time = time.perf_counter()
         self.transfer_topo = TransferTopology(
             tp_rank=self.tp_rank,
             tp_size=self.world_size,
@@ -878,8 +881,10 @@ class NixlBaseConnectorWorker:
             )
 
         logger.info(
-            "Registering KV_Caches. use_mla: %s, kv_buffer_device: %s, "
-            "use_host_buffer: %s",
+            "NIXL KV registration started: tp_rank=%d, tp_size=%d, "
+            "use_mla=%s, kv_buffer_device=%s, use_host_buffer=%s",
+            self.tp_rank,
+            self.world_size,
             self.use_mla,
             self.kv_buffer_device,
             self.use_host_buffer,
@@ -1031,9 +1036,42 @@ class NixlBaseConnectorWorker:
         # Total local FA descriptors (boundary between FA and mamba descs).
         self.num_descs = self.num_regions * self.num_blocks
 
+        # 每个 region 都会向 NIXL 注册一段本 rank GPU memory；总字节数可用于
+        # 判断 TP rank 间是否实际注册了异常规模的 KV cache。
+        registered_bytes = sum(region[1] for region in caches_data)
+        logger.info(
+            "NIXL KV registration prepared: tp_rank=%d, device_id=%d, "
+            "physical_regions=%d, logical_regions=%d, num_blocks=%d, "
+            "registered_bytes=%d",
+            self.tp_rank,
+            self.device_id,
+            len(caches_data),
+            self.num_regions,
+            self.num_blocks,
+            registered_bytes,
+        )
+
+        # `get_reg_descs` 进入 NIXL native 层创建内存描述符。
+        get_descs_start_time = time.perf_counter()
+        logger.info("NIXL get_reg_descs started: tp_rank=%d", self.tp_rank)
         descs = self.nixl_wrapper.get_reg_descs(caches_data, self.nixl_memory_type)
+        logger.info(
+            "NIXL get_reg_descs completed: tp_rank=%d, elapsed_s=%.3f",
+            self.tp_rank,
+            time.perf_counter() - get_descs_start_time,
+        )
         logger.debug("Registering descs: %s", caches_data)
+
+        # `register_memory` 是 UCX/GPU memory registration 的实际边界；TP=2
+        # 启动阻塞时，需要明确每个 rank 是否从这里返回。
+        register_memory_start_time = time.perf_counter()
+        logger.info("NIXL register_memory started: tp_rank=%d", self.tp_rank)
         self.nixl_wrapper.register_memory(descs, backends=self.nixl_backends)
+        logger.info(
+            "NIXL register_memory completed: tp_rank=%d, elapsed_s=%.3f",
+            self.tp_rank,
+            time.perf_counter() - register_memory_start_time,
+        )
         logger.debug("Done registering descs")
         self._registered_descs.append(descs)
 
@@ -1055,11 +1093,26 @@ class NixlBaseConnectorWorker:
             )
 
         # Register local/src descr for NIXL xfer.
+        local_handler_start_time = time.perf_counter()
+        logger.info(
+            "NIXL register_local_xfer_handler started: tp_rank=%d, "
+            "block_size=%d",
+            self.tp_rank,
+            self.block_size,
+        )
         self.src_xfer_handles_by_block_size[self.block_size], self.src_blocks_data = (
             self.register_local_xfer_handler(self.block_size)
         )
+        logger.info(
+            "NIXL register_local_xfer_handler completed: tp_rank=%d, "
+            "elapsed_s=%.3f",
+            self.tp_rank,
+            time.perf_counter() - local_handler_start_time,
+        )
 
         # After KV Caches registered, listen for new connections.
+        agent_metadata_start_time = time.perf_counter()
+        logger.info("NIXL get_agent_metadata started: tp_rank=%d", self.tp_rank)
         agent_metadata = NixlAgentMetadata(
             engine_id=self.engine_id,
             agent_metadata=self.nixl_wrapper.get_agent_metadata(),
@@ -1083,6 +1136,13 @@ class NixlBaseConnectorWorker:
         self.xfer_handshake_metadata = NixlHandshakePayload(
             compatibility_hash=self.compat_hash,
             agent_metadata_bytes=encoder.encode(agent_metadata),
+        )
+        logger.info(
+            "NIXL KV registration completed: tp_rank=%d, "
+            "agent_metadata_elapsed_s=%.3f, total_elapsed_s=%.3f",
+            self.tp_rank,
+            time.perf_counter() - agent_metadata_start_time,
+            time.perf_counter() - registration_start_time,
         )
 
     def _build_mamba_local(

@@ -13,7 +13,8 @@
 
 构造 **research/data/mix_source/requests/*.json**：
 
-- **Append 来源**：当前 ANNS 问题在 SQuAD v2 中对应的完整官方 context。
+- **Append 来源**：当前 ANNS 问题在 SQuAD v2 中对应的官方 context；默认完整
+  保留，也可按每个 chunk 的 token 上限截断。
 - **Update 来源**：Stream2LLM ANNS trace 中不断变化的 PipelinePool。
 - **最终问题**：以 prompt_finished 事件保存原始 ANNS 问题。
 - **事件时间**：不写入数据文件，由 replay 的 interval 参数控制。
@@ -46,9 +47,14 @@ SQuAD 官方 context
 └── Append chunk 1：context 后半部分
 ~~~
 
-两个 chunk 合起来完整覆盖官方 context，不会把整篇 article 的全局前两个
-paragraph 当作请求证据，也不会对 SQuAD context 做 token 截断。这一点保证
-当前问题的官方证据不会因为 Append 构建策略而消失。
+默认情况下，两个 chunk 合起来完整覆盖官方 context，不会把整篇 article 的
+全局前两个 paragraph 当作请求证据，也不会对 SQuAD context 做 token 截断。
+这套无损模式用于质量评测。
+
+`--max-append-chunk-tokens` 可为每个格式化后的 Append 事件设置独立 token
+上限，包装标签也计入预算。它适合 4K 上下文窗口的性能实验：超过预算的正文会
+被直接截断并写入 `[truncated]` 标记。启用后官方答案可能落在被删除的后缀，
+因此不能将该数据集用于 SQuAD EM/F1 质量结论。
 
 Append 文本格式为：
 
@@ -94,7 +100,8 @@ ANNS 文档格式为：
 </retrieved_document>
 ~~~
 
-Update 可以设置单文档和整版快照 token 预算；SQuAD Append 不受这些预算影响。
+Update 可以设置单文档和整版快照 token 预算；Append 的上限由独立的
+`--max-append-chunk-tokens` 控制。
 
 ### 最终逻辑 Prompt
 
@@ -342,6 +349,29 @@ MAX_MODEL_LEN=16384
 --max-update-snapshot-tokens 6144
 ~~~
 
+## Qwen 4K 性能数据集
+
+质量评测使用的 `research/data/mix_source` 应保持完整 SQuAD context。若使用
+Qwen2.5-3B 的 4K 窗口做纯性能实验，请写入独立目录，并同时限制两个来源：
+
+~~~shell
+.venv/bin/python \
+  research/scripts/data_processing/build_mixed_source_dataset.py \
+  --anns-dir research/data/anns \
+  --squad-dir research/data/squad_v2 \
+  --output-dir research/data/mix_source_perf_qwen \
+  --start-index 0 \
+  --max-queries 0 \
+  --tokenizer-model ~/Models/Qwen2.5-3B \
+  --max-append-chunk-tokens 256 \
+  --max-anns-document-tokens 256 \
+  --max-update-snapshot-tokens 1536 \
+  --overwrite
+~~~
+
+该配置最多保留两个各 256-token 的 Append chunk，以及 1536-token 的 Update
+snapshot；它不覆盖质量集，也不保证 SQuAD 答案仍被保留。
+
 token 预算使用数据生成时指定的 tokenizer。跨模型实验应尽量复用同一批请求，
 避免因 tokenizer 不同而改变 ANNS 文本内容；回放前再按目标模型检查实际长度。
 
@@ -413,7 +443,8 @@ manifest.jsonl 只索引当前 SQuAD 版本请求。如果日志提示仍存在 
 | --query-id | 未设置 | 显式选择 query id，可重复；设置后忽略位置范围 |
 | --start-index | 0 | 数值排序后的起始位置 |
 | --max-queries | 1 | 最大请求数，0 表示全部 |
-| --tokenizer-model | 未设置 | ANNS token 预算使用的 tokenizer |
+| --tokenizer-model | 未设置 | 所有 token 预算使用的 tokenizer |
+| --max-append-chunk-tokens | 0 | 单个格式化 SQuAD Append 事件上限；0 保留完整 context |
 | --max-anns-document-tokens | 0 | 单个 ANNS 文档上限，0 表示关闭 |
 | --max-update-snapshot-tokens | 0 | 单版 Update 上限，0 表示关闭 |
 | --max-anns-document-chars | 0 | 单个 ANNS 文档字符上限 |

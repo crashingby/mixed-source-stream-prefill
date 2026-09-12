@@ -179,8 +179,17 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help=(
             "Local tokenizer path or locally cached HuggingFace repo used "
-            "only for ANNS token budgets. Required when a --max-*-tokens "
+            "for content token budgets. Required when a --max-*-tokens "
             "budget is enabled."
+        ),
+    )
+    parser.add_argument(
+        "--max-append-chunk-tokens",
+        type=int,
+        default=0,
+        help=(
+            "Truncate each formatted SQuAD Append event to this many "
+            "tokenizer tokens; 0 preserves the complete context."
         ),
     )
     parser.add_argument(
@@ -645,8 +654,24 @@ def _split_squad_context(
 def _format_squad_context_chunk(
     record: SquadContextRecord,
     chunk: SquadContextChunk,
+    max_chunk_tokens: int,
+    tokenizer: Any | None,
 ) -> str:
-    """把一个 SQuAD context 片段包装为独立 Append 文本。"""
+    """把一个 SQuAD context 片段包装并按需裁剪为独立 Append 文本。
+
+    token 上限作用于完整的 REST 请求事件文本，包含 ``squad_context`` 的
+    XML 风格包装。默认上限为零，完整保留 SQuAD context 与官方答案范围；
+    非零预算仅用于需要固定输入上界的性能数据集。
+
+    Args:
+        record: 提供 SQuAD split、title 与 id 等稳定包装元数据的原始记录。
+        chunk: 已按安全边界切出的连续 context 片段。
+        max_chunk_tokens: 单个格式化 Append 事件的 token 上限；零表示不裁剪。
+        tokenizer: 计算 token 预算的 tokenizer；启用上限时必须存在。
+
+    Returns:
+        可直接写入 Append 事件 ``text`` 字段的格式化文本。
+    """
     split = html.escape(record.split, quote=True)
     title = html.escape(record.title, quote=True)
     squad_id = html.escape(record.squad_id, quote=True)
@@ -655,7 +680,16 @@ def _format_squad_context_chunk(
         f'squad_id="{squad_id}" segment="{chunk.chunk_index + 1}/'
         f'{NUM_SQUAD_APPEND_CHUNKS}">\n'
     )
-    return f"{header}{chunk.text}\n</squad_context>\n"
+    footer = "\n</squad_context>\n"
+
+    # 对完整事件施加预算，避免任一 Append chunk 独占 4K 服务的上下文窗口。
+    return _truncate_wrapped_body_by_tokens(
+        header=header,
+        body=chunk.text,
+        footer=footer,
+        max_tokens=max_chunk_tokens,
+        tokenizer=tokenizer,
+    )
 
 
 def _parse_pipeline_pool(raw_pool: str) -> tuple[str, ...]:
@@ -784,11 +818,11 @@ def _truncate_text(text: str, max_chars: int) -> str:
 
 
 def _load_tokenizer(tokenizer_model: str | None) -> Any | None:
-    """按需加载 tokenizer，只用于 ANNS 内容预算。"""
+    """按需加载 tokenizer，用于 Append 与 ANNS 内容预算。"""
     if tokenizer_model is None:
         return None
 
-    # 未启用 token 预算时生成器只依赖 Python 标准库。
+    # 未启用任何 token 预算时，生成器只依赖 Python 标准库。
     from transformers import AutoTokenizer
 
     return AutoTokenizer.from_pretrained(
@@ -1026,6 +1060,8 @@ def _build_sample(
                     "text": _format_squad_context_chunk(
                         squad_record,
                         chunk,
+                        args.max_append_chunk_tokens,
+                        tokenizer,
                     ),
                 },
                 "provenance": {
@@ -1155,6 +1191,8 @@ def _build_sample(
             "context_sha256": context_sha256,
             "num_append_chunks": NUM_SQUAD_APPEND_CHUNKS,
             "context_chars": len(squad_record.context),
+            # 避免把截断性能集误认为完整上下文质量集。
+            "append_chunk_token_budget": args.max_append_chunk_tokens,
         },
         "provenance": {
             "base_dataset": "stream2llm-data/anns",
@@ -1396,8 +1434,10 @@ def _write_dataset_metadata(
             "dataset": "squad_v2",
             "num_chunks_per_request": NUM_SQUAD_APPEND_CHUNKS,
             "split_strategy": "balanced_sentence_boundary",
-            "preserve_complete_context": True,
-            "preserve_answer_spans": True,
+            # 零预算是质量评测使用的无损模式；非零预算只保证事件长度上界。
+            "preserve_complete_context": args.max_append_chunk_tokens == 0,
+            "preserve_answer_spans": args.max_append_chunk_tokens == 0,
+            "max_append_chunk_tokens": args.max_append_chunk_tokens,
         },
         "update_source": {
             "dataset": "stream2llm-data/anns",
@@ -1405,6 +1445,7 @@ def _write_dataset_metadata(
         },
         "generation_defaults": {
             "max_anns_document_chars": args.max_anns_document_chars,
+            "max_append_chunk_tokens": args.max_append_chunk_tokens,
             "max_anns_document_tokens": args.max_anns_document_tokens,
             "max_update_snapshot_tokens": args.max_update_snapshot_tokens,
             "tokenizer_model": args.tokenizer_model,
@@ -1423,6 +1464,7 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--temperature must be non-negative.")
     non_negative_fields = (
         "max_anns_document_chars",
+        "max_append_chunk_tokens",
         "max_anns_document_tokens",
         "max_update_snapshot_tokens",
     )
@@ -1432,6 +1474,7 @@ def _validate_args(args: argparse.Namespace) -> None:
             raise ValueError(f"--{option_name} must be non-negative.")
 
     token_budget_fields = (
+        "max_append_chunk_tokens",
         "max_anns_document_tokens",
         "max_update_snapshot_tokens",
     )
@@ -1440,7 +1483,7 @@ def _validate_args(args: argparse.Namespace) -> None:
         and args.tokenizer_model is None
     ):
         raise ValueError(
-            "--tokenizer-model is required when token-level ANNS budgets "
+            "--tokenizer-model is required when token-level content budgets "
             "are enabled."
         )
     if not args.prefix:

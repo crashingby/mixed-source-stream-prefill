@@ -26,13 +26,37 @@ NIXL_SIDE_CHANNEL_HOST="${VLLM_NIXL_SIDE_CHANNEL_HOST:-$(hostname)}"
 GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.65}"
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-4096}"
 MAX_NUM_SEQS="${MAX_NUM_SEQS:-16}"
+TENSOR_PARALLEL_SIZE="${TENSOR_PARALLEL_SIZE:-1}"
+if ! [[ "${TENSOR_PARALLEL_SIZE}" =~ ^[1-9][0-9]*$ ]]; then
+  echo "TENSOR_PARALLEL_SIZE must be a positive integer, got: ${TENSOR_PARALLEL_SIZE}" >&2
+  exit 2
+fi
+ATTENTION_BACKEND="${ATTENTION_BACKEND:-}"
+ENABLE_KV_TRANSFER="${ENABLE_KV_TRANSFER:-1}"
+if [[ "${ENABLE_KV_TRANSFER}" != "0" && "${ENABLE_KV_TRANSFER}" != "1" ]]; then
+  echo "ENABLE_KV_TRANSFER must be 0 or 1, got: ${ENABLE_KV_TRANSFER}" >&2
+  exit 2
+fi
 PROMPT_STREAM_UPDATE_COALESCING_CONFIG="${PROMPT_STREAM_UPDATE_COALESCING_CONFIG:-}"
+
+ATTENTION_ARGS=()
+if [[ -n "${ATTENTION_BACKEND}" ]]; then
+  ATTENTION_ARGS=(--attention-backend "${ATTENTION_BACKEND}")
+fi
 
 COALESCING_ARGS=()
 if [[ -n "${PROMPT_STREAM_UPDATE_COALESCING_CONFIG}" ]]; then
   COALESCING_ARGS=(
     --prompt-stream-update-coalescing-config
     "${PROMPT_STREAM_UPDATE_COALESCING_CONFIG}"
+  )
+fi
+
+KV_TRANSFER_ARGS=()
+if [[ "${ENABLE_KV_TRANSFER}" == "1" ]]; then
+  KV_TRANSFER_ARGS=(
+    --kv-transfer-config
+    '{"kv_connector":"NixlConnector","kv_role":"kv_producer","kv_load_failure_policy":"fail"}'
   )
 fi
 
@@ -48,6 +72,9 @@ echo "CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-}"
 echo "SLURM_JOB_GPUS=${SLURM_JOB_GPUS:-}"
 echo "MODEL_PATH=${MODEL_PATH}"
 echo "SERVED_MODEL_NAME=${SERVED_MODEL_NAME}"
+echo "TENSOR_PARALLEL_SIZE=${TENSOR_PARALLEL_SIZE}"
+echo "ATTENTION_BACKEND=${ATTENTION_BACKEND:-auto}"
+echo "ENABLE_KV_TRANSFER=${ENABLE_KV_TRANSFER}"
 echo "PROMPT_STREAM_UPDATE_COALESCING_CONFIG=${PROMPT_STREAM_UPDATE_COALESCING_CONFIG:-disabled}"
 
 echo "=== nvidia-smi before vLLM startup ==="
@@ -70,9 +97,11 @@ VLLM_NIXL_SIDE_CHANNEL_PORT="${NIXL_SIDE_CHANNEL_PORT}" \
   --gpu-memory-utilization "${GPU_MEMORY_UTILIZATION}" \
   --max-model-len "${MAX_MODEL_LEN}" \
   --max-num-seqs "${MAX_NUM_SEQS}" \
+  --tensor-parallel-size "${TENSOR_PARALLEL_SIZE}" \
   --host "${HOST}" \
   --port "${PORT}" \
   --enforce-eager \
   --no-async-scheduling \
+  "${ATTENTION_ARGS[@]}" \
   "${COALESCING_ARGS[@]}" \
-  --kv-transfer-config '{"kv_connector":"NixlConnector","kv_role":"kv_producer","kv_load_failure_policy":"fail"}'
+  "${KV_TRANSFER_ARGS[@]}"

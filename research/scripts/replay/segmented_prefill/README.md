@@ -8,7 +8,16 @@
 - `replay_normal.py`：把最终完整 prompt 一次性发送给普通 completions API。
 - `replay_common.py`：三个入口共用的内部实现，不直接运行。
 
-三个脚本都只配置 `--proxy-url`。
+## 模型模板与分段编码
+
+所有模式必须传入 `--tokenizer-model`，且它必须与 P 节点实际加载模型的 tokenizer 对应。共享层按下列规则构造请求：
+
+- `start_request.prompt` 作为 system message；Append、最终 Update 和 finish 文本按顺序组成一个 user message。
+- 使用目标模型 `apply_chat_template()` 和唯一 marker 拆出固定 template prefix/suffix；start、每个 data event 和 finish 都通过 `token_ids` 发送。
+- normal 也提交同一组分段 token ids 的串接结果。因此 Llama 的 BOS、assistant header 与模板边界在三种模式中一致。
+- generation-quality 专用的“最短答案”指令不会在性能回放层额外注入；性能 prompt 的最终问题仍完全由数据集 finish 文本决定。
+
+三个脚本都需要配置 `--proxy-url` 和 `--tokenizer-model`。
 
 ## proxy 支持的路径
 
@@ -118,6 +127,7 @@ chunk，并通过 `--max-anns-document-tokens` 和
 .venv/bin/python research/scripts/replay/segmented_prefill/replay_prompt_stream.py \
   --data-dir research/data/mix_source \
   --query-id 0 \
+  --tokenizer-model <TOKENIZER_MODEL> \
   --dry-run \
   --run-name dry-stream-query-0
 ```
@@ -126,6 +136,7 @@ chunk，并通过 `--max-anns-document-tokens` 和
 .venv/bin/python research/scripts/replay/segmented_prefill/replay_normal.py \
   --data-dir research/data/mix_source \
   --query-id 0 \
+  --tokenizer-model <TOKENIZER_MODEL> \
   --dry-run \
   --run-name dry-normal-query-0
 ```
@@ -134,6 +145,7 @@ chunk，并通过 `--max-anns-document-tokens` 和
 .venv/bin/python research/scripts/replay/segmented_prefill/replay_merged_update.py \
   --data-dir research/data/mix_source \
   --query-id 0 \
+  --tokenizer-model <TOKENIZER_MODEL> \
   --dry-run \
   --run-name dry-merged-update-query-0
 ```
@@ -148,6 +160,7 @@ chunk，并通过 `--max-anns-document-tokens` 和
   --query-id 0 \
   --proxy-url http://<PROXY_HOST>:8000 \
   --model <SERVED_MODEL_NAME> \
+  --tokenizer-model <TOKENIZER_MODEL> \
   --qps 0 \
   --max-concurrency 1 \
   --append-chunk-interval 0.05 \
@@ -167,6 +180,7 @@ chunk，并通过 `--max-anns-document-tokens` 和
   --max-requests 100 \
   --proxy-url http://<PROXY_HOST>:8000 \
   --model <SERVED_MODEL_NAME> \
+  --tokenizer-model <TOKENIZER_MODEL> \
   --qps 1.0 \
   --arrival-process poisson \
   --random-seed 2026 \
@@ -192,6 +206,7 @@ chunk，并通过 `--max-anns-document-tokens` 和
   --max-requests 100 \
   --proxy-url http://<PROXY_HOST>:8000 \
   --model <SERVED_MODEL_NAME> \
+  --tokenizer-model <TOKENIZER_MODEL> \
   --qps 1.0 \
   --arrival-process poisson \
   --random-seed 2026 \
@@ -216,6 +231,7 @@ chunk，并通过 `--max-anns-document-tokens` 和
   --max-requests 100 \
   --proxy-url http://<PROXY_HOST>:8000 \
   --model <SERVED_MODEL_NAME> \
+  --tokenizer-model <TOKENIZER_MODEL> \
   --qps 1.0 \
   --arrival-process poisson \
   --random-seed 2026 \
@@ -240,6 +256,7 @@ for qps in 0.5 1 2 4; do
     --max-requests 512 \
     --proxy-url http://<PROXY_HOST>:8000 \
     --model <SERVED_MODEL_NAME> \
+    --tokenizer-model <TOKENIZER_MODEL> \
     --qps "${qps}" \
     --arrival-process poisson \
     --random-seed 2026 \
@@ -289,6 +306,7 @@ mkdir -p research/scripts/logs
 ```shell
 PROXY_URL=http://<PROXY_HOST>:8000 \
 MODEL=<SERVED_MODEL_NAME> \
+TOKENIZER_MODEL=<TOKENIZER_MODEL> \
 sbatch research/scripts/replay/segmented_prefill/run_ttft_qps_sweep.sbatch
 ```
 
@@ -299,6 +317,7 @@ DATA_DIR=research/data/mix_source \
 OUTPUT_DIR=research/scripts/replay/segmented_prefill/results \
 PROXY_URL=http://<PROXY_HOST>:8000 \
 MODEL=<SERVED_MODEL_NAME> \
+TOKENIZER_MODEL=<TOKENIZER_MODEL> \
 MAX_REQUESTS=512 \
 QPS_LIST="0.5 1 2 4" \
 ARRIVAL_PROCESS=poisson \
@@ -315,6 +334,48 @@ SSE_TIMEOUT=120 \
 RUN_PREFIX=ttft \
 sbatch research/scripts/replay/segmented_prefill/run_ttft_qps_sweep.sbatch
 ```
+
+
+### 使用 Triton backend 重跑
+
+attention backend 由 P/D server 启动时全局决定；replay client 不能按请求切换。两个启动脚本现已接受可选的 `ATTENTION_BACKEND` 环境变量。保留既有 FA 结果目录，并使用独立的 `RUN_PREFIX=triton-ttft`：
+
+```shell
+ATTENTION_BACKEND=TRITON_ATTN \
+MODEL_PATH=<MODEL_PATH> \
+SERVED_MODEL_NAME=<SERVED_MODEL_NAME> \
+GPU_MEMORY_UTILIZATION=<GPU_UTIL> \
+MAX_MODEL_LEN=4096 \
+MAX_NUM_SEQS=16 \
+sbatch --nodelist=<P_HOST> research/scripts/server/start_p_node.sbatch
+```
+
+若之后测量完整 P/D transfer 与 decode，D 节点也以同样的 `ATTENTION_BACKEND=TRITON_ATTN` 重启。当前 sweep 全部使用 `--ttft-only`，首 token 只由 P 节点生成，D 不会实际进行 KV load；但三种模式都必须通过同一个 Triton P 节点运行。
+
+```shell
+DATA_DIR=research/data/mix_source \
+OUTPUT_DIR=research/scripts/replay/segmented_prefill/results \
+PROXY_URL=http://<PROXY_HOST>:8000 \
+MODEL=<SERVED_MODEL_NAME> \
+TOKENIZER_MODEL=<TOKENIZER_MODEL> \
+MAX_REQUESTS=512 \
+QPS_LIST="0.5 1 2 4" \
+ARRIVAL_PROCESS=poisson \
+RANDOM_SEED=2026 \
+MAX_CONCURRENCY=8 \
+APPEND_INITIAL_DELAY=0.0 \
+UPDATE_INITIAL_DELAY=0.0 \
+APPEND_CHUNK_INTERVAL=0.5 \
+UPDATE_CHUNK_INTERVAL=0.2 \
+SOURCE_FINISH_DELAY=0.0 \
+MAX_TOKENS=64 \
+TEMPERATURE=0 \
+SSE_TIMEOUT=120 \
+RUN_PREFIX=triton-ttft \
+sbatch research/scripts/replay/segmented_prefill/run_ttft_qps_sweep.sbatch
+```
+
+该命令依次写入 `triton-ttft-stream-*`、`triton-ttft-merged-update-*` 和 `triton-ttft-normal-*`。它们应与旧的 `ttft-*` FA/auto 结果分开画图和汇总。
 
 输出目录名形如：
 
@@ -336,7 +397,8 @@ mkdir -p research/scripts/logs
 DATA_DIR=research/data/mix_source \
 OUTPUT_DIR=research/scripts/replay/segmented_prefill/results \
 PROXY_URL=http://g2c14:8000 \
-MODEL=qwen2.5-3b \
+MODEL=llama-3.1-8b-instruct \
+TOKENIZER_MODEL=/workplace/home/huangxinying/Models/Llama-3.1-8B-Instruct \
 MAX_REQUESTS=512 \
 QPS_LIST="0.5 1 2 4" \
 ARRIVAL_PROCESS=poisson \
@@ -401,6 +463,7 @@ done
 | `--include-partial` | 关闭 | 允许使用 `status != complete` 的样本。 |
 | `--proxy-url` | `http://127.0.0.1:8000` | 三种模式共同使用的 proxy 地址。 |
 | `--model` | `qwen2.5-3b` | 必须匹配服务端的 `--served-model-name`。 |
+| `--tokenizer-model` | 必填 | 本地模型/tokenizer 目录；必须与 `--model` 对应的 P 模型使用同一 chat template。 |
 | `--qps` | `1.0` | 逻辑请求启动速率；`0` 表示闭环串行。 |
 | `--arrival-process` | `fixed` | 使用固定间隔或 `poisson` 泊松到达。 |
 | `--max-concurrency` | `1` | 同时在飞的逻辑请求上限。 |
