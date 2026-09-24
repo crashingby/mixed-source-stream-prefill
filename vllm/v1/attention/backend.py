@@ -389,6 +389,10 @@ class CommonAttentionMetadata:
 
     causal: bool | torch.Tensor = True
 
+    # 每个请求的物理 KV 空洞 [start, end)；None 保持普通 attention 路径。
+    # [0, 0] 表示该 batch 行没有 padding，坐标始终与 block table 一致。
+    prompt_stream_padding_ranges: torch.Tensor | None = None
+
     # Needed by FastPrefillAttentionBuilder
     logits_indices_padded: torch.Tensor | None = None
     num_logits_indices: int | None = None
@@ -507,6 +511,9 @@ class CommonAttentionMetadata:
             dcp_local_seq_lens=maybe_slice_reqs(self.dcp_local_seq_lens),
             dcp_local_seq_lens_cpu=maybe_slice_reqs(self.dcp_local_seq_lens_cpu),
             is_prefilling=maybe_slice_reqs(self.is_prefilling),
+            prompt_stream_padding_ranges=maybe_slice_reqs(
+                self.prompt_stream_padding_ranges
+            ),
         )
 
 

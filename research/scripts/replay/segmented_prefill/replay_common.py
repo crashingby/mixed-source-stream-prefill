@@ -85,6 +85,15 @@ REQUEST_METRIC_FIELDS = (
     "normal_prompt_chars",
     "completion_chars",
     "completion_chunks",
+    "completion_tokens",
+    "completion_token_count_exact",
+    "time_to_last_token_ms",
+    "mean_time_per_output_token_ms",
+    "output_tokens_per_second",
+    "masked_padding_expected",
+    "masked_padding_observed",
+    "masked_padding_validation_status",
+    "masked_padding_tokens",
     "coalescing_enabled",
     "actual_p_node_coalescing_config_json",
     "update_events_accepted",
@@ -335,6 +344,15 @@ class RequestMetric:
     normal_prompt_chars: int = 0
     completion_chars: int = 0
     completion_chunks: int = 0
+    completion_tokens: int = 0
+    completion_token_count_exact: bool = False
+    time_to_last_token_ms: float | None = None
+    mean_time_per_output_token_ms: float | None = None
+    output_tokens_per_second: float | None = None
+    masked_padding_expected: str = "any"
+    masked_padding_observed: bool | None = None
+    masked_padding_validation_status: str = "not_evaluated"
+    masked_padding_tokens: int | None = None
     coalescing_enabled: bool | None = None
     actual_p_node_coalescing_config_json: str | None = None
     update_events_accepted: int | None = None
@@ -390,8 +408,12 @@ class SseMeasurement:
     completed_time: float
     completion_chars: int
     completion_chunks: int
+    completion_tokens: int
+    completion_token_count_exact: bool
+    last_token_time: float
     payloads: tuple[dict[str, Any], ...]
     prompt_stream_stats: dict[str, Any] | None
+    masked_padding_manifest: dict[str, int] | None
 
 
 ReplaySample = Callable[
@@ -949,6 +971,24 @@ def parse_args(mode: ReplayMode) -> argparse.Namespace:
         help="Save parsed SSE response payloads per request for debugging.",
     )
     parser.add_argument(
+        "--return-token-ids",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Request delta token IDs in completion SSE chunks. Enable this "
+            "for exact output-token throughput and TPOT measurement."
+        ),
+    )
+    parser.add_argument(
+        "--expected-masked-padding",
+        choices=("any", "enabled", "disabled"),
+        default="any",
+        help=(
+            "Validate whether the first prompt-stream SSE payload carries "
+            "the masked-padding manifest expected from the active P node."
+        ),
+    )
+    parser.add_argument(
         "--ttft-only",
         action="store_true",
         help=(
@@ -1402,7 +1442,11 @@ def _limit_selected_samples(
 
 def _is_first_token_choice(choice: dict[str, Any]) -> bool:
     """判断一个 OpenAI SSE choice 是否实际代表一个生成 token。"""
-    if "token_ids" in choice and isinstance(choice["token_ids"], list):
+    if (
+        "token_ids" in choice
+        and isinstance(choice["token_ids"], list)
+        and choice["token_ids"]
+    ):
         return True
     if "text" in choice:
         # 仅有 final finish_reason 的空 completion chunk 不应伪装成首 token。
@@ -1456,8 +1500,13 @@ async def _consume_sse_response(
     first_token_origin: str | None = None
     completion_chars = 0
     completion_chunks = 0
+    completion_tokens = 0
+    token_count_is_exact = True
+    saw_token_id_metadata = False
+    last_token_time: float | None = None
     payloads: list[dict[str, Any]] = []
     prompt_stream_stats: dict[str, Any] | None = None
+    masked_padding_manifest: dict[str, int] | None = None
     async for line in response.aiter_lines():
         if not line.startswith("data:"):
             continue
@@ -1490,6 +1539,35 @@ async def _consume_sse_response(
             # 独立保存统计，避免 --ttft-only 且未保存 payload 时丢失首帧字段。
             prompt_stream_stats = dict(raw_stats)
 
+        raw_padding = payload.get("prompt_stream_masked_padding")
+        if raw_padding is not None:
+            if (
+                not isinstance(raw_padding, dict)
+                or set(raw_padding) != {"version", "start", "end"}
+                or any(
+                    type(raw_padding[field_name]) is not int
+                    for field_name in ("version", "start", "end")
+                )
+                or raw_padding["version"] != 1
+                or not 0 <= raw_padding["start"] <= raw_padding["end"]
+            ):
+                raise ReplayHttpError(
+                    "SSE prompt_stream_masked_padding must be a valid v1 range."
+                )
+            normalized_padding = {
+                field_name: int(raw_padding[field_name])
+                for field_name in ("version", "start", "end")
+            }
+            if (
+                masked_padding_manifest is not None
+                and masked_padding_manifest != normalized_padding
+            ):
+                raise ReplayHttpError(
+                    "One SSE response returned inconsistent masked-padding "
+                    "manifests."
+                )
+            masked_padding_manifest = normalized_padding
+
         choices = payload.get("choices")
         if not isinstance(choices, list):
             continue
@@ -1497,23 +1575,46 @@ async def _consume_sse_response(
             if not isinstance(choice, dict):
                 continue
             if _is_first_token_choice(choice):
+                token_arrival_time = time.perf_counter()
                 if first_token_time is None:
-                    first_token_time = time.perf_counter()
+                    first_token_time = token_arrival_time
                     first_token_origin = (
                         "prefill" if "token_ids" in choice else "decode"
                     )
                 completion_chunks += 1
                 completion_chars += len(_chunk_text(choice))
+                raw_token_ids = choice.get("token_ids")
+                if isinstance(raw_token_ids, list):
+                    if not all(type(token_id) is int for token_id in raw_token_ids):
+                        raise ReplayHttpError(
+                            "Completion SSE token_ids must contain integers."
+                        )
+                    saw_token_id_metadata = True
+                    completion_tokens += len(raw_token_ids)
+                else:
+                    # 未请求 token_ids 时只能以非空 SSE choice 近似一个 token；
+                    # 该数值不得进入正式 TPS 结果。
+                    token_count_is_exact = False
+                    completion_tokens += 1
+                last_token_time = token_arrival_time
                 if ttft_only:
                     completed_time = time.perf_counter()
+                    assert first_token_time is not None
+                    assert last_token_time is not None
                     return SseMeasurement(
                         first_token_time=first_token_time,
                         first_token_origin=first_token_origin,
                         completed_time=completed_time,
                         completion_chars=completion_chars,
                         completion_chunks=completion_chunks,
+                        completion_tokens=completion_tokens,
+                        completion_token_count_exact=(
+                            token_count_is_exact and saw_token_id_metadata
+                        ),
+                        last_token_time=last_token_time,
                         payloads=tuple(payloads),
                         prompt_stream_stats=prompt_stream_stats,
+                        masked_padding_manifest=masked_padding_manifest,
                     )
 
     completed_time = time.perf_counter()
@@ -1521,14 +1622,21 @@ async def _consume_sse_response(
         raise ReplayHttpError("SSE response ended before emitting a completion token.")
     if first_token_time < first_token_start_time:
         raise AssertionError("First token time cannot precede TTFT start time.")
+    assert last_token_time is not None
     return SseMeasurement(
         first_token_time=first_token_time,
         first_token_origin=first_token_origin,
         completed_time=completed_time,
         completion_chars=completion_chars,
         completion_chunks=completion_chunks,
+        completion_tokens=completion_tokens,
+        completion_token_count_exact=(
+            token_count_is_exact and saw_token_id_metadata
+        ),
+        last_token_time=last_token_time,
         payloads=tuple(payloads),
         prompt_stream_stats=prompt_stream_stats,
+        masked_padding_manifest=masked_padding_manifest,
     )
 
 
@@ -1727,6 +1835,23 @@ def _summarize_metrics(metrics: Sequence[RequestMetric]) -> dict[str, Any]:
             and metric.finish_to_first_token_ms is not None
         ]
         numeric_ttfts = [float(ttft) for ttft in successful_ttfts]
+        numeric_tpots = [
+            float(metric.mean_time_per_output_token_ms)
+            for metric in mode_metrics
+            if metric.completion_token_count_exact
+            and metric.mean_time_per_output_token_ms is not None
+        ]
+        numeric_output_tps = [
+            float(metric.output_tokens_per_second)
+            for metric in mode_metrics
+            if metric.completion_token_count_exact
+            and metric.output_tokens_per_second is not None
+        ]
+        total_exact_output_tokens = sum(
+            metric.completion_tokens
+            for metric in mode_metrics
+            if metric.completion_token_count_exact
+        )
         transport_success_metrics = [
             metric
             for metric in mode_metrics
@@ -1798,6 +1923,25 @@ def _summarize_metrics(metrics: Sequence[RequestMetric]) -> dict[str, Any]:
                 "p95": _percentile(numeric_ttfts, 95),
                 "p99": _percentile(numeric_ttfts, 99),
                 "max": max(numeric_ttfts) if numeric_ttfts else None,
+            },
+            "tpot_ms": {
+                "mean": statistics.fmean(numeric_tpots) if numeric_tpots else None,
+                "p50": _percentile(numeric_tpots, 50),
+                "p90": _percentile(numeric_tpots, 90),
+                "p95": _percentile(numeric_tpots, 95),
+                "p99": _percentile(numeric_tpots, 99),
+            },
+            "output_tokens_per_second": {
+                "mean": (
+                    statistics.fmean(numeric_output_tps)
+                    if numeric_output_tps
+                    else None
+                ),
+                "p50": _percentile(numeric_output_tps, 50),
+                "p90": _percentile(numeric_output_tps, 90),
+                "p95": _percentile(numeric_output_tps, 95),
+                "num_exact_requests": len(numeric_output_tps),
+                "total_exact_output_tokens": total_exact_output_tokens,
             },
             "prompt_stream_stats": {
                 "update_events_accepted": total_accepted,

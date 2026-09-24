@@ -1,5 +1,67 @@
 # 分段 KV 中间 Padding 的 Masked Attention 调研
 
+## 实现状态与启用方式（2026-09）
+
+本文的 Triton 第一版已接入源码。下文保留原始问题分析与设计动机；其中
+“当前不支持”描述的是修改前的通用接口。现在使用显式开关启用：
+
+```shell
+--attention-backend TRITON_ATTN --prompt-stream-masked-padding --no-async-scheduling
+```
+
+现有 `research/scripts/server/start_p_node.sbatch` 和 `start_d_node.sbatch`
+均接受 `PROMPT_STREAM_MASKED_PADDING=1`，默认 `0` 保持历史近似。完整 PD
+生成时 P/D 都要开启，proxy 要重启到新代码。TTFT-only 可以在 P 上同时设置
+`ENABLE_KV_TRANSFER=0`，P 仍返回布局描述，但不会设置远端加载标记。
+
+实际接口与行为如下：
+
+| 层次 | 已实现接口 | 行为 |
+| --- | --- | --- |
+| Request | `PromptStreamExecutionView.padding_range` | 随 active work 冻结半开物理区间；新 Append 切换视图时更新旧 padding 边界。 |
+| 调度传输 | `NewRequestData.prompt_stream_padding_range` | 新请求及 worker refresh 完整传递；区间不变的 cached step 继续使用旧值，无需重复发送。 |
+| Worker | `CachedRequestState`、`InputBatch.prompt_stream_padding_ranges` | 添加、删除、交换、压缩及恢复时同步范围。 |
+| 坐标 | `GPUModelRunner.positions` / `model_positions` | 前者保留物理 token/KV 坐标，后者只对 padding 之后的真实 token 减去空洞长度。 |
+| Attention | `CommonAttentionMetadata.prompt_stream_padding_ranges` | 每请求两个 int32；启用时使用固定 GPU buffer，覆盖 batch 混排与 CUDA Graph。 |
+| Triton | `compute_kv_seq_mask()` / `unified_attention()` | 最外层 `AND not_padding`，并屏蔽 padding K/V 读取，处理全空 tile/softmax 分片以避免 NaN。 |
+| P/D | `kv_transfer_params.prompt_stream_masked_padding` | `{version: 1, start: L, end: L+r}`，同时传递逻辑/物理长度；block IDs 和已计算物理长度不变。 |
+
+`positions` 没有在源码中重命名为 `cache_positions`，但其职责已限制为原有
+物理坐标。模型 forward 使用独立的 `model_positions`；不会用修正后的 RoPE
+位置寻找 KV slot。普通请求的区间为空；关闭开关时模型位置直接别名到物理
+位置，attention 不接收 padding tensor。
+
+首版限于文本 decoder、全因果 attention、普通一维位置编码和 `TRITON_ATTN`。
+同步调度、PP=1、无 context parallel/speculative decode；同节点 TP 可沿用相同
+区间。自动选择 runner 时使用 V1；显式强制 V2 会报错。MLA、混合状态模型、
+滑窗、ALiBi、多维 RoPE、多模态及非因果路径明确拒绝。非默认词频惩罚与
+prompt logprobs 暂不支持，因为其输入仍是物理 token 序列。完整 PD 的
+`--disable-kv-transfer` 诊断分支也拒绝 masked 请求，避免丢失坐标语义。
+
+长度闸门目前仍保守限制物理 prompt 加输出所需容量，未放宽 `MAX_MODEL_LEN`；
+逻辑长度另以 `prompt_stream_logical_prompt_len` 报告。API `usage` 的历史
+物理计数口径不作为 mask 正确性的依据，也不用于推断空洞。两种长度必须
+使用各自明确字段，不从重复 token ID 猜测。
+
+已验证 Request/work 冻结、恢复、manifest 校验、worker 行重排及 proxy
+JSON/SSE 透传；A30 上 27 项 Triton 单算子测试通过，含 prefill/decode、
+零空洞、NaN padding、全空分片、CUDA Graph 区间变化及 NIXL HND 布局。
+其中包括真实 worker 位置转换与 RoPE、attention 联合计算，和删除 padding 的
+连续序列对照。没有启动 vLLM 服务，
+完整模型 logits、NIXL 跨节点生成及性能重测尚待验证。测试入口：
+
+```shell
+.venv/bin/python -m pytest \
+  tests/v1/test_prompt_stream_masked_padding.py \
+  tests/v1/worker/test_prompt_stream_padding.py \
+  tests/v1/test_prompt_stream_masked_padding_proxy.py \
+  tests/kernels/attention/test_triton_prompt_stream_padding.py -q
+```
+
+数学等价对照需固定相同 Append 上下文，例如先完成 Append，再做最终 Update
+与 Question。任意到达顺序下保留的旧 Update KV 仍存在 Append-after-Update
+近似，单独消除 padding 不会修复这些旧 KV 的上下文及位置。
+
 ## 结论摘要
 
 当前分段流式 Prefill 的物理序列为：

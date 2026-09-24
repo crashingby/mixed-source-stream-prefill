@@ -481,6 +481,21 @@ class AsyncLLM(EngineClient):
             )
             prompt_text, _, _ = extract_prompt_components(self.model_config, prompt)
 
+        # Masked padding 只改变 attention/RoPE；这些特性会读取物理 token
+        # 历史，尚不能把段间填充从词频与 prompt logprob 中排除。
+        params = request.sampling_params
+        if self.vllm_config.scheduler_config.prompt_stream_masked_padding and (
+            params is None
+            or params.prompt_logprobs is not None
+            or params.repetition_penalty != 1.0
+            or params.presence_penalty != 0.0
+            or params.frequency_penalty != 0.0
+        ):
+            raise ValueError(
+                "Masked-padding prompt streams require sampling without prompt "
+                "logprobs or non-default repetition/presence/frequency penalties."
+            )
+
         self.input_processor.assign_request_id(request)
         request.prompt_stream_event = PromptStreamEvent(
             request_id=request.request_id,

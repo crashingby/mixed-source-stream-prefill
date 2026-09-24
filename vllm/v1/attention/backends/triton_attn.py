@@ -93,6 +93,8 @@ class TritonAttentionMetadata:
     prefix_scheduler_metadata: torch.Tensor | None = None
     mm_prefix_range: dict[int, list[tuple[int, int]]] | None = None
     mm_prefix_range_tensor: torch.Tensor | None = None
+    # shape=[num_reqs, 2]，只屏蔽物理 KV 中的区间，不改变 block table。
+    prompt_stream_padding_ranges: torch.Tensor | None = None
 
 
 class TritonAttentionMetadataBuilder(AttentionMetadataBuilder[TritonAttentionMetadata]):
@@ -198,6 +200,15 @@ class TritonAttentionMetadataBuilder(AttentionMetadataBuilder[TritonAttentionMet
 
         use_cascade = common_prefix_len > 0
 
+        # Cascade 会改写 key 坐标，第一版不能复用原物理 padding 区间。
+        if (
+            common_attn_metadata.prompt_stream_padding_ranges is not None
+            and use_cascade
+        ):
+            raise ValueError(
+                "Masked prompt padding does not support cascade attention."
+            )
+
         if use_cascade:
             cu_prefix_query_lens = torch.tensor(
                 [0, num_actual_tokens], dtype=torch.int32, device=self.device
@@ -233,6 +244,9 @@ class TritonAttentionMetadataBuilder(AttentionMetadataBuilder[TritonAttentionMet
             softmax_segm_output=self.softmax_segm_output,
             softmax_segm_max=self.softmax_segm_max,
             softmax_segm_expsum=self.softmax_segm_expsum,
+            prompt_stream_padding_ranges=(
+                common_attn_metadata.prompt_stream_padding_ranges
+            ),
         )
 
         mm_ranges = common_attn_metadata.mm_req_doc_ranges
@@ -563,6 +577,13 @@ class TritonAttentionImpl(AttentionImpl):
 
         assert attn_metadata.use_cascade is False
 
+        # Encoder/cross attention 的 key 坐标不对应 decoder 的分段 KV。
+        if (
+            attn_metadata.prompt_stream_padding_ranges is not None
+            and self.attn_type != AttentionType.DECODER
+        ):
+            raise ValueError("Masked prompt padding requires decoder self-attention.")
+
         # IMPORTANT!
         # NOTE(woosuk): With piece-wise CUDA graphs, this method is executed in
         # eager-mode PyTorch. Thus, we need to be careful about any CPU overhead
@@ -671,6 +692,7 @@ class TritonAttentionImpl(AttentionImpl):
             v_scale_cache=v_scale_cache,
             chunk_lookback=self.chunk_lookback,
             use_td=self.use_td,
+            prompt_stream_padding_ranges=attn_metadata.prompt_stream_padding_ranges,
         )
 
         return output

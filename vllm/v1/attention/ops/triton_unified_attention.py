@@ -274,6 +274,9 @@ def kernel_unified_attention(
     USE_TD: tl.constexpr = False,
     USE_TD_QO: tl.constexpr = False,
     Q_IS_FP8: tl.constexpr = False,
+    # 请求级物理 padding 区间；关闭时相关 load 和 mask 被编译期删除。
+    prompt_stream_padding_ranges_ptr=None,
+    USE_PROMPT_STREAM_PADDING: tl.constexpr = False,
 ):
     USE_PER_TOKEN_HEAD_SCALES: tl.constexpr = KV_QUANT_MODE >= 2
     USE_FP8_Q_DESCALE: tl.constexpr = KV_QUANT_MODE == 1 and Q_IS_FP8
@@ -300,6 +303,13 @@ def kernel_unified_attention(
 
     if q_block_local_idx * BLOCK_Q >= cur_batch_query_len:
         return
+
+    padding_start = 0
+    padding_end = 0
+    if USE_PROMPT_STREAM_PADDING:
+        # 每个 program 只读取本请求的一对边界，避免构造稠密 attention mask。
+        padding_start = tl.load(prompt_stream_padding_ranges_ptr + seq_idx * 2)
+        padding_end = tl.load(prompt_stream_padding_ranges_ptr + seq_idx * 2 + 1)
 
     if IS_3D:
         tiles_per_segment = cdiv_fn(seq_len, NUM_SEGMENTS_PER_SEQ * TILE_SIZE)
@@ -402,6 +412,9 @@ def kernel_unified_attention(
     for j in range(loop_lo, loop_hi):
         seq_offset = j * TILE_SIZE + offs_t
         tile_mask = seq_offset < max_seq_prefix_len
+        if USE_PROMPT_STREAM_PADDING:
+            # KV 空洞本身也不读取，防止 padding 中的 NaN 经 0*V 污染结果。
+            tile_mask &= (seq_offset < padding_start) | (seq_offset >= padding_end)
 
         physical_block_idx = tl.load(
             block_tables_ptr + block_table_offset + seq_offset // BLOCK_SIZE
@@ -471,6 +484,10 @@ def kernel_unified_attention(
                 mask=dim_mask[None, :] & tile_mask[:, None],
                 other=0.0,
             )
+        if USE_PROMPT_STREAM_PADDING and USE_TD:
+            # Tensor descriptor 总是整 tile 读取，需要在 dot 之前清空空洞。
+            K_load = tl.where(tile_mask[None, :], K_load, 0.0)
+            V_load = tl.where(tile_mask[:, None], V_load, 0.0)
         K = _cast_kv_tile(K_load, Q, k_scale, KV_QUANT_MODE)
         V = _cast_kv_tile(V_load, Q, v_scale, KV_QUANT_MODE)
 
@@ -508,6 +525,9 @@ def kernel_unified_attention(
             per_seq_causal_ptr,
             CHUNK_LOOKBACK,
             CHUNK_SIZE,
+            USE_PROMPT_STREAM_PADDING,
+            padding_start,
+            padding_end,
         )
 
         # S : (BLOCK_M, TILE_SIZE)
@@ -536,7 +556,7 @@ def kernel_unified_attention(
                 qq_bias_row_ptrs, seq_offset, context_len, qq_bias_stride_0
             )
 
-        M, L, P, alpha = softmax_step(S, M, L)
+        M, L, P, alpha = softmax_step(S, M, L, USE_PROMPT_STREAM_PADDING)
         acc = acc * alpha[:, None]
 
         if SLIDING_WINDOW:
@@ -619,7 +639,11 @@ def kernel_unified_attention(
             NUM_SEGMENTS_PER_SEQ,
         )
     else:
-        acc = acc / L[:, None]
+        if USE_PROMPT_STREAM_PADDING:
+            # padding query 或特殊空行可以完全没有可见 key，输出零而非 NaN。
+            acc = tl.where(L[:, None] > 0, acc / L[:, None], 0.0)
+        else:
+            acc = acc / L[:, None]
         if USE_FP8_Q_DESCALE:
             acc *= value_scale
         if USE_FP8:
@@ -682,6 +706,7 @@ def reduce_segments(
     USE_FP8: tl.constexpr,  # bool
     FP8_MIN: tl.constexpr = float8_info.min,
     FP8_MAX: tl.constexpr = float8_info.max,
+    USE_PROMPT_STREAM_PADDING: tl.constexpr = False,
 ):
     query_token_idx = tl.program_id(0)
     query_head_idx = tl.program_id(1)
@@ -712,6 +737,9 @@ def reduce_segments(
     )
     segm_max = tl.load(segm_max_ptr + segm_offset, mask=segm_mask, other=float("-inf"))
     overall_max = tl.max(segm_max)
+    if USE_PROMPT_STREAM_PADDING:
+        # 若所有分区都是空的，用有限基准计算 exp(-inf)，避免 -inf-(-inf)。
+        overall_max = tl.where(overall_max > float("-inf"), overall_max, 0.0)
 
     # load and rescale segment exp sums
     segm_expsum = tl.load(segm_expsum_ptr + segm_offset, mask=segm_mask, other=0.0)
@@ -818,7 +846,36 @@ def unified_attention(
     # The non-TD branch is dead-code-eliminated at Triton compile time so
     # disabling this flag costs nothing.
     use_td: bool = False,
+    prompt_stream_padding_ranges: torch.Tensor | None = None,
 ):
+    if prompt_stream_padding_ranges is not None:
+        # 仅检查张量元数据，不读取 GPU 内容，保持 CUDA Graph 捕获无同步。
+        expected_shape = (len(seqused_k), 2)
+        if (
+            prompt_stream_padding_ranges.shape != expected_shape
+            or prompt_stream_padding_ranges.dtype not in (torch.int32, torch.int64)
+            or prompt_stream_padding_ranges.device != q.device
+            or not prompt_stream_padding_ranges.is_contiguous()
+        ):
+            raise ValueError(
+                "prompt_stream_padding_ranges must be a contiguous int32/int64 "
+                f"tensor on {q.device} with shape {expected_shape}."
+            )
+        # 这些模式还依赖逻辑距离或不同的 key 坐标，第一版明确拒绝。
+        if (
+            causal is not True
+            or window_size[0] != -1
+            or window_size[1] not in (-1, 0)
+            or alibi_slopes is not None
+            or qq_bias is not None
+            or mm_prefix_range is not None
+            or chunk_lookback != -1
+        ):
+            raise ValueError(
+                "Masked prompt padding requires full causal self-attention "
+                "without sliding/chunked windows, ALiBi, QQ bias or PrefixLM."
+            )
+
     # Resolve causal: bool or per-seq tensor.
     use_per_seq_causal = isinstance(causal, torch.Tensor)
     use_causal = bool(causal) if not use_per_seq_causal else True
@@ -1088,6 +1145,8 @@ def unified_attention(
         CHUNK_SIZE=chunk_size,
         USE_TD=use_td,
         USE_TD_QO=use_td_qo,
+        prompt_stream_padding_ranges_ptr=prompt_stream_padding_ranges,
+        USE_PROMPT_STREAM_PADDING=prompt_stream_padding_ranges is not None,
         **launch_kwargs,
     )
 
@@ -1111,4 +1170,5 @@ def unified_attention(
             BLOCK_Q=BLOCK_Q,
             NUM_SEGMENTS_PER_SEQ=num_par_softmax_segments,
             USE_FP8=output_scale is not None,
+            USE_PROMPT_STREAM_PADDING=prompt_stream_padding_ranges is not None,
         )

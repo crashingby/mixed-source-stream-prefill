@@ -29,6 +29,7 @@ from vllm.tokenizers import TokenizerLike
 from vllm.utils import length_from_prompt_token_ids_or_embeds, random_uuid
 from vllm.utils.jsontree import json_iter_leaves
 from vllm.v1.engine import EngineCoreRequest
+from vllm.v1.engine.prompt_stream import parse_prompt_stream_padding_range
 
 logger = init_logger(__name__)
 
@@ -328,6 +329,35 @@ class InputProcessor:
                 sampling_params.update_from_tokenizer(self.tokenizer)
         else:
             pooling_params = params.clone()
+
+        # 在 API 进程拒绝未知 mask schema 或未启用功能的 D 节点，避免把
+        # 客户端配置错误变成 EngineCore 的不可恢复异常。
+        if sampling_params is not None and sampling_params.extra_args:
+            transfer_params = sampling_params.extra_args.get("kv_transfer_params")
+            padding_range = parse_prompt_stream_padding_range(
+                transfer_params,
+                length_from_prompt_token_ids_or_embeds(prompt_token_ids, prompt_embeds),
+            )
+            if padding_range is not None:
+                if not self.scheduler_config.prompt_stream_masked_padding:
+                    raise ValueError(
+                        "Masked-padding KV requires --prompt-stream-masked-padding "
+                        "on the decode engine."
+                    )
+                if prompt_token_ids is None or prompt_embeds is not None:
+                    raise ValueError("Masked padding requires token-ID prompts.")
+                # 当前只消除 attention/RoPE 中的填充；这些采样特性会读取
+                # 物理 prompt，不能把重复的填充 ID 当作真实的历史词频。
+                if (
+                    sampling_params.prompt_logprobs is not None
+                    or sampling_params.repetition_penalty != 1.0
+                    or sampling_params.presence_penalty != 0.0
+                    or sampling_params.frequency_penalty != 0.0
+                ):
+                    raise ValueError(
+                        "Masked padding does not support prompt logprobs or "
+                        "non-default repetition/presence/frequency penalties."
+                    )
 
         # Multimodal related.
         mm_features: list[MultiModalFeatureSpec] | None = None

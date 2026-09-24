@@ -2,8 +2,57 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import enum
+from collections.abc import Mapping
+from typing import Any
 
 import msgspec
+
+
+def parse_prompt_stream_padding_range(
+    params: Mapping[str, Any] | None,
+    num_prompt_tokens: int,
+) -> tuple[int, int] | None:
+    """校验 P/D manifest 中的 padding 坐标，返回物理半开区间。
+
+    在 API 输入处理和 Request 构建时共用，避免坏 manifest 进入 worker。
+    普通请求返回 None；即使区间为空，存在版本标记也表示启用了新语义。
+
+    Args:
+        params: 原样转发的 KV transfer metadata，也可包含 P-only 输出描述。
+        num_prompt_tokens: D 输入的物理 token 数，包含可能追加的 P 首 token。
+
+    Returns:
+        经过校验的 (start, end)，或未启用时的 None。
+    """
+    if not params or "prompt_stream_masked_padding" not in params:
+        return None
+    marker = params["prompt_stream_masked_padding"]
+    if not isinstance(marker, dict) or set(marker) != {"version", "start", "end"}:
+        raise ValueError("Invalid prompt_stream_masked_padding manifest fields.")
+    if type(marker["version"]) is not int or marker["version"] != 1:
+        raise ValueError("Unsupported prompt_stream_masked_padding version.")
+    start, end = marker["start"], marker["end"]
+    physical_len = params.get("prompt_stream_physical_prompt_len")
+    logical_len = params.get("prompt_stream_logical_prompt_len")
+    output_tokens = params.get("prompt_stream_prefill_output_tokens", 0)
+    # bool 也是 int 子类，传输长度必须排除这种歧义。
+    if any(
+        type(value) is not int
+        for value in (start, end, physical_len, logical_len, output_tokens)
+    ):
+        raise ValueError("Masked padding bounds and lengths must be integers.")
+    if not 0 <= start <= end <= physical_len:
+        raise ValueError("Masked padding range is outside the physical prompt.")
+    if logical_len != physical_len - (end - start):
+        raise ValueError("Masked padding logical/physical prompt lengths disagree.")
+    if output_tokens not in (0, 1) or num_prompt_tokens != physical_len + output_tokens:
+        raise ValueError(
+            "Masked padding prompt length does not match the P token tail: "
+            f"decode_prompt_tokens={num_prompt_tokens}, "
+            f"physical_prompt_tokens={physical_len}, "
+            f"prefill_output_tokens={output_tokens}."
+        )
+    return start, end
 
 
 class PromptStreamEventType(str, enum.Enum):

@@ -134,7 +134,9 @@ def parse_args():
         action="store_true",
         help=(
             "Do not forward kv_transfer_params to D. This is a debug mode "
-            "for comparing remote KV decode against local D prefill."
+            "for comparing remote KV decode against local D prefill. "
+            "Masked-padding prompt streams require KV transfer and reject "
+            "this debug mode."
         ),
     )
     args = parser.parse_args()
@@ -390,6 +392,49 @@ def _shrink_decode_max_tokens(
         decode_request["max_tokens"] = max(0, max_tokens - num_prefill_output_tokens)
 
 
+def _validate_prompt_stream_padding_manifest(
+    response_json: dict[str, Any],
+) -> dict[str, int] | None:
+    """校验 P 的 padding 语义，供 PD 转发与 P-only 首帧共同使用。
+
+    padding 的 token id 可能与真实文本相同，因此只能使用 P 明确导出的
+    物理区间。该验证不读取远端 block IDs，也适用于无 connector 的输出。
+
+    Args:
+        response_json: P 的 finish JSON，包含物理 prompt 和可选语义清单。
+
+    Returns:
+        已校验的原始区间字典；未开启 masked padding 时返回 None。
+
+    Raises:
+        HTTPException: P 返回的版本、区间或逻辑/物理长度不一致。
+    """
+    params = response_json.get("kv_transfer_params")
+    if not isinstance(params, dict) or "prompt_stream_masked_padding" not in params:
+        return None
+    padding = params["prompt_stream_masked_padding"]
+    physical_tokens = response_json.get("prompt_token_ids")
+    physical_len = params.get("prompt_stream_physical_prompt_len")
+    logical_len = params.get("prompt_stream_logical_prompt_len")
+    if (
+        not isinstance(padding, dict)
+        or set(padding) != {"version", "start", "end"}
+        or any(type(padding[key]) is not int for key in ("version", "start", "end"))
+        or padding["version"] != 1
+        or type(physical_len) is not int
+        or type(logical_len) is not int
+        or not isinstance(physical_tokens, list)
+        or physical_len != len(physical_tokens)
+        or not 0 <= padding["start"] <= padding["end"] < physical_len
+        or logical_len != physical_len - padding["end"] + padding["start"]
+    ):
+        raise HTTPException(
+            status_code=502,
+            detail="P node returned an invalid masked-padding manifest.",
+        )
+    return padding
+
+
 def _validate_prompt_stream_transfer(
     session: PromptStreamProxySession,
     response_json: dict[str, Any],
@@ -414,6 +459,7 @@ def _validate_prompt_stream_transfer(
             detail=("P node did not return a non-negative integer remote_num_tokens."),
         )
     physical_prompt_len = len(physical_prompt_token_ids)
+    padding = _validate_prompt_stream_padding_manifest(response_json)
     reported_physical_prompt_len = kv_transfer_params.get(
         "prompt_stream_physical_prompt_len"
     )
@@ -495,6 +541,16 @@ def _validate_prompt_stream_transfer(
             status_code=502,
             detail="P node returned invalid prompt stream block counts or sizes.",
         )
+    # UPDATE 段从 block 边界开始；mask 只能遮住 PREFIX_APPEND 的尾部空位。
+    if padding is not None and any(
+        padding["end"] % block_size != 0
+        or padding["end"] - padding["start"] >= block_size
+        for block_size in manifest_block_sizes
+    ):
+        raise HTTPException(
+            status_code=502,
+            detail="P node masked-padding range is not a segment boundary.",
+        )
     if not all(isinstance(group, (list, tuple)) for group in remote_block_ids):
         raise HTTPException(
             status_code=502,
@@ -563,11 +619,11 @@ def _should_finish_without_decode(
     return isinstance(max_tokens, int) and max_tokens <= num_prefill_output_tokens
 
 
-def _attach_prompt_stream_stats(
+def _attach_prompt_stream_metadata(
     response_payload: dict[str, Any],
     prefill_response: dict[str, Any],
 ) -> dict[str, Any]:
-    """把 P 节点统计附加到返回客户端的 Prompt Stream 响应。
+    """把 P 节点统计和 padding 模式附加到客户端的 JSON/SSE 响应。
 
     统计描述的是 P 节点内部的 Prompt Stream work 与 KV 状态，proxy 只做
     透明透传，不能重新计算。该 helper 只作用于客户端响应 payload；调用方
@@ -579,11 +635,15 @@ def _attach_prompt_stream_stats(
         prefill_response: P 节点 ``/prompt_stream/finish`` 返回的 JSON。
 
     Returns:
-        已附加可选 ``prompt_stream_stats`` 字段的原 payload。
+        已附加可选统计及 masked-padding 区间的原 payload。
 
     Raises:
         HTTPException: P 节点返回了非对象类型的统计字段时抛出。
     """
+    # 首 token 与模式元数据同时交付，TTFT-only 客户端无需等待结束帧。
+    padding = _validate_prompt_stream_padding_manifest(prefill_response)
+    if padding is not None:
+        response_payload["prompt_stream_masked_padding"] = dict(padding)
     prompt_stream_stats = prefill_response.get("prompt_stream_stats")
     if prompt_stream_stats is None:
         # 兼容尚未导出统计的 P 节点；simple_test/replay 会对实验结果做
@@ -636,7 +696,7 @@ def _build_prefill_only_response(
             "total_tokens": prompt_tokens + completion_tokens,
         },
     }
-    return _attach_prompt_stream_stats(response_payload, response_json)
+    return _attach_prompt_stream_metadata(response_payload, response_json)
 
 
 def _merge_prefill_output(
@@ -646,7 +706,7 @@ def _merge_prefill_output(
 ) -> dict[str, Any]:
     """把 P 首 token 合并回 D 的非流式 completions 响应。"""
     if num_prefill_output_tokens <= 0:
-        return _attach_prompt_stream_stats(response_json, prefill_response)
+        return _attach_prompt_stream_metadata(response_json, prefill_response)
     choices = response_json.get("choices")
     if not isinstance(choices, list) or len(choices) != 1:
         raise HTTPException(
@@ -672,7 +732,7 @@ def _merge_prefill_output(
             )
         if isinstance(completion_tokens, int):
             usage["completion_tokens"] = completion_tokens + num_prefill_output_tokens
-    return _attach_prompt_stream_stats(response_json, prefill_response)
+    return _attach_prompt_stream_metadata(response_json, prefill_response)
 
 
 def _build_prefill_start_request(
@@ -1045,7 +1105,7 @@ def _build_prefill_stream_chunk(
     }
     # 流式客户端会把这一帧作为真实首 token；统计必须和首帧一起返回，
     # 不能放到尾帧，否则 TTFT-only 客户端可能已经结束读取。
-    return _attach_prompt_stream_stats(response_payload, prefill_response)
+    return _attach_prompt_stream_metadata(response_payload, prefill_response)
 
 
 async def _stream_decode_completion(
@@ -1607,13 +1667,29 @@ async def finish_prompt_stream(request: Request):
     # KV load，P 仍必须导出完整物理 prompt 视图，避免把仅适用于 TTFT-only
     # 的无 connector P 输出错误地用于完整 P/D 请求。
     kv_transfer_params = prefill_response.get("kv_transfer_params")
-    if not isinstance(kv_transfer_params, dict) or not kv_transfer_params:
+    if (
+        not isinstance(kv_transfer_params, dict)
+        or kv_transfer_params.get("do_remote_prefill") is not True
+        or not isinstance(kv_transfer_params.get("remote_block_ids"), (list, tuple))
+    ):
         raise HTTPException(
             status_code=502,
             detail=(
                 "P node full prompt-stream finish requires "
                 "kv_transfer_params; use /v1/prompt_stream/finish_ttft "
                 "when KV transfer is disabled."
+            ),
+        )
+
+    # 无 connector 时也可能有 padding 语义清单，但它不代表存在可拉取的 KV。
+    # debug 重算若直接丢掉该清单，D 会重新让 padding 参与注意力与 RoPE。
+    padding = _validate_prompt_stream_padding_manifest(prefill_response)
+    if global_args.disable_kv_transfer and padding is not None:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "--disable-kv-transfer cannot discard masked-padding semantics. "
+                "Enable KV transfer, or use /v1/prompt_stream/finish_ttft."
             ),
         )
 

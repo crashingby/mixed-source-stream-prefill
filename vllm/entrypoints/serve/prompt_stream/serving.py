@@ -212,13 +212,25 @@ class PromptStreamServing:
 
         try:
             prefill_output = await self._wait_for_finish_output(session)
-            physical_prompt_token_ids = prefill_output.kv_transfer_params.pop(
+            # 无 NIXL 的 TTFT-only 输出也携带语义布局。复制后再取出 token
+            # view，避免修改 collector 保存的共享结果或意外丢掉 mask 区间。
+            kv_transfer_params = dict(prefill_output.kv_transfer_params)
+            scheduler_config = self.engine_client.vllm_config.scheduler_config
+            if (
+                scheduler_config.prompt_stream_masked_padding
+                and "prompt_stream_masked_padding" not in kv_transfer_params
+            ):
+                raise ValueError(
+                    "Masked-padding finish output is missing its semantic manifest: "
+                    f"request_id={session.request_id}."
+                )
+            physical_prompt_token_ids = kv_transfer_params.pop(
                 "prompt_stream_prompt_token_ids",
                 None,
             )
             response = PromptStreamFinishResponse(
                 request_id=session.request_id,
-                kv_transfer_params=prefill_output.kv_transfer_params,
+                kv_transfer_params=kv_transfer_params,
                 token_ids=prompt_stream_event.token_ids,
                 prompt_token_ids=physical_prompt_token_ids,
                 output_token_ids=prefill_output.token_ids,
@@ -480,8 +492,8 @@ class PromptStreamServing:
                     )
                 completion_output = output.outputs[0]
                 return PromptStreamPrefillOutput(
-                    # 空字典显式表达“本次 P prefill 未导出远端 KV”，保持 P
-                    # 端响应 schema 稳定，并避免 TTFT-only 引入另一种协议类型。
+                    # 无 connector 时可能只有 padding 的语义清单；有字典
+                    # 不等于存在可加载的远端 KV，proxy 另行检查 transfer 标记。
                     kv_transfer_params=output.kv_transfer_params or {},
                     token_ids=list(completion_output.token_ids),
                     text=completion_output.text,

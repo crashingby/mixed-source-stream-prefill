@@ -176,6 +176,13 @@ class SchedulerConfig:
     Scheduler 才创建请求级合并状态并处理相应 deadline。
     """
 
+    prompt_stream_masked_padding: bool = False
+    """屏蔽分段 Prompt Stream 的中间 padding，并修正真实 token 的 RoPE 位置。
+
+    需显式选择 TRITON_ATTN；P/D 两端必须启用相同语义。关闭时保留原有
+    padding 近似，便于在相同调度及 block 布局下进行消融实验。
+    """
+
     @staticmethod
     def default_factory(**kwargs):
         """
@@ -234,6 +241,8 @@ class SchedulerConfig:
         #   impact on that. For more details, please check
         #   https://github.com/vllm-project/vllm/issues/29585
         factors.append(self.max_num_batched_tokens)
+        # Mask 与模型位置分流会改变 attention 计算图，不能复用旧图缓存。
+        factors.append(self.prompt_stream_masked_padding)
 
         hash_str = safe_hash(str(factors).encode(), usedforsecurity=False).hexdigest()
         return hash_str

@@ -281,6 +281,9 @@ def compute_kv_seq_mask(
     per_seq_causal_ptr=None,
     CHUNK_LOOKBACK: tl.constexpr = -1,
     CHUNK_SIZE: tl.constexpr = -1,
+    USE_PROMPT_STREAM_PADDING: tl.constexpr = False,
+    padding_start=0,
+    padding_end=0,
 ):
     """Build the KV mask for one tile.
 
@@ -350,6 +353,12 @@ def compute_kv_seq_mask(
                 & is_valid
             )
             seq_mask |= q_in_range & k_in_range
+
+    # 必须最后取交集，避免 PrefixLM 等扩大可见范围的规则重新暴露 padding。
+    if USE_PROMPT_STREAM_PADDING:
+        seq_mask &= (seq_offset[None, :] < padding_start) | (
+            seq_offset[None, :] >= padding_end
+        )
     return seq_mask
 
 
@@ -393,7 +402,7 @@ def load_qq_bias_tile(
 
 
 @triton.jit
-def softmax_step(S, M, L):
+def softmax_step(S, M, L, PRESERVE_EMPTY_MAX: tl.constexpr = False):
     """Online softmax update for one tile.
 
     Returns ``(M_new, L_new, P, alpha)``.  Caller is responsible for
@@ -404,6 +413,13 @@ def softmax_step(S, M, L):
     # compute running maximum
     # m_j : (BLOCK_M,)
     m_j = tl.maximum(M, tl.max(S, axis=1))
+    if PRESERVE_EMPTY_MAX:
+        # 空 tile 必须保留 -inf 最大值；否则它的伪最大值 0 会压低后续
+        # 合法但很小的 logits，在 3D 分区合并时产生下溢或错误权重。
+        safe_max = tl.where(m_j > float("-inf"), m_j, 0.0)
+        P = tl.exp(S - safe_max[:, None])
+        alpha = tl.exp(M - safe_max)
+        return m_j, L * alpha + tl.sum(P, axis=1), P, alpha
     # For sliding window there's a chance the max is -inf due to masking of
     # the entire row. In this case we need to set m_j 0 to avoid NaN
     m_j = tl.where(m_j > float("-inf"), m_j, 0.0)

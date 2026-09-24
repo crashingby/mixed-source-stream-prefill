@@ -63,6 +63,9 @@ class CachedRequestState:
     pooling_params: PoolingParams | None = None
     pooling_states: PoolingStates | None = None
 
+    # 随当前物理 token/block 视图冻结；恢复、refresh 时由 scheduler 重发。
+    prompt_stream_padding_range: tuple[int, int] | None = None
+
     def __post_init__(self):
         self.num_prompt_tokens = length_from_prompt_token_ids_or_embeds(
             self.prompt_token_ids, self.prompt_embeds
@@ -166,6 +169,11 @@ class InputBatch:
             pin_memory=pin_memory,
         )
         self.num_computed_tokens_cpu = self.num_computed_tokens_cpu_tensor.numpy()
+
+        # 与 batch 行一一对应；[0, 0) 表示普通请求或当前视图没有空洞。
+        self.prompt_stream_padding_ranges = np.zeros(
+            (max_num_reqs, 2), dtype=np.int32
+        )
 
         # Block table.
         self.block_table = MultiGroupBlockTable(
@@ -349,6 +357,10 @@ class InputBatch:
             self.spec_token_ids[req_index].clear()
 
         self.req_id_to_index[req_id] = req_index
+        # 复用空行时必须覆盖旧范围，防止把上一个请求的 padding 带入新请求。
+        self.prompt_stream_padding_ranges[req_index] = (
+            request.prompt_stream_padding_range or (0, 0)
+        )
 
         # Copy the prompt token ids and output token ids.
         num_prompt_tokens = length_from_prompt_token_ids_or_embeds(
@@ -526,6 +538,7 @@ class InputBatch:
         self.req_output_token_ids[req_index] = None
         self.spec_token_ids[req_index].clear()
         self.block_table.clear_row(req_index)
+        self.prompt_stream_padding_ranges[req_index] = 0
 
         # LoRA
         lora_id = self.request_lora_mapping[req_index]
@@ -597,6 +610,10 @@ class InputBatch:
         self.num_computed_tokens_cpu[i1], self.num_computed_tokens_cpu[i2] = (
             self.num_computed_tokens_cpu[i2],
             self.num_computed_tokens_cpu[i1],
+        )
+        # NumPy 高级索引产生副本，避免原地交换覆盖其中一行。
+        self.prompt_stream_padding_ranges[[i1, i2]] = (
+            self.prompt_stream_padding_ranges[[i2, i1]]
         )
 
         # NOTE: the following is unsafe
@@ -754,6 +771,10 @@ class InputBatch:
             self.num_computed_tokens_cpu[empty_index] = self.num_computed_tokens_cpu[
                 last_req_index
             ]
+            self.prompt_stream_padding_ranges[empty_index] = (
+                self.prompt_stream_padding_ranges[last_req_index]
+            )
+            self.prompt_stream_padding_ranges[last_req_index] = 0
             self.block_table.move_row(last_req_index, empty_index)
 
             self.request_lora_mapping[empty_index] = self.request_lora_mapping[
