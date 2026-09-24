@@ -245,6 +245,12 @@ def _make_metadata_with_slice(
         seq_lens_cpu_upper_bound=seq_lens_cpu_upper_bound,
         _seq_lens_cpu=seq_lens_cpu,
         _num_computed_tokens_cpu=num_computed_tokens_cpu,
+        # ubatch 只切请求行；KV 仍是原请求的物理坐标，区间无需减偏移。
+        prompt_stream_padding_ranges=(
+            attn_metadata.prompt_stream_padding_ranges[request_slice]
+            if attn_metadata.prompt_stream_padding_ranges is not None
+            else None
+        ),
     )
 
 

@@ -705,6 +705,8 @@ class EngineArgs:
 
     stream_interval: int = SchedulerConfig.stream_interval
 
+    prompt_stream_masked_padding: bool = SchedulerConfig.prompt_stream_masked_padding
+
     prompt_stream_update_coalescing_config: (
         PromptStreamUpdateCoalescingConfig | None
     ) = None
@@ -1442,6 +1444,10 @@ class EngineArgs:
             "--stream-interval", **scheduler_kwargs["stream_interval"]
         )
         scheduler_group.add_argument(
+            "--prompt-stream-masked-padding",
+            **scheduler_kwargs["prompt_stream_masked_padding"],
+        )
+        scheduler_group.add_argument(
             "--prompt-stream-update-coalescing-config",
             **scheduler_kwargs["prompt_stream_update_coalescing_config"],
         )
@@ -2094,6 +2100,7 @@ class EngineArgs:
             disable_hybrid_kv_cache_manager=self.disable_hybrid_kv_cache_manager,
             async_scheduling=self.async_scheduling,
             stream_interval=self.stream_interval,
+            prompt_stream_masked_padding=self.prompt_stream_masked_padding,
             prompt_stream_update_coalescing_config=(
                 self.prompt_stream_update_coalescing_config
             ),

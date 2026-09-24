@@ -66,8 +66,37 @@ SERVED_MODEL_NAME=<SERVED_MODEL_NAME> \
 GPU_MEMORY_UTILIZATION=<GPU_UTIL> \
 MAX_MODEL_LEN=<MAX_MODEL_LEN> \
 MAX_NUM_SEQS=<MAX_NUM_SEQS> \
+TENSOR_PARALLEL_SIZE=1 \
 sbatch --nodelist=<P_HOST> research/scripts/server/start_p_node.sbatch
 ```
+
+### P 节点的单节点 TP
+
+`start_p_node.sbatch` 默认仍请求一张 GPU，并使用
+`TENSOR_PARALLEL_SIZE=1`。需要 TP=2 时，在同一个节点申请两张 GPU，并
+设置相同的 TP size：
+
+提交命令中的 `--gres=gpu:2` 会覆盖脚本默认的 `#SBATCH --gres=gpu:1`。
+
+```shell
+TENSOR_PARALLEL_SIZE=2 \
+MODEL_PATH=<MODEL_PATH> \
+SERVED_MODEL_NAME=<SERVED_MODEL_NAME> \
+GPU_MEMORY_UTILIZATION=<GPU_UTIL> \
+MAX_MODEL_LEN=<MAX_MODEL_LEN> \
+MAX_NUM_SEQS=<MAX_NUM_SEQS> \
+sbatch --nodelist=<P_HOST> --gres=gpu:2 \
+  research/scripts/server/start_p_node.sbatch
+```
+
+`--nodes=1` 已固定在脚本中，因此这只会使用同一主机上的两张卡，不会
+形成多节点 TP。不要手动设置 `CUDA_VISIBLE_DEVICES`；Slurm 会把申请到的
+两张卡暴露给 vLLM。`TENSOR_PARALLEL_SIZE` 必须不大于实际申请到的 GPU 数。
+
+本轮 `finish_ttft` 实验只需要 P 使用 TP=2。若之后运行完整 P -> D KV
+transfer 与 decode，应把 D 也改为同样的 TP=2 配置；当前
+`start_d_node.sbatch` 仍是单卡脚本。
+
 
 提交 D 节点：
 
@@ -94,8 +123,44 @@ sbatch --nodelist=<D_HOST> research/scripts/server/start_d_node.sbatch
 | `NIXL_SIDE_CHANNEL_PORT` | P 为 `5600`，D 为 `5601` | NIXL side-channel 端口 |
 | `GPU_MEMORY_UTILIZATION` | `0.65` | vLLM GPU 显存使用比例 |
 | `MAX_MODEL_LEN` | `4096` | 最大上下文长度 |
+| `TENSOR_PARALLEL_SIZE` | `1` | 仅 P 节点：同一 Slurm 节点内的 vLLM TP rank 数；值为 `2` 时提交命令还必须申请两张 GPU。 |
 | `MAX_NUM_SEQS` | `16` | 最大并发序列数 |
+| `ATTENTION_BACKEND` | 空，自动选择 | 显式指定 vLLM attention backend，例如 `TRITON_ATTN` 或 `FLASH_ATTN`。P/D 对照实验应使用相同值。 |
+| `PROMPT_STREAM_MASKED_PADDING` | `0` | `1` 时传入 `--prompt-stream-masked-padding`，屏蔽分段 KV 中间 padding 并修正 RoPE；未指定后端时自动选择 `TRITON_ATTN`。完整 PD 模式的 P/D 均需开启。 |
+| `GENERATION_CONFIG` | 空；masked 模式为 `vllm` | 传给 `--generation-config`。masked 模式默认覆盖 Qwen 的模型 generation config，避免其 `repetition_penalty=1.05` 将物理 padding 计入词频。 |
+| `ENABLE_KV_TRANSFER` | `1` | 仅 P 节点：`1` 时使用 NIXL `kv_producer`；`0` 时完全省略 `--kv-transfer-config`。TP=2 的 TTFT-only 实验应设为 `0`。 |
 | `PROMPT_STREAM_UPDATE_COALESCING_CONFIG` | 空，功能关闭 | 仅 P 节点使用的 Update 合并 JSON；非空时透传为 `--prompt-stream-update-coalescing-config`。 |
+
+使用中间 padding mask 时，在原有提交命令中增加
+`PROMPT_STREAM_MASKED_PADDING=1`。例如仅测 P 首 token：
+
+```shell
+PROMPT_STREAM_MASKED_PADDING=1 \
+ATTENTION_BACKEND=TRITON_ATTN \
+ENABLE_KV_TRANSFER=0 \
+MODEL_PATH="${HOME}/Models/Qwen2.5-3B" \
+SERVED_MODEL_NAME=qwen2.5-3b \
+GPU_MEMORY_UTILIZATION=0.6 \
+MAX_MODEL_LEN=4096 \
+MAX_NUM_SEQS=16 \
+sbatch --nodelist=g2c9 research/scripts/server/start_p_node.sbatch
+```
+
+完整 PD 生成保留 `ENABLE_KV_TRANSFER=1`，D 的原有提交命令也加上
+`PROMPT_STREAM_MASKED_PADDING=1 ATTENTION_BACKEND=TRITON_ATTN`。proxy 和 P/D
+进程都需重启以加载新代码；replay 的接口和 chunk 格式不变。不要在完整 PD
+路径使用 proxy 的 `--disable-kv-transfer`，该诊断路径没有承诺复现带 mask
+的分段语义，当前会拒绝这种组合。TTFT-only 不受此限制。
+
+启用该开关时，P/D 脚本会默认追加 `--generation-config vllm`。这不是为了
+改变模型输出偏好，而是避免 Qwen 模型目录里的默认 `repetition_penalty=1.05`
+读取物理 padding token；若手动设置 `GENERATION_CONFIG`，必须保证
+repetition/presence/frequency penalty 均为默认值，否则 masked 路径会明确拒绝。
+
+不开此变量仍使用旧的 padding 近似。该功能独立于 Update coalescing；第一次
+比较建议保持原有事件间隔和 coalescing 配置，只改变这个开关。已验证单算子及
+无服务状态机，完整模型/P-D/replay 仍需运行验证。更多说明见
+[Masked-Padding.md](../../Masked-Padding.md)。
 
 启用严格 Append gate 与固定窗口的 P 节点提交示例：
 
@@ -107,9 +172,21 @@ sbatch --nodelist=<P_HOST> research/scripts/server/start_p_node.sbatch
 ```
 
 不设置 `PROMPT_STREAM_UPDATE_COALESCING_CONFIG` 时保持逐 Update 事件立即创建
-work 的原有行为。D 节点不要设置这个变量。第一版只支持 P 节点上的
-NIXL pull-mode `kv_producer`、DP=1、PP=1 和单 in-flight batch；本脚本已有
+work 的原有行为。D 节点不要设置这个变量。当前 P 脚本支持同节点 TP，
+但仍只支持 DP=1、PP=1 和单 in-flight batch；本脚本已有
 `--no-async-scheduling`，不需要再添加异步调度参数。
+
+只测 TTFT 时，P 生成首 token 后就结束，既不向 D 传 KV，也不需要初始化 NIXL。
+特别是当前 TP=2 的 NIXL KV 注册仍在排查，应显式禁用：
+
+```shell
+ENABLE_KV_TRANSFER=0 \
+TENSOR_PARALLEL_SIZE=2 \
+sbatch --nodelist=<P_HOST> --gres=gpu:2 \
+  research/scripts/server/start_p_node.sbatch
+```
+
+不设置或设为 `ENABLE_KV_TRANSFER=1` 时维持原有完整 P/D 配置。
 
 跨节点 P/D 时，`VLLM_NIXL_SIDE_CHANNEL_HOST` 必须是对端可以访问的地址。脚本默认用 job 实际运行节点的 `hostname`，通常比 `localhost` 更安全。若集群 DNS 不可用，可以显式设置为日志中 `HOST_IP` 的内网 IP。
 

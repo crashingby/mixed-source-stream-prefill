@@ -4,7 +4,7 @@
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=16G
-#SBATCH --time=12:00:00
+#SBATCH --time=24:00:00
 #SBATCH --output=research/scripts/logs/replay-ttft-sweep-%j.out
 
 set -euo pipefail
@@ -17,6 +17,12 @@ DATA_DIR="${DATA_DIR:-research/data/mix_source}"
 OUTPUT_DIR="${OUTPUT_DIR:-research/scripts/replay/segmented_prefill/results}"
 PROXY_URL="${PROXY_URL:-http://127.0.0.1:8000}"
 MODEL="${MODEL:-qwen2.5-3b}"
+TOKENIZER_MODEL="${TOKENIZER_MODEL:-${MODEL_PATH:-}}"
+TOKENIZER_TRUST_REMOTE_CODE="${TOKENIZER_TRUST_REMOTE_CODE:-0}"
+if [[ -z "${TOKENIZER_MODEL}" ]]; then
+  echo "TOKENIZER_MODEL (or MODEL_PATH) must be set." >&2
+  exit 2
+fi
 
 MAX_REQUESTS="${MAX_REQUESTS:-512}"
 QPS_LIST="${QPS_LIST:-0.5 1 2 4}"
@@ -46,6 +52,8 @@ echo "DATA_DIR=${DATA_DIR}"
 echo "OUTPUT_DIR=${OUTPUT_DIR}"
 echo "PROXY_URL=${PROXY_URL}"
 echo "MODEL=${MODEL}"
+echo "TOKENIZER_MODEL=${TOKENIZER_MODEL}"
+echo "TOKENIZER_TRUST_REMOTE_CODE=${TOKENIZER_TRUST_REMOTE_CODE}"
 echo "MAX_REQUESTS=${MAX_REQUESTS}"
 echo "QPS_LIST=${QPS_LIST}"
 echo "ARRIVAL_PROCESS=${ARRIVAL_PROCESS}"
@@ -75,6 +83,7 @@ run_replay() {
     --max-requests "${MAX_REQUESTS}"
     --proxy-url "${PROXY_URL}"
     --model "${MODEL}"
+    --tokenizer-model "${TOKENIZER_MODEL}"
     --qps "${qps}"
     --arrival-process "${ARRIVAL_PROCESS}"
     --random-seed "${RANDOM_SEED}"
@@ -86,6 +95,10 @@ run_replay() {
     --output-dir "${OUTPUT_DIR}"
     --run-name "${run_name}"
   )
+
+  if [[ "${TOKENIZER_TRUST_REMOTE_CODE}" == "1" ]]; then
+    common_args+=(--tokenizer-trust-remote-code)
+  fi
 
   if [[ "${FAIL_FAST}" == "1" ]]; then
     common_args+=(--fail-fast)

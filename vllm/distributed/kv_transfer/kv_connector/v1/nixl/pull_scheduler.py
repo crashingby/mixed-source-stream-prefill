@@ -11,6 +11,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_scheduler import (
 )
 from vllm.logger import init_logger
 from vllm.utils.math_utils import cdiv
+from vllm.v1.engine.prompt_stream import parse_prompt_stream_padding_range
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -335,6 +336,22 @@ class NixlPullConnectorScheduler(NixlBaseConnectorScheduler):
                             f"physical={physical_prompt_len}, "
                             f"prefill_output={prefill_output_tokens}"
                         )
+                    # 掩码只改变 attention 的可见范围；KV 仍按完整物理块
+                    # 搬运。验证区间，不能依据逻辑长度裁剪 remote block IDs。
+                    padding_range = parse_prompt_stream_padding_range(
+                        params, request.num_prompt_tokens
+                    )
+                    if padding_range is not None:
+                        pad_start, pad_end = padding_range
+                        if any(
+                            pad_end % block_size != 0
+                            or pad_end - pad_start >= block_size
+                            for block_size in expected_sizes
+                        ):
+                            raise ValueError(
+                                "masked padding range does not match the "
+                                "PREFIX_APPEND segment boundary"
+                            )
                     if num_external_tokens != physical_prompt_len:
                         raise ValueError(
                             "external token count differs from physical prompt: "

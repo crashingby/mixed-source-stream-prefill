@@ -2755,6 +2755,16 @@ class Scheduler(SchedulerInterface):
         )
 
     def add_request(self, request: Request) -> None:
+        # D 使用普通 Request；P 使用长期 PromptStreamState，两条路径统一
+        # 在这里确定语义。旧模式请求在同一 engine 中仍可正常运行。
+        masked_padding = self.scheduler_config.prompt_stream_masked_padding
+        if request.get_prompt_stream_padding_range() is not None and not masked_padding:
+            raise ValueError(
+                "Masked-padding KV requires --prompt-stream-masked-padding "
+                "on the decode engine."
+            )
+        if request.prompt_stream_event is not None:
+            request.prompt_stream_masked_padding = masked_padding
         existing = self.requests.get(request.request_id)
         if existing is not None:
             if request.prompt_stream_event is not None:
@@ -2931,6 +2941,30 @@ class Scheduler(SchedulerInterface):
         self._prompt_stream_worker_removal_req_ids.discard(request.request_id)
         self._inflight_prefills.discard(request)
         connector_delay_free_blocks, kv_xfer_params = self._connector_finished(request)
+        # 无 NIXL / P-only 请求仍要报告语义布局；不添加远端加载开关或租约。
+        if (
+            request.is_prompt_streaming()
+            and request.prompt_stream_masked_padding
+            and request.status in (
+                RequestStatus.FINISHED_LENGTH_CAPPED,
+                RequestStatus.FINISHED_STOPPED,
+            )
+        ):
+            kv_xfer_params = dict(kv_xfer_params or {})
+            layout = request.get_prompt_stream_layout()
+            physical_token_ids = request.get_prompt_stream_physical_prompt_token_ids()
+            pad_start = layout.prefix_len + layout.append_len
+            kv_xfer_params.update(
+                prompt_stream_prompt_token_ids=physical_token_ids,
+                prompt_stream_physical_prompt_len=len(physical_token_ids),
+                prompt_stream_logical_prompt_len=layout.total_len,
+                prompt_stream_prefill_output_tokens=request.num_output_tokens,
+                prompt_stream_masked_padding={
+                    "version": 1,
+                    "start": pad_start,
+                    "end": pad_start + layout.prefix_append_padding_len,
+                },
+            )
         self.encoder_cache_manager.free(request)
         request_id = request.request_id
         self.finished_req_ids.add(request_id)
@@ -3304,6 +3338,9 @@ class Scheduler(SchedulerInterface):
             # D connector 必须据此裁剪本地 load block table。
             kv_transfer_params["prompt_stream_physical_prompt_len"] = (
                 physical_prompt_len
+            )
+            kv_transfer_params["prompt_stream_logical_prompt_len"] = (
+                request.get_prompt_stream_layout().total_len
             )
             # prompt-stream 的 P block table 是 D load 的权威 manifest。
             # remote_num_tokens 只覆盖已经 forward 的物理 prompt；P 采样的

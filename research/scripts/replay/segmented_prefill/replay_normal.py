@@ -11,10 +11,11 @@ from typing import Any
 
 import httpx
 from replay_common import (
+    ChatTemplateRenderer,
+    RenderedReplayPrompt,
     ReplayHttpError,
     RequestMetric,
     SampleReplayInput,
-    _build_normal_prompt,
     _get_data_events,
     _normalize_v1_url,
     _override_sampling_params,
@@ -25,19 +26,19 @@ from replay_common import (
 
 def _make_normal_payload(
     sample: SampleReplayInput,
+    rendered_prompt: RenderedReplayPrompt,
     args: argparse.Namespace,
-) -> tuple[dict[str, Any], int, int]:
-    """构造 proxy 普通 `/v1/completions` SSE 请求与内容统计。"""
-    prompt, append_chars, final_update_chars = _build_normal_prompt(sample)
+) -> dict[str, Any]:
+    """构造由分段 chat template token 组成的普通 SSE 请求。"""
     payload: dict[str, Any] = {
         "model": args.model,
-        "prompt": prompt,
+        "prompt": list(rendered_prompt.logical_prompt_token_ids),
         "stream": True,
         "max_tokens": sample.start_request.get("max_tokens", 64),
         "temperature": sample.start_request.get("temperature", 0.0),
     }
     _override_sampling_params(payload, args)
-    return payload, append_chars, final_update_chars
+    return payload
 
 
 def _normal_completion_endpoint(args: argparse.Namespace) -> str:
@@ -61,6 +62,8 @@ def _normal_completion_endpoint(args: argparse.Namespace) -> str:
 async def _replay_normal_sample(
     client: httpx.AsyncClient,
     sample: SampleReplayInput,
+    rendered_prompt: RenderedReplayPrompt,
+    _renderer: ChatTemplateRenderer,
     args: argparse.Namespace,
     run_id: str,
     planned_arrival_offset_ms: float,
@@ -68,10 +71,7 @@ async def _replay_normal_sample(
 ) -> RequestMetric:
     """通过 proxy 普通 P/D 分离回放最终逻辑 prompt 并计量 TTFT。"""
     request_start_time = time.perf_counter()
-    normal_payload, append_chars, final_update_chars = _make_normal_payload(
-        sample,
-        args,
-    )
+    normal_payload = _make_normal_payload(sample, rendered_prompt, args)
     metric = RequestMetric(
         run_id=run_id,
         mode="normal",
@@ -92,9 +92,9 @@ async def _replay_normal_sample(
             for source_stream in sample.source_streams
             if source_stream.source_type == "update"
         ),
-        append_chars=append_chars,
-        final_update_chars=final_update_chars,
-        normal_prompt_chars=len(str(normal_payload["prompt"])),
+        append_chars=rendered_prompt.append_chars,
+        final_update_chars=rendered_prompt.final_update_chars,
+        normal_prompt_chars=len(rendered_prompt.logical_prompt_text),
     )
     try:
         # 普通模式的 TTFT 起点是整段 prompt 的 normal PD 请求提交时刻。

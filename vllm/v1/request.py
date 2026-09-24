@@ -26,6 +26,7 @@ from vllm.v1.engine.prompt_stream import (
     PromptSourceType,
     PromptStreamEvent,
     PromptStreamEventType,
+    parse_prompt_stream_padding_range,
 )
 from vllm.v1.metrics.stats import PrefillStats
 from vllm.v1.structured_output.request import StructuredOutputRequest
@@ -263,6 +264,8 @@ class PromptStreamExecutionView:
     num_computed_tokens: int
     prefix_append_physical_len: int
     segment_offset: int
+    # 当前 work 冻结的物理 padding 区间；Append 增长后不能沿用旧视图。
+    padding_range: tuple[int, int] = (0, 0)
 
 
 @dataclass
@@ -754,6 +757,11 @@ class Request:
 
         # prompt 发生真实变化后，worker 侧 cached request 需要刷新 token/block 状态。
         self.prompt_stream_needs_worker_refresh = False
+        # D 请求无 PromptStreamState，必须独立保留 P 已声明的坐标语义。
+        self._transferred_padding_range = parse_prompt_stream_padding_range(
+            self.kv_transfer_params, self.num_prompt_tokens
+        )
+        self.prompt_stream_masked_padding = self._transferred_padding_range is not None
 
     @classmethod
     def from_engine_core_request(
@@ -1709,8 +1717,20 @@ class Request:
         """
         return bool(
             self.kv_transfer_params
-            and self.kv_transfer_params.get("prompt_stream_exact_transfer")
+            and (
+                self.kv_transfer_params.get("prompt_stream_exact_transfer")
+                # 即使重新本地 prefill，带空洞的语义也不能复用普通 APC。
+                or "prompt_stream_masked_padding" in self.kv_transfer_params
+            )
         )
+
+    def get_prompt_stream_padding_range(self) -> tuple[int, int] | None:
+        """返回本轮 worker 使用的物理空洞；普通请求及旧近似模式返回 None。"""
+        if not self.prompt_stream_masked_padding:
+            return None
+        if self.prompt_stream_execution_view is not None:
+            return self.prompt_stream_execution_view.padding_range
+        return self._transferred_padding_range
 
     def is_prompt_stream_finished(self) -> bool:
         """判断 prompt 输入是否结束。
@@ -2834,6 +2854,10 @@ class Request:
                     num_computed_tokens=active_work_item.num_computed_tokens,
                     prefix_append_physical_len=len(prefix_append_token_ids),
                     segment_offset=0,
+                    padding_range=(
+                        active_work_item.prefix_append_logical_len,
+                        len(prefix_append_token_ids),
+                    ),
                 )
 
             if active_work_item.phase == PromptStreamExecutionPhase.QUESTION:
@@ -2862,6 +2886,10 @@ class Request:
                     ),
                     prefix_append_physical_len=prefix_append_physical_len,
                     segment_offset=prefix_append_physical_len,
+                    padding_range=(
+                        active_work_item.prefix_append_logical_len,
+                        prefix_append_physical_len,
+                    ),
                 )
 
             # Update delta 基于 flush 时冻结的 PREFIX_APPEND KV 和 work 自己
@@ -2885,6 +2913,10 @@ class Request:
                 ),
                 prefix_append_physical_len=prefix_append_physical_len,
                 segment_offset=prefix_append_physical_len,
+                padding_range=(
+                    active_work_item.prefix_append_logical_len,
+                    prefix_append_physical_len,
+                ),
             )
 
         # 所有 source work 已提交后，最终 question 才能使用最终的物理布局。
@@ -2898,6 +2930,13 @@ class Request:
             update_token_ids = list(prompt_stream.update_committed_token_ids)
         question_token_ids = prompt_stream.suffix_token_ids
         prefix_append_physical_len = len(prefix_append_token_ids)
+
+        # idle/最终 decode 视图使用已完成 Append 的边界，而非某个旧 work。
+        layout = self.get_prompt_stream_layout()
+        padding_range = (
+            layout.prefix_len + layout.append_len,
+            prefix_append_physical_len,
+        )
 
         # 没有 active work 时只暴露已经物化的内容。Question 必须先由
         # enqueue_question_if_ready() 显式进入 FIFO，不能通过 idle view
@@ -2927,6 +2966,7 @@ class Request:
                 num_computed_tokens=len(execution_token_ids),
                 prefix_append_physical_len=prefix_append_physical_len,
                 segment_offset=prefix_append_physical_len,
+                padding_range=padding_range,
             )
 
         return PromptStreamExecutionView(
@@ -2937,6 +2977,7 @@ class Request:
             num_computed_tokens=len(prefix_append_token_ids),
             prefix_append_physical_len=prefix_append_physical_len,
             segment_offset=0,
+            padding_range=padding_range,
         )
 
     def prepare_prompt_stream_execution(self, block_size: int) -> bool:
@@ -2979,6 +3020,7 @@ class Request:
             and old_view.prefix_append_physical_len
             == new_view.prefix_append_physical_len
             and old_view.segment_offset == new_view.segment_offset
+            and old_view.padding_range == new_view.padding_range
         ):
             # 同一执行视图的 chunked prefill 只推进进度；cached request 路径
             # 会收到新的 num_computed_tokens，无需重装 token 和 block table。

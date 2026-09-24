@@ -48,7 +48,7 @@ class PromptStreamSession:
 
 @dataclass(frozen=True)
 class PromptStreamPrefillOutput:
-    """P 节点 finish 时交给 proxy 的首 token 和 transfer 元数据。"""
+    """P 节点 finish 时交给 proxy 的首 token 和可选 transfer 元数据。"""
 
     kv_transfer_params: dict[str, Any]
     token_ids: list[int]
@@ -163,7 +163,7 @@ class PromptStreamServing:
         self,
         envelope: PromptStreamEventEnvelope,
     ) -> PromptStreamFinishResponse:
-        """提交 PROMPT_FINISHED，并等待 P 节点返回 kv_transfer_params。"""
+        """提交 PROMPT_FINISHED，并等待 P 节点返回首 token 和可选 KV 元数据。"""
         session = self._get_session(envelope.request_id)
         async with session.event_lock:
             if session.finishing:
@@ -212,13 +212,25 @@ class PromptStreamServing:
 
         try:
             prefill_output = await self._wait_for_finish_output(session)
-            physical_prompt_token_ids = prefill_output.kv_transfer_params.pop(
+            # 无 NIXL 的 TTFT-only 输出也携带语义布局。复制后再取出 token
+            # view，避免修改 collector 保存的共享结果或意外丢掉 mask 区间。
+            kv_transfer_params = dict(prefill_output.kv_transfer_params)
+            scheduler_config = self.engine_client.vllm_config.scheduler_config
+            if (
+                scheduler_config.prompt_stream_masked_padding
+                and "prompt_stream_masked_padding" not in kv_transfer_params
+            ):
+                raise ValueError(
+                    "Masked-padding finish output is missing its semantic manifest: "
+                    f"request_id={session.request_id}."
+                )
+            physical_prompt_token_ids = kv_transfer_params.pop(
                 "prompt_stream_prompt_token_ids",
                 None,
             )
             response = PromptStreamFinishResponse(
                 request_id=session.request_id,
-                kv_transfer_params=prefill_output.kv_transfer_params,
+                kv_transfer_params=kv_transfer_params,
                 token_ids=prompt_stream_event.token_ids,
                 prompt_token_ids=physical_prompt_token_ids,
                 output_token_ids=prefill_output.token_ids,
@@ -451,11 +463,16 @@ class PromptStreamServing:
         self,
         session: PromptStreamSession,
     ) -> PromptStreamPrefillOutput:
-        """等待 P 节点返回 kv_transfer_params 和首个输出 token。
+        """等待 P 节点返回首个输出 token 和可选 KV transfer 元数据。
 
         Returns:
             P 节点为了完成 PD prefill 采样出的首个 decode token、文本、停止
-            原因、connector 参数以及 Prompt Stream 最终统计。
+            原因、可选 connector 参数以及 Prompt Stream 最终统计。
+
+        Notes:
+            `finish_ttft` 不会把请求交给 D 节点，因此 P 可在未启用 KV
+            connector 时正常完成。完整 P/D 路径是否要求 transfer 参数由
+            proxy 的 `/v1/prompt_stream/finish` 路由单独校验。
         """
         while True:
             output = await session.collector.get()
@@ -464,7 +481,10 @@ class PromptStreamServing:
                     "Prompt stream finish expected RequestOutput, "
                     f"but got {type(output).__name__}."
                 )
-            if output.kv_transfer_params:
+            # 有 transfer 参数时，P/D 与 TTFT-only 都可直接使用该完成输出。
+            # 没有参数时，只有 Request 已 finished 才表示无 connector 的 P-only
+            # prefill 已正常结束；中间 streaming 输出仍需继续等待最终输出。
+            if output.kv_transfer_params or output.finished:
                 if len(output.outputs) != 1:
                     raise ValueError(
                         "Prompt stream finish requires exactly one completion "
@@ -472,15 +492,12 @@ class PromptStreamServing:
                     )
                 completion_output = output.outputs[0]
                 return PromptStreamPrefillOutput(
-                    kv_transfer_params=output.kv_transfer_params,
+                    # 无 connector 时可能只有 padding 的语义清单；有字典
+                    # 不等于存在可加载的远端 KV，proxy 另行检查 transfer 标记。
+                    kv_transfer_params=output.kv_transfer_params or {},
                     token_ids=list(completion_output.token_ids),
                     text=completion_output.text,
                     finish_reason=completion_output.finish_reason,
                     stop_reason=completion_output.stop_reason,
                     prompt_stream_stats=output.prompt_stream_stats,
-                )
-            if output.finished:
-                raise ValueError(
-                    "Prompt stream finished without kv_transfer_params for "
-                    f"request_id={session.request_id}."
                 )

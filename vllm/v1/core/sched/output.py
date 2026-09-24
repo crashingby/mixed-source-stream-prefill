@@ -43,6 +43,10 @@ class NewRequestData:
     # Only used for v2 model runner.
     prefill_token_ids: list[int] | None = None
 
+    # 当前执行视图中的物理 padding 半开区间；None 表示未启用该语义。
+    # 每次 prompt-stream refresh 都随完整视图重新发送，不能沿用上一阶段。
+    prompt_stream_padding_range: tuple[int, int] | None = None
+
     @classmethod
     def from_request(
         cls,
@@ -62,6 +66,7 @@ class NewRequestData:
             prompt_embeds=request.prompt_embeds,
             prompt_is_token_ids=request.prompt_is_token_ids,
             prefill_token_ids=prefill_token_ids,
+            prompt_stream_padding_range=request.get_prompt_stream_padding_range(),
         )
 
     def __repr__(self) -> str:
@@ -77,6 +82,7 @@ class NewRequestData:
             f"sampling_params={self.sampling_params},"
             f"block_ids={self.block_ids},"
             f"num_computed_tokens={self.num_computed_tokens},"
+            f"prompt_stream_padding_range={self.prompt_stream_padding_range},"
             f"lora_request={self.lora_request},"
             f"prompt_embeds_shape={prompt_embeds_shape}"
             ")"
@@ -102,6 +108,7 @@ class NewRequestData:
             f"sampling_params={self.sampling_params},"
             f"block_ids={self.block_ids},"
             f"num_computed_tokens={self.num_computed_tokens},"
+            f"prompt_stream_padding_range={self.prompt_stream_padding_range},"
             f"lora_request={self.lora_request},"
             f"prompt_embeds_shape={prompt_embeds_shape}"
             ")"

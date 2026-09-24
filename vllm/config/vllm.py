@@ -524,6 +524,10 @@ class VllmConfig:
         if use_v2_model_runner is not None:
             return use_v2_model_runner
 
+        # 首版坐标分流在 GPUModelRunner 中实现，自动选择时使用此路径。
+        if self.scheduler_config.prompt_stream_masked_padding:
+            return False
+
         if self.model_config is not None and self.model_config.is_diffusion:
             return True
 
@@ -864,6 +868,65 @@ class VllmConfig:
             logger.info_once("Performance mode set to '%s'.", self.performance_mode)
 
         self.try_verify_and_update_config()
+
+        if self.scheduler_config.prompt_stream_masked_padding:
+            # 当前协议仍以一个连续物理进度推进，只开放已经实现坐标分流的
+            # 同步、一维 RoPE、full-attention Triton 路径；TP 可正常使用。
+            backend = self.attention_config.backend
+            if backend is None or backend.name != "TRITON_ATTN":
+                raise ValueError(
+                    "--prompt-stream-masked-padding requires "
+                    "--attention-backend TRITON_ATTN."
+                )
+            if (
+                self.attention_config.use_non_causal
+                or self.attention_config.use_prefill_decode_attention
+            ):
+                raise ValueError(
+                    "Masked padding requires causal unified Triton attention."
+                )
+            if self.use_v2_model_runner:
+                raise ValueError("Masked padding requires VLLM_USE_V2_MODEL_RUNNER=0.")
+            if self.scheduler_config.async_scheduling:
+                raise ValueError("Masked padding requires --no-async-scheduling.")
+            self.scheduler_config.async_scheduling = False
+            parallel = self.parallel_config
+            if (
+                parallel.pipeline_parallel_size != 1
+                or parallel.decode_context_parallel_size != 1
+                or parallel.prefill_context_parallel_size != 1
+            ):
+                raise ValueError(
+                    "Masked padding does not support PP or context parallelism."
+                )
+            if self.speculative_config is not None:
+                raise ValueError(
+                    "Masked padding does not support speculative decoding."
+                )
+            model = self.model_config
+            if model is not None and (
+                model.use_mla
+                or model.uses_mrope
+                or model.uses_xdrope_dim > 0
+                or model.uses_alibi
+                or model.is_hybrid
+                or model.runner_type != "generate"
+                or model.is_multimodal_model
+                or model.is_encoder_decoder
+                or model.get_sliding_window() is not None
+            ):
+                raise ValueError(
+                    "Masked padding requires a text-only full-attention decoder "
+                    "with ordinary one-dimensional positions."
+                )
+            transfer = self.kv_transfer_config
+            if transfer is not None and (
+                transfer.kv_connector not in ("NixlConnector", "NixlPullConnector")
+                or transfer.kv_buffer_device != "cuda"
+            ):
+                raise ValueError(
+                    "Masked padding currently requires direct-device NIXL pull."
+                )
 
         if (
             self.scheduler_config.prompt_stream_update_coalescing_config

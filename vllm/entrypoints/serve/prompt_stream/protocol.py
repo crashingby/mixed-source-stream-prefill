@@ -90,6 +90,8 @@ class PromptStreamFinishResponse(OpenAIBaseModel):
 
     request_id: str
     status: Literal["prefill_finished"] = "prefill_finished"
+    # 无 connector 时也可保存 masked-padding 语义清单；只有明确包含
+    # do_remote_prefill 与 remote_block_ids 才表示可供 D 节点加载的 KV。
     kv_transfer_params: dict[str, Any]
     token_ids: list[int] | None = None
     prompt_token_ids: list[int] | None = None

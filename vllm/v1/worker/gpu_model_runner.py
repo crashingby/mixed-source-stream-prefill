@@ -493,6 +493,31 @@ class GPUModelRunner(
             model_config
         )
 
+        # 第一版只覆盖一维位置编码、全因果 Triton attention。
+        # 提前拒绝未实现的坐标语义，不能静默退回未屏蔽的计算。
+        self.prompt_stream_masked_padding = (
+            scheduler_config.prompt_stream_masked_padding
+        )
+        if self.prompt_stream_masked_padding:
+            if (
+                self.is_pooling_model
+                or self.uses_mrope
+                or self.uses_xdrope_dim > 0
+                or self.use_alibi
+                or self.supports_mm_inputs
+                or model_config.is_encoder_decoder
+                or model_config.use_mla
+                or model_config.is_hybrid
+                or self.speculative_config is not None
+                or self.dcp_world_size != 1
+                or parallel_config.prefill_context_parallel_size != 1
+            ):
+                raise ValueError(
+                    "prompt_stream_masked_padding requires a text-only causal "
+                    "decoder with one-dimensional positions, no speculative "
+                    "decoding and no context parallelism."
+                )
+
         if self.model_config.is_encoder_decoder:
             # Maximum length of the encoder input, only for encoder-decoder
             # models.
@@ -721,6 +746,22 @@ class GPUModelRunner(
         self.positions = torch.zeros(
             self.max_num_tokens, dtype=torch.int64, device=self.device
         )
+        # positions 继续表示物理 KV 坐标；只有模型/RoPE 读取语义位置。
+        # 未启用时直接别名，不增加 tensor 或逐步转换开销。
+        self.model_positions = (
+            torch.zeros_like(self.positions)
+            if self.prompt_stream_masked_padding
+            else self.positions
+        )
+        self.prompt_stream_padding_ranges = (
+            self._make_buffer(self.max_num_reqs, 2, dtype=torch.int32)
+            if self.prompt_stream_masked_padding
+            else None
+        )
+        if self.prompt_stream_padding_ranges is not None:
+            # 固定地址也用于 warmup/CUDA Graph；普通请求的空区间全为零。
+            self.prompt_stream_padding_ranges.cpu.zero_()
+            self.prompt_stream_padding_ranges.gpu.zero_()
         self.query_start_loc = self._make_buffer(
             self.max_num_reqs + 1, dtype=torch.int32
         )
@@ -984,13 +1025,13 @@ class GPUModelRunner(
                 return self.mrope_positions.gpu[:, :num_tokens]
             if self.uses_xdrope_dim > 0:
                 return self.xdrope_positions.gpu[:, :num_tokens]
-            return self.positions[:num_tokens]
+            return self.model_positions[:num_tokens]
         else:
             if self.uses_mrope:
                 return self.mrope_positions.gpu[:, num_tokens]
             if self.uses_xdrope_dim > 0:
                 return self.xdrope_positions.gpu[:, num_tokens]
-            return self.positions[num_tokens]
+            return self.model_positions[num_tokens]
 
     def _make_buffer(
         self, *size: int | torch.SymInt, dtype: torch.dtype, numpy: bool = True
@@ -1193,6 +1234,7 @@ class GPUModelRunner(
 
         # Add new requests to the cached states.
         for new_req_data in scheduler_output.scheduled_new_reqs:
+            self._validate_prompt_stream_padding_request(new_req_data)
             req_id = new_req_data.req_id
             if req_id in self.requests:
                 # For streaming case only.
@@ -1234,6 +1276,7 @@ class GPUModelRunner(
                 num_computed_tokens=new_req_data.num_computed_tokens,
                 output_token_ids=[],
                 lora_request=new_req_data.lora_request,
+                prompt_stream_padding_range=new_req_data.prompt_stream_padding_range,
             )
             self.requests[req_id] = req_state
             self.late_interaction_runner.register_request(req_id, pooling_params)
@@ -1552,6 +1595,29 @@ class GPUModelRunner(
                     num_reqs,
                 )
 
+    def _validate_prompt_stream_padding_request(
+        self, request: NewRequestData
+    ) -> None:
+        """校验来自 scheduler 的 padding 区间，禁止静默忽略协议语义。"""
+        padding_range = request.prompt_stream_padding_range
+        if padding_range is None:
+            return
+        if not self.prompt_stream_masked_padding:
+            raise ValueError(
+                f"Request {request.req_id} requires prompt_stream_masked_padding "
+                "but it is disabled on this worker."
+            )
+        # 区间以完整物理 prompt 为界；新增输出只会接在该区间之后。
+        num_prompt_tokens = len(request.prompt_token_ids or [])
+        start, end = padding_range
+        if not 0 <= start <= end <= num_prompt_tokens:
+            raise ValueError(
+                f"Invalid padding range {padding_range} for request "
+                f"{request.req_id}, num_prompt_tokens={num_prompt_tokens}."
+            )
+        if request.mm_features or request.prompt_embeds is not None:
+            raise ValueError("Masked prompt-stream padding only supports token IDs.")
+
     def _update_streaming_request(
         self, req_id: str, new_req_data: NewRequestData
     ) -> CachedRequestState:
@@ -1574,6 +1640,10 @@ class GPUModelRunner(
         self.late_interaction_runner.register_request(req_id, req_state.pooling_params)
         req_state.block_ids = new_req_data.block_ids
         req_state.num_computed_tokens = new_req_data.num_computed_tokens
+        # 每次分段切换/恢复都替换区间，不能保留上一轮的 Append 边界。
+        req_state.prompt_stream_padding_range = (
+            new_req_data.prompt_stream_padding_range
+        )
         req_state.num_prompt_tokens = length_from_prompt_token_ids_or_embeds(
             req_state.prompt_token_ids, req_state.prompt_embeds
         )
@@ -2110,6 +2180,10 @@ class GPUModelRunner(
             self.num_computed_tokens[req_indices_gpu].to(torch.int64)
             + self.query_pos.gpu[:total_num_scheduled_tokens]
         )
+        if self.prompt_stream_masked_padding:
+            self._prepare_prompt_stream_positions(
+                num_reqs, total_num_scheduled_tokens, req_indices_gpu
+            )
         self.seq_lens[:num_reqs] = (
             self.num_computed_tokens[:num_reqs] + num_scheduled_tokens_gpu
         )
@@ -2204,6 +2278,34 @@ class GPUModelRunner(
             logits_indices,
             spec_decode_metadata,
         )
+
+    def _prepare_prompt_stream_positions(
+        self,
+        num_reqs: int,
+        num_tokens: int,
+        req_indices: torch.Tensor,
+    ) -> None:
+        """同步当前 batch 的空洞并生成给 RoPE 使用的紧凑位置。
+
+        物理 positions、seq_lens 与 block table 均保持原有布局；仅真实
+        suffix token 的模型位置减去空洞长度。padding 自身仍计算并写 KV，
+        但其 KV 不会再被真实 query 读取。
+        """
+        ranges = self.prompt_stream_padding_ranges
+        if ranges is None:
+            return
+        # 清空 batch 尾部，保证 CUDA Graph 的虚拟请求行不继承旧空洞。
+        ranges.np[:num_reqs] = self.input_batch.prompt_stream_padding_ranges[:num_reqs]
+        ranges.np[num_reqs:] = 0
+        ranges.copy_to_gpu()
+        # 使用物理请求索引取区间；重排已由 InputBatch 同步维护。
+        per_token_ranges = ranges.gpu[req_indices]
+        physical_positions = self.positions[:num_tokens]
+        padding_lengths = per_token_ranges[:, 1] - per_token_ranges[:, 0]
+        offsets = torch.where(
+            physical_positions >= per_token_ranges[:, 1], padding_lengths, 0
+        )
+        self.model_positions[:num_tokens].copy_(physical_positions - offsets)
 
     def _build_attention_metadata(
         self,
@@ -2344,6 +2446,12 @@ class GPUModelRunner(
             is_prefilling=is_prefilling,
             positions=self.positions[:num_tokens_padded],
             mm_req_doc_ranges=req_doc_ranges,
+            # 即使本批全为 [0, 0)，启用后仍传固定 buffer，保持图捕获分支稳定。
+            prompt_stream_padding_ranges=(
+                self.prompt_stream_padding_ranges.gpu[:num_reqs_padded]
+                if self.prompt_stream_padding_ranges is not None
+                else None
+            ),
         )
 
         if self.dcp_world_size > 1:
@@ -3537,9 +3645,9 @@ class GPUModelRunner(
         elif self.uses_xdrope_dim > 0:
             positions = self.xdrope_positions.gpu[:, :num_input_tokens]
         else:
-            positions = self.positions[:num_input_tokens]
+            positions = self.model_positions[:num_input_tokens]
             if num_input_tokens > num_scheduled_tokens:
-                self.positions[num_scheduled_tokens:num_input_tokens].zero_()
+                self.model_positions[num_scheduled_tokens:num_input_tokens].zero_()
 
         if is_first_rank:
             intermediate_tensors = None
@@ -5829,6 +5937,11 @@ class GPUModelRunner(
         # protocol so that back-to-back dummy/real steps don't overwrite
         # pinned memory while a prior non_blocking H2D DMA is still reading.
         with self.synchronize_input_prep():
+            if self.prompt_stream_padding_ranges is not None:
+                # dummy batch 没有空洞；和其他 pinned buffer 共用同步边界，
+                # 避免清零覆盖前一步仍在读取的非阻塞 H2D 源数据。
+                self.prompt_stream_padding_ranges.cpu.zero_()
+                self.prompt_stream_padding_ranges.gpu.zero_()
             # If force_attention is True, we always capture attention.
             # Otherwise, it only happens for cudagraph_runtime_mode=FULL.
             if force_attention or cudagraph_runtime_mode == CUDAGraphMode.FULL:
@@ -5905,7 +6018,7 @@ class GPUModelRunner(
             elif self.uses_xdrope_dim > 0:
                 positions = self.xdrope_positions.gpu[:, :num_tokens_padded]
             else:
-                positions = self.positions[:num_tokens_padded]
+                positions = self.model_positions[:num_tokens_padded]
 
             if get_pp_group().is_first_rank:
                 intermediate_tensors = None
@@ -6787,6 +6900,19 @@ class GPUModelRunner(
                 layer_kv_cache_spec = kv_cache_group_spec.kv_cache_spec
                 if isinstance(layer_kv_cache_spec, UniformTypeKVCacheSpecs):
                     layer_kv_cache_spec = layer_kv_cache_spec.kv_cache_specs[layer_name]
+                if self.prompt_stream_masked_padding and (
+                    attn_backend.get_name() != "TRITON_ATTN"
+                    or type(layer_kv_cache_spec) is not FullAttentionSpec
+                    or layer_kv_cache_spec.sliding_window is not None
+                    or layer_kv_cache_spec.attention_chunk_size is not None
+                ):
+                    # 分层检查防止混合后端、局部窗口或 MLA 只屏蔽部分层。
+                    raise ValueError(
+                        "prompt_stream_masked_padding requires TRITON_ATTN "
+                        "with full attention on every layer; "
+                        f"layer={layer_name}, backend={attn_backend.get_name()}, "
+                        f"kv_cache_spec={layer_kv_cache_spec}."
+                    )
                 # Non-Attention layer types (e.g. Mamba1, ShortConv) do not
                 # expose ``num_heads``; fall back to 0 so they cluster as
                 # before. Such layers never coexist with Attention in a

@@ -253,6 +253,9 @@ def make_local_attention_virtual_batches(
     common_attn_metadata: CommonAttentionMetadata,
     block_size: int = 0,
 ) -> tuple[CommonAttentionMetadata, Callable[[torch.Tensor], torch.Tensor]]:
+    # 虚拟 local batch 会重新编号 KV；禁止丢失全局物理空洞后静默计算。
+    if common_attn_metadata.prompt_stream_padding_ranges is not None:
+        raise ValueError("Masked prompt padding does not support local attention.")
     query_start_loc_np = common_attn_metadata.query_start_loc_cpu.numpy()
     seq_lens_np = common_attn_metadata.seq_lens_cpu.numpy()
     block_table = common_attn_metadata.block_table_tensor
@@ -459,6 +462,7 @@ def make_kv_sharing_fast_prefill_common_attn_metadata(
         seq_lens_cpu_upper_bound=common_attn_metadata.seq_lens_cpu_upper_bound,
         _seq_lens_cpu=common_attn_metadata._seq_lens_cpu,
         _num_computed_tokens_cpu=common_attn_metadata._num_computed_tokens_cpu,
+        prompt_stream_padding_ranges=common_attn_metadata.prompt_stream_padding_ranges,
     )
     return common_attn_metadata
 

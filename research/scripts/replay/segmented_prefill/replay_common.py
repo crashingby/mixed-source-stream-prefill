@@ -22,13 +22,14 @@ import random
 import statistics
 import time
 from collections import defaultdict
-from collections.abc import Awaitable, Callable, Iterable, Sequence
+from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal
 
 import httpx
+from transformers import AutoTokenizer, PreTrainedTokenizerBase
 
 from prompt_stream_stats_v2 import (
     PromptStreamStatsV2Error,
@@ -49,6 +50,7 @@ ReplayMode = Literal["stream", "normal", "merged_update"]
 ArrivalProcess = Literal["fixed", "poisson"]
 STREAM_TIMING_MODES = frozenset(("stream", "merged_update"))
 DEFAULT_EVENT_PROGRESS_LOG_INTERVAL = 1
+CHAT_TEMPLATE_CONTENT_MARKER = "VLLM_PROMPT_STREAM_CONTENT_7CDA3F6B"
 
 REQUEST_METRIC_FIELDS = (
     "run_id",
@@ -83,6 +85,15 @@ REQUEST_METRIC_FIELDS = (
     "normal_prompt_chars",
     "completion_chars",
     "completion_chunks",
+    "completion_tokens",
+    "completion_token_count_exact",
+    "time_to_last_token_ms",
+    "mean_time_per_output_token_ms",
+    "output_tokens_per_second",
+    "masked_padding_expected",
+    "masked_padding_observed",
+    "masked_padding_validation_status",
+    "masked_padding_tokens",
     "coalescing_enabled",
     "actual_p_node_coalescing_config_json",
     "update_events_accepted",
@@ -176,6 +187,98 @@ class SampleReplayInput:
     raw_sample: dict[str, Any]
 
 
+@dataclass(frozen=True)
+class RenderedReplayPrompt:
+    """模型 chat template 渲染后的文本和可分段 token 序列。"""
+
+    start_token_ids: tuple[int, ...]
+    finish_text: str
+    finish_token_ids: tuple[int, ...]
+    logical_prompt_token_ids: tuple[int, ...]
+    logical_prompt_text: str
+    append_chars: int
+    final_update_chars: int
+
+
+@dataclass(frozen=True)
+class ChatTemplateRenderer:
+    """使用目标模型 tokenizer 构造可分段的 chat prompt。"""
+
+    tokenizer: PreTrainedTokenizerBase
+    tokenizer_model: str
+    chat_template_sha256: str
+
+    @classmethod
+    def from_pretrained(
+        cls,
+        tokenizer_model: str,
+        trust_remote_code: bool,
+    ) -> "ChatTemplateRenderer":
+        """加载 tokenizer，并固定本轮实验使用的 chat template。"""
+        tokenizer = AutoTokenizer.from_pretrained(
+            tokenizer_model,
+            trust_remote_code=trust_remote_code,
+        )
+        try:
+            chat_template = tokenizer.get_chat_template()
+        except ValueError as exc:
+            raise ValueError(
+                f"Tokenizer {tokenizer_model!r} has no usable chat template."
+            ) from exc
+        if not isinstance(chat_template, str) or not chat_template:
+            raise ValueError(
+                f"Tokenizer {tokenizer_model!r} returned an invalid chat template."
+            )
+        return cls(
+            tokenizer=tokenizer,
+            tokenizer_model=tokenizer_model,
+            chat_template_sha256=hashlib.sha256(
+                chat_template.encode("utf-8")
+            ).hexdigest(),
+        )
+
+    def encode_content(self, text: str) -> tuple[int, ...]:
+        """编码一个动态 prompt 分段，不重复添加 BOS/EOS。"""
+        return tuple(
+            int(token_id)
+            for token_id in self.tokenizer.encode(text, add_special_tokens=False)
+        )
+
+    def render_envelope(self, system_message: str) -> tuple[str, str]:
+        """提取 user 内容前后的模型模板文本。"""
+        rendered = self.tokenizer.apply_chat_template(
+            [
+                {"role": "system", "content": system_message},
+                {"role": "user", "content": CHAT_TEMPLATE_CONTENT_MARKER},
+            ],
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+        if not isinstance(rendered, str):
+            raise ValueError("apply_chat_template(tokenize=False) must return text.")
+        if rendered.count(CHAT_TEMPLATE_CONTENT_MARKER) != 1:
+            raise ValueError(
+                "Chat template must preserve the prompt-stream content marker "
+                "exactly once."
+            )
+        prefix, suffix = rendered.split(CHAT_TEMPLATE_CONTENT_MARKER, maxsplit=1)
+        return prefix, suffix
+
+    def render_chat_prompt(self, system_message: str, user_content: str) -> str:
+        """渲染完整 chat prompt，用于验证分段拼接边界。"""
+        rendered = self.tokenizer.apply_chat_template(
+            [
+                {"role": "system", "content": system_message},
+                {"role": "user", "content": user_content},
+            ],
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+        if not isinstance(rendered, str):
+            raise ValueError("apply_chat_template(tokenize=False) must return text.")
+        return rendered
+
+
 @dataclass
 class EventMetric:
     """一次 prompt-stream event REST 调用的发送与 ack 指标。"""
@@ -241,6 +344,15 @@ class RequestMetric:
     normal_prompt_chars: int = 0
     completion_chars: int = 0
     completion_chunks: int = 0
+    completion_tokens: int = 0
+    completion_token_count_exact: bool = False
+    time_to_last_token_ms: float | None = None
+    mean_time_per_output_token_ms: float | None = None
+    output_tokens_per_second: float | None = None
+    masked_padding_expected: str = "any"
+    masked_padding_observed: bool | None = None
+    masked_padding_validation_status: str = "not_evaluated"
+    masked_padding_tokens: int | None = None
     coalescing_enabled: bool | None = None
     actual_p_node_coalescing_config_json: str | None = None
     update_events_accepted: int | None = None
@@ -296,14 +408,20 @@ class SseMeasurement:
     completed_time: float
     completion_chars: int
     completion_chunks: int
+    completion_tokens: int
+    completion_token_count_exact: bool
+    last_token_time: float
     payloads: tuple[dict[str, Any], ...]
     prompt_stream_stats: dict[str, Any] | None
+    masked_padding_manifest: dict[str, int] | None
 
 
 ReplaySample = Callable[
     [
         httpx.AsyncClient,
         SampleReplayInput,
+        RenderedReplayPrompt,
+        ChatTemplateRenderer,
         argparse.Namespace,
         str,
         float,
@@ -689,6 +807,21 @@ def parse_args(mode: ReplayMode) -> argparse.Namespace:
         help="Served model name sent through the proxy.",
     )
     parser.add_argument(
+        "--tokenizer-model",
+        type=str,
+        required=True,
+        help=(
+            "Tokenizer model used to apply the served model chat template and "
+            "encode every prompt segment."
+        ),
+    )
+    parser.add_argument(
+        "--tokenizer-trust-remote-code",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Allow remote tokenizer code while loading --tokenizer-model.",
+    )
+    parser.add_argument(
         "--qps",
         type=float,
         default=1.0,
@@ -838,6 +971,24 @@ def parse_args(mode: ReplayMode) -> argparse.Namespace:
         help="Save parsed SSE response payloads per request for debugging.",
     )
     parser.add_argument(
+        "--return-token-ids",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Request delta token IDs in completion SSE chunks. Enable this "
+            "for exact output-token throughput and TPOT measurement."
+        ),
+    )
+    parser.add_argument(
+        "--expected-masked-padding",
+        choices=("any", "enabled", "disabled"),
+        default="any",
+        help=(
+            "Validate whether the first prompt-stream SSE payload carries "
+            "the masked-padding manifest expected from the active P node."
+        ),
+    )
+    parser.add_argument(
         "--ttft-only",
         action="store_true",
         help=(
@@ -953,6 +1104,23 @@ def _prompt_stream_finish_endpoint(args: argparse.Namespace) -> str:
     if getattr(args, "ttft_only", False):
         return "/v1/prompt_stream/finish_ttft"
     return "/v1/prompt_stream/finish"
+
+
+def _prompt_stream_start_endpoint(args: argparse.Namespace) -> str:
+    """返回当前 prompt-stream replay 应使用的 start 路径。
+
+    TTFT-only 必须从会话创建时就不携带 ``kv_transfer_params``；若仍使用
+    普通 ``/start``，P 会错误地把该请求登记为未来由 D 拉取 KV 的 producer。
+
+    Args:
+        args: 回放命令行参数。
+
+    Returns:
+        proxy 的完整 P/D 或严格 P-only start endpoint。
+    """
+    if getattr(args, "ttft_only", False):
+        return "/v1/prompt_stream/start_ttft"
+    return "/v1/prompt_stream/start"
 
 
 def _load_json(path: Path) -> dict[str, Any]:
@@ -1126,17 +1294,16 @@ def _get_data_events(source_stream: SourceEventStream) -> list[dict[str, Any]]:
     ]
 
 
-def _build_normal_prompt(sample: SampleReplayInput) -> tuple[str, int, int]:
-    """构造普通模式使用的最终逻辑 prompt。
+def _render_sample_prompt(
+    sample: SampleReplayInput,
+    renderer: ChatTemplateRenderer,
+) -> RenderedReplayPrompt:
+    """用目标模型 chat template 构造可分段且可复现的逻辑 prompt。
 
-    排布严格遵循实验定义：固定模板 + 所有 Append chunk + 每个 Update 来源的
-    最终快照 + 最后用户问题。不会包含 source_finished 控制事件。
-
-    Args:
-        sample: 已验证的 mixed-source 样本。
-
-    Returns:
-        三元组 ``(prompt, append_chars, final_update_chars)``。
+    其中 ``start_request.prompt`` 是 system message；Append、最终 Update
+    快照和 finish 文本共同构成同一个 user message。动态部分均以
+    ``add_special_tokens=False`` 独立编码，因此 REST 传输不会重复插入 BOS、
+    EOS 或 assistant header。
     """
     append_text_parts: list[str] = []
     final_update_text_parts: list[str] = []
@@ -1144,22 +1311,48 @@ def _build_normal_prompt(sample: SampleReplayInput) -> tuple[str, int, int]:
         data_records = _get_data_events(source_stream)
         if source_stream.source_type == "append":
             append_text_parts.extend(
-                str(record["event"].get("text") or "") for record in data_records
+                str(record["event"].get("text") or "")
+                for record in data_records
             )
         elif data_records:
-            # Update 语义是完整快照，因此普通模式仅保留该来源最终版本。
             final_update_text_parts.append(
                 str(data_records[-1]["event"].get("text") or "")
             )
 
+    system_message = str(sample.start_request["prompt"]).strip()
     append_text = "".join(append_text_parts)
     final_update_text = "".join(final_update_text_parts)
-    final_question = str(sample.finish_event.get("text") or "")
-    prompt = (
-        f"{sample.start_request['prompt']}{append_text}{final_update_text}"
-        f"{final_question}"
+    finish_text = str(sample.finish_event.get("text") or "")
+    template_prefix, template_suffix = renderer.render_envelope(system_message)
+    user_content = f"{append_text}{final_update_text}{finish_text}"
+    logical_prompt_text = f"{template_prefix}{user_content}{template_suffix}"
+    expected_prompt_text = renderer.render_chat_prompt(system_message, user_content)
+    if logical_prompt_text != expected_prompt_text:
+        raise ValueError(
+            "Chat template envelope does not reproduce the complete prompt; "
+            "cannot safely replay segmented token ids."
+        )
+
+    start_token_ids = renderer.encode_content(template_prefix)
+    finish_token_ids = (
+        *renderer.encode_content(finish_text),
+        *renderer.encode_content(template_suffix),
     )
-    return prompt, len(append_text), len(final_update_text)
+    logical_prompt_token_ids = (
+        *start_token_ids,
+        *renderer.encode_content(append_text),
+        *renderer.encode_content(final_update_text),
+        *finish_token_ids,
+    )
+    return RenderedReplayPrompt(
+        start_token_ids=start_token_ids,
+        finish_text=finish_text,
+        finish_token_ids=finish_token_ids,
+        logical_prompt_token_ids=logical_prompt_token_ids,
+        logical_prompt_text=logical_prompt_text,
+        append_chars=len(append_text),
+        final_update_chars=len(final_update_text),
+    )
 
 
 def _override_sampling_params(
@@ -1249,7 +1442,11 @@ def _limit_selected_samples(
 
 def _is_first_token_choice(choice: dict[str, Any]) -> bool:
     """判断一个 OpenAI SSE choice 是否实际代表一个生成 token。"""
-    if "token_ids" in choice and isinstance(choice["token_ids"], list):
+    if (
+        "token_ids" in choice
+        and isinstance(choice["token_ids"], list)
+        and choice["token_ids"]
+    ):
         return True
     if "text" in choice:
         # 仅有 final finish_reason 的空 completion chunk 不应伪装成首 token。
@@ -1303,8 +1500,13 @@ async def _consume_sse_response(
     first_token_origin: str | None = None
     completion_chars = 0
     completion_chunks = 0
+    completion_tokens = 0
+    token_count_is_exact = True
+    saw_token_id_metadata = False
+    last_token_time: float | None = None
     payloads: list[dict[str, Any]] = []
     prompt_stream_stats: dict[str, Any] | None = None
+    masked_padding_manifest: dict[str, int] | None = None
     async for line in response.aiter_lines():
         if not line.startswith("data:"):
             continue
@@ -1337,6 +1539,35 @@ async def _consume_sse_response(
             # 独立保存统计，避免 --ttft-only 且未保存 payload 时丢失首帧字段。
             prompt_stream_stats = dict(raw_stats)
 
+        raw_padding = payload.get("prompt_stream_masked_padding")
+        if raw_padding is not None:
+            if (
+                not isinstance(raw_padding, dict)
+                or set(raw_padding) != {"version", "start", "end"}
+                or any(
+                    type(raw_padding[field_name]) is not int
+                    for field_name in ("version", "start", "end")
+                )
+                or raw_padding["version"] != 1
+                or not 0 <= raw_padding["start"] <= raw_padding["end"]
+            ):
+                raise ReplayHttpError(
+                    "SSE prompt_stream_masked_padding must be a valid v1 range."
+                )
+            normalized_padding = {
+                field_name: int(raw_padding[field_name])
+                for field_name in ("version", "start", "end")
+            }
+            if (
+                masked_padding_manifest is not None
+                and masked_padding_manifest != normalized_padding
+            ):
+                raise ReplayHttpError(
+                    "One SSE response returned inconsistent masked-padding "
+                    "manifests."
+                )
+            masked_padding_manifest = normalized_padding
+
         choices = payload.get("choices")
         if not isinstance(choices, list):
             continue
@@ -1344,23 +1575,46 @@ async def _consume_sse_response(
             if not isinstance(choice, dict):
                 continue
             if _is_first_token_choice(choice):
+                token_arrival_time = time.perf_counter()
                 if first_token_time is None:
-                    first_token_time = time.perf_counter()
+                    first_token_time = token_arrival_time
                     first_token_origin = (
                         "prefill" if "token_ids" in choice else "decode"
                     )
                 completion_chunks += 1
                 completion_chars += len(_chunk_text(choice))
+                raw_token_ids = choice.get("token_ids")
+                if isinstance(raw_token_ids, list):
+                    if not all(type(token_id) is int for token_id in raw_token_ids):
+                        raise ReplayHttpError(
+                            "Completion SSE token_ids must contain integers."
+                        )
+                    saw_token_id_metadata = True
+                    completion_tokens += len(raw_token_ids)
+                else:
+                    # 未请求 token_ids 时只能以非空 SSE choice 近似一个 token；
+                    # 该数值不得进入正式 TPS 结果。
+                    token_count_is_exact = False
+                    completion_tokens += 1
+                last_token_time = token_arrival_time
                 if ttft_only:
                     completed_time = time.perf_counter()
+                    assert first_token_time is not None
+                    assert last_token_time is not None
                     return SseMeasurement(
                         first_token_time=first_token_time,
                         first_token_origin=first_token_origin,
                         completed_time=completed_time,
                         completion_chars=completion_chars,
                         completion_chunks=completion_chunks,
+                        completion_tokens=completion_tokens,
+                        completion_token_count_exact=(
+                            token_count_is_exact and saw_token_id_metadata
+                        ),
+                        last_token_time=last_token_time,
                         payloads=tuple(payloads),
                         prompt_stream_stats=prompt_stream_stats,
+                        masked_padding_manifest=masked_padding_manifest,
                     )
 
     completed_time = time.perf_counter()
@@ -1368,14 +1622,21 @@ async def _consume_sse_response(
         raise ReplayHttpError("SSE response ended before emitting a completion token.")
     if first_token_time < first_token_start_time:
         raise AssertionError("First token time cannot precede TTFT start time.")
+    assert last_token_time is not None
     return SseMeasurement(
         first_token_time=first_token_time,
         first_token_origin=first_token_origin,
         completed_time=completed_time,
         completion_chars=completion_chars,
         completion_chunks=completion_chunks,
+        completion_tokens=completion_tokens,
+        completion_token_count_exact=(
+            token_count_is_exact and saw_token_id_metadata
+        ),
+        last_token_time=last_token_time,
         payloads=tuple(payloads),
         prompt_stream_stats=prompt_stream_stats,
+        masked_padding_manifest=masked_padding_manifest,
     )
 
 
@@ -1430,6 +1691,8 @@ def _planned_arrival_offsets(
 
 async def _replay_requests(
     samples: Sequence[SampleReplayInput],
+    rendered_prompts: Mapping[str, RenderedReplayPrompt],
+    renderer: ChatTemplateRenderer,
     args: argparse.Namespace,
     run_id: str,
     replay_sample: ReplaySample,
@@ -1438,6 +1701,8 @@ async def _replay_requests(
 
     Args:
         samples: 已验证的 mixed-source 样本。
+        rendered_prompts: 每个 sample 已预渲染的 chat-template prompt。
+        renderer: 目标模型 tokenizer 与固定 chat template。
         args: 当前脚本的 CLI 参数。
         run_id: 本次实验的稳定标识。
         replay_sample: 当前模式负责单请求 REST 链路的异步函数。
@@ -1466,9 +1731,12 @@ async def _replay_requests(
                 queue_delay_ms = (
                     time.perf_counter() - semaphore_wait_start_time
                 ) * 1000
+                rendered_prompt = rendered_prompts[sample.sample_id]
                 return await replay_sample(
                     client,
                     sample,
+                    rendered_prompt,
+                    renderer,
                     args,
                     run_id,
                     planned_offset * 1000,
@@ -1567,6 +1835,23 @@ def _summarize_metrics(metrics: Sequence[RequestMetric]) -> dict[str, Any]:
             and metric.finish_to_first_token_ms is not None
         ]
         numeric_ttfts = [float(ttft) for ttft in successful_ttfts]
+        numeric_tpots = [
+            float(metric.mean_time_per_output_token_ms)
+            for metric in mode_metrics
+            if metric.completion_token_count_exact
+            and metric.mean_time_per_output_token_ms is not None
+        ]
+        numeric_output_tps = [
+            float(metric.output_tokens_per_second)
+            for metric in mode_metrics
+            if metric.completion_token_count_exact
+            and metric.output_tokens_per_second is not None
+        ]
+        total_exact_output_tokens = sum(
+            metric.completion_tokens
+            for metric in mode_metrics
+            if metric.completion_token_count_exact
+        )
         transport_success_metrics = [
             metric
             for metric in mode_metrics
@@ -1638,6 +1923,25 @@ def _summarize_metrics(metrics: Sequence[RequestMetric]) -> dict[str, Any]:
                 "p95": _percentile(numeric_ttfts, 95),
                 "p99": _percentile(numeric_ttfts, 99),
                 "max": max(numeric_ttfts) if numeric_ttfts else None,
+            },
+            "tpot_ms": {
+                "mean": statistics.fmean(numeric_tpots) if numeric_tpots else None,
+                "p50": _percentile(numeric_tpots, 50),
+                "p90": _percentile(numeric_tpots, 90),
+                "p95": _percentile(numeric_tpots, 95),
+                "p99": _percentile(numeric_tpots, 99),
+            },
+            "output_tokens_per_second": {
+                "mean": (
+                    statistics.fmean(numeric_output_tps)
+                    if numeric_output_tps
+                    else None
+                ),
+                "p50": _percentile(numeric_output_tps, 50),
+                "p90": _percentile(numeric_output_tps, 90),
+                "p95": _percentile(numeric_output_tps, 95),
+                "num_exact_requests": len(numeric_output_tps),
+                "total_exact_output_tokens": total_exact_output_tokens,
             },
             "prompt_stream_stats": {
                 "update_events_accepted": total_accepted,
@@ -1747,6 +2051,7 @@ def _request_metric_row(metric: RequestMetric) -> dict[str, Any]:
 def _write_run_outputs(
     run_directory: Path,
     args: argparse.Namespace,
+    renderer: ChatTemplateRenderer,
     samples: Sequence[SampleReplayInput],
     metrics: Sequence[RequestMetric],
 ) -> None:
@@ -1789,6 +2094,12 @@ def _write_run_outputs(
         run_directory / "config.json",
         {
             "args": vars(args),
+            "prompt_format": {
+                "name": "model_chat_template_system_user/v1",
+                "tokenizer_model": renderer.tokenizer_model,
+                "chat_template_sha256": renderer.chat_template_sha256,
+                "transport": "pretokenized_segments",
+            },
             "num_selected_samples": len(samples),
             "selected_sample_set_sha256": selected_sample_set_sha256,
             "selected_samples": selected_sample_manifest,
@@ -1828,6 +2139,8 @@ def _write_run_outputs(
 
 def _validate_args(args: argparse.Namespace) -> None:
     """在读取数据或发 HTTP 前检查数值与模式参数。"""
+    if not args.tokenizer_model.strip():
+        raise ValueError("--tokenizer-model must not be empty.")
     if args.start_index < 0:
         raise ValueError("--start-index must be non-negative.")
     if args.max_requests < 0:
@@ -1922,6 +2235,16 @@ async def run(
     _validate_args(args)
     candidate_samples = _select_samples(args)
     samples = _limit_selected_samples(candidate_samples, args)
+    renderer = ChatTemplateRenderer.from_pretrained(
+        args.tokenizer_model,
+        args.tokenizer_trust_remote_code,
+    )
+    rendered_prompts = {
+        sample.sample_id: _render_sample_prompt(sample, renderer)
+        for sample in samples
+    }
+    if len(rendered_prompts) != len(samples):
+        raise ValueError("Selected samples must have unique sample_id values.")
     run_id, run_directory = _make_run_directory(args)
     logger.info(
         "Selected %d samples; mode=%s qps=%.3f max_concurrency=%d.",
@@ -1934,9 +2257,7 @@ async def run(
     if args.dry_run:
         dry_metrics: list[RequestMetric] = []
         for sample in samples:
-            normal_prompt, append_chars, final_update_chars = _build_normal_prompt(
-                sample
-            )
+            rendered_prompt = rendered_prompts[sample.sample_id]
             dry_metrics.append(
                 RequestMetric(
                     run_id=run_id,
@@ -1958,21 +2279,23 @@ async def run(
                         for source_stream in sample.source_streams
                         if source_stream.source_type == "update"
                     ),
-                    append_chars=append_chars,
-                    final_update_chars=final_update_chars,
-                    normal_prompt_chars=len(normal_prompt),
+                    append_chars=rendered_prompt.append_chars,
+                    final_update_chars=rendered_prompt.final_update_chars,
+                    normal_prompt_chars=len(rendered_prompt.logical_prompt_text),
                 )
             )
-        _write_run_outputs(run_directory, args, samples, dry_metrics)
+        _write_run_outputs(run_directory, args, renderer, samples, dry_metrics)
         return run_directory
 
     metrics = await _replay_requests(
         samples,
+        rendered_prompts,
+        renderer,
         args,
         run_id,
         replay_sample,
     )
-    _write_run_outputs(run_directory, args, samples, metrics)
+    _write_run_outputs(run_directory, args, renderer, samples, metrics)
     return run_directory
 
 

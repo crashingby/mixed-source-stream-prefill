@@ -14,16 +14,20 @@ from typing import Any
 
 import httpx
 from replay_common import (
+    ChatTemplateRenderer,
     EventMetric,
+    RenderedReplayPrompt,
     ReplayHttpError,
     RequestMetric,
     SampleReplayInput,
     SourceEventStream,
+    SseMeasurement,
     apply_prompt_stream_stats,
     _normalize_v1_url,
     _override_sampling_params,
     _post_json,
     _prompt_stream_finish_endpoint,
+    _prompt_stream_start_endpoint,
     _sleep_until,
     consume_sse_response,
     main,
@@ -35,6 +39,7 @@ logger = logging.getLogger(__name__)
 
 def _make_stream_start_payload(
     sample: SampleReplayInput,
+    rendered_prompt: RenderedReplayPrompt,
     args: argparse.Namespace,
     external_request_id: str,
 ) -> dict[str, Any]:
@@ -48,11 +53,16 @@ def _make_stream_start_payload(
         {
             "api": "completions",
             "model": args.model,
+            "prompt": list(rendered_prompt.start_token_ids),
             "stream": True,
             "request_id": external_request_id,
         }
     )
     _override_sampling_params(payload, args)
+    if args.return_token_ids:
+        # D 节点必须返回每个 SSE chunk 的增量 token_ids，正式 TPS 才能
+        # 使用真实 token 数，而不是把 chunk 数误当成 token 数。
+        payload["return_token_ids"] = True
     return payload
 
 
@@ -104,6 +114,7 @@ async def _send_source_events(
     proxy_url: str,
     request_id: str,
     sample: SampleReplayInput,
+    renderer: ChatTemplateRenderer,
     source_stream: SourceEventStream,
     source_dispatch_start_time: float,
     args: argparse.Namespace,
@@ -170,6 +181,10 @@ async def _send_source_events(
             actual_send_time - source_dispatch_start_time
         ) * 1000
         outbound_event = dict(stored_event)
+        if event_type in ("append", "update"):
+            outbound_event["token_ids"] = list(
+                renderer.encode_content(str(outbound_event.get("text") or ""))
+            )
         # 数据集没有实验时间；每次真正发 REST 请求时才附加 arrival_time。
         outbound_event["arrival_time"] = time.time()
         payload = {
@@ -328,6 +343,42 @@ async def _send_source_events(
     return event_metrics
 
 
+def _apply_masked_padding_measurement(
+    metric: RequestMetric,
+    measurement: SseMeasurement,
+    expected_mode: str,
+) -> None:
+    """记录并校验一次请求观察到的 masked-padding 模式。
+
+    Args:
+        metric: 当前请求的逐请求指标。
+        measurement: SSE 消费阶段提取出的模式清单与 token 时刻。
+        expected_mode: CLI 声明的 ``enabled``、``disabled`` 或 ``any``。
+
+    Raises:
+        ReplayHttpError: 实际 P 节点模式与实验标签不一致时抛出。
+    """
+    manifest = measurement.masked_padding_manifest
+    observed_enabled = manifest is not None
+    metric.masked_padding_expected = expected_mode
+    metric.masked_padding_observed = observed_enabled
+    if manifest is not None:
+        metric.masked_padding_tokens = manifest["end"] - manifest["start"]
+
+    if expected_mode == "any":
+        metric.masked_padding_validation_status = "not_evaluated"
+        return
+
+    expected_enabled = expected_mode == "enabled"
+    if observed_enabled != expected_enabled:
+        metric.masked_padding_validation_status = "mismatch"
+        raise ReplayHttpError(
+            "P-node masked-padding mode does not match the experiment: "
+            f"expected={expected_mode}, observed={observed_enabled}."
+        )
+    metric.masked_padding_validation_status = "valid"
+
+
 async def _abort_prompt_stream(
     client: httpx.AsyncClient,
     proxy_url: str,
@@ -347,6 +398,8 @@ async def _abort_prompt_stream(
 async def _replay_stream_sample(
     client: httpx.AsyncClient,
     sample: SampleReplayInput,
+    rendered_prompt: RenderedReplayPrompt,
+    renderer: ChatTemplateRenderer,
     args: argparse.Namespace,
     run_id: str,
     planned_arrival_offset_ms: float,
@@ -364,6 +417,9 @@ async def _replay_stream_sample(
         planned_arrival_offset_ms=planned_arrival_offset_ms,
         queue_delay_ms=queue_delay_ms,
         request_start_wall_time=time.time(),
+        append_chars=rendered_prompt.append_chars,
+        final_update_chars=rendered_prompt.final_update_chars,
+        normal_prompt_chars=len(rendered_prompt.logical_prompt_text),
     )
     request_id: str | None = None
     finish_sent_time: float | None = None
@@ -372,11 +428,19 @@ async def _replay_stream_sample(
         external_request_id = (
             f"replay-{run_id}-{sample.sample_id}-{uuid.uuid4().hex[:8]}"
         )
-        start_payload = _make_stream_start_payload(sample, args, external_request_id)
+        start_payload = _make_stream_start_payload(
+            sample,
+            rendered_prompt,
+            args,
+            external_request_id,
+        )
         start_ack_start_time = time.perf_counter()
         start_response = await _post_json(
             client,
-            _normalize_v1_url(args.proxy_url, "/v1/prompt_stream/start"),
+            _normalize_v1_url(
+                args.proxy_url,
+                _prompt_stream_start_endpoint(args),
+            ),
             start_payload,
         )
         metric.start_ack_ms = (time.perf_counter() - start_ack_start_time) * 1000
@@ -403,6 +467,7 @@ async def _replay_stream_sample(
                     proxy_url=args.proxy_url,
                     request_id=request_id,
                     sample=sample,
+                    renderer=renderer,
                     source_stream=source_stream,
                     source_dispatch_start_time=source_dispatch_start_time,
                     args=args,
@@ -447,6 +512,8 @@ async def _replay_stream_sample(
             )
 
         finish_event = dict(sample.finish_event)
+        finish_event["text"] = rendered_prompt.finish_text
+        finish_event["token_ids"] = list(rendered_prompt.finish_token_ids)
         finish_event["arrival_time"] = time.time()
         finish_payload = {
             "request_id": request_id,
@@ -483,6 +550,12 @@ async def _replay_stream_sample(
                 args.sse_timeout,
             )
 
+        _apply_masked_padding_measurement(
+            metric,
+            sse_measurement,
+            args.expected_masked_padding,
+        )
+
         # 首 token 已经到达后，后置 stats 校验不能把网络成功改写成失败。
         metric.transport_status = "ok"
         metric.first_token_received = True
@@ -504,6 +577,30 @@ async def _replay_stream_sample(
         metric.ttft_origin = sse_measurement.first_token_origin
         metric.completion_chars = sse_measurement.completion_chars
         metric.completion_chunks = sse_measurement.completion_chunks
+        metric.completion_tokens = sse_measurement.completion_tokens
+        metric.completion_token_count_exact = (
+            sse_measurement.completion_token_count_exact
+        )
+        metric.time_to_last_token_ms = (
+            sse_measurement.last_token_time - finish_sent_time
+        ) * 1000
+        if (
+            metric.completion_token_count_exact
+            and metric.completion_tokens > 1
+        ):
+            # TPOT 采用首 token 之后 N-1 个生成间隔的平均时长。它包含
+            # P→D handoff、D 调度及 decode，正好覆盖 mask 在 D 侧的代价。
+            decode_duration_ms = (
+                sse_measurement.last_token_time
+                - sse_measurement.first_token_time
+            ) * 1000
+            metric.mean_time_per_output_token_ms = (
+                decode_duration_ms / (metric.completion_tokens - 1)
+            )
+            if metric.mean_time_per_output_token_ms > 0:
+                metric.output_tokens_per_second = (
+                    1000 / metric.mean_time_per_output_token_ms
+                )
         metric.response_payloads = list(sse_measurement.payloads)
         apply_prompt_stream_stats(
             metric,
