@@ -258,3 +258,4 @@ research/scripts/logs
 research/scripts/replay/segmented_prefill/results
 research/scripts/replay/update_coalescing/results
 research/scripts/replay/generation_quality/results
+research/scripts/replay/masked_padding/results
