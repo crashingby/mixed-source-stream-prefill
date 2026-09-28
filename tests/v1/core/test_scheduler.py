@@ -2720,6 +2720,8 @@ def test_schedule_skip_tokenizer_init_structured_output_request():
 
 def test_abort_request_when_structured_output_fsm_cannot_advance():
     scheduler = object.__new__(Scheduler)
+    scheduler._prompt_stream_inflight_steps = {}
+    scheduler._prompt_stream_update_coalescer = None
     sampling_params = SamplingParams(ignore_eos=True, max_tokens=4)
     sampling_params.update_from_generation_config({}, EOS_TOKEN_ID)
 

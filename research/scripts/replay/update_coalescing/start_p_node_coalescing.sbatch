@@ -25,7 +25,7 @@ export COALESCING_PROFILE
 export PROMPT_STREAM_UPDATE_COALESCING_CONFIG
 
 case "${COALESCING_PROFILE}" in
-  fixed-window|quiet-debounce|adaptive)
+  fixed-window|quiet-debounce)
     soft_window_ms="${SOFT_WINDOW_MS:-20}"
     hard_deadline_ms="${HARD_DEADLINE_MS:-80}"
     if ! awk \

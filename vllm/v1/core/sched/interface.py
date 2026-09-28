@@ -176,17 +176,17 @@ class SchedulerInterface(ABC):
     def has_prompt_stream_update_coalescer(self) -> bool:
         """返回当前 scheduler 是否启用了 PromptStream Update 合并器。
 
-        默认值为 ``False``，使普通 scheduler 完全保留原有 EngineCore
-        轮询、阻塞与休眠路径。实现合并器的 scheduler 必须显式覆盖该接口。
+        该能力决定是否启用 Update 策略反馈与 deadline 唤醒，不决定 dormant
+        是否可用。实现合并器的 scheduler 必须显式覆盖该接口。
         """
         return False
 
     def has_runnable_engine_work(self) -> bool:
         """判断当前是否存在需要 EngineCore 立即推进的工作。
 
-        默认实现保持既有 scheduler 语义。PromptStream Update 合并器可以
-        覆盖该接口，把只等待 source 事件或 deadline 的 dormant 请求排除，
-        避免 EngineCore 在没有 GPU work 时空转。
+        默认实现保持既有 scheduler 语义。支持 PromptStream 的 scheduler
+        将只等待输入或 deadline 的 dormant 请求排除，同时保留 worker
+        清理和 KV 传输等必须推进的工作；此行为不依赖 Update 合并配置。
         """
         return self.has_requests()
 
@@ -195,7 +195,7 @@ class SchedulerInterface(ABC):
         return None
 
     def flush_due_update_coalescing(self, now: float | None = None) -> int:
-        """放行已经到期的 PromptStream Update 窗口。
+        """放行到期窗口，并按执行进度重新评估 adaptive 候选。
 
         不支持合并的 scheduler 使用 no-op 默认实现，确保 EngineCore 的
         可选唤醒 hook 不会改变普通请求行为。

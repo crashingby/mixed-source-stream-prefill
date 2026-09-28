@@ -89,10 +89,11 @@ RUN_METADATA_FIELDS = (
     "expected_coalescing",
     "coalescing_config_json",
     "update_policy",
-    "append_gate",
     "soft_window_ms",
     "hard_deadline_ms",
     "ttft_deadline_ms",
+    "adaptive_token_pressure_threshold",
+    "adaptive_slot_pressure_threshold",
 )
 
 SUMMARY_METRIC_FIELDS = (
@@ -137,10 +138,11 @@ CONFIGURATION_SUMMARY_FIELDS = (
     "update_chunk_interval_s",
     "coalescing_config_json",
     "update_policy",
-    "append_gate",
     "soft_window_ms",
     "hard_deadline_ms",
     "ttft_deadline_ms",
+    "adaptive_token_pressure_threshold",
+    "adaptive_slot_pressure_threshold",
     "arrival_process",
     "model",
     "max_concurrency",
@@ -168,7 +170,6 @@ COMBINED_METADATA_FIELDS = (
     "analysis_update_chunk_interval_s",
     "analysis_coalescing_config_json",
     "analysis_update_policy",
-    "analysis_append_gate",
 )
 
 _WARMUP_PATTERN = re.compile(r"(^|[-_])warmup($|[-_])", re.IGNORECASE)
@@ -200,10 +201,12 @@ class RunMetadata:
     expected_coalescing: str
     coalescing_config_json: str
     update_policy: str
-    append_gate: str
     soft_window_ms: float | None
     hard_deadline_ms: float | None
     ttft_deadline_ms: float | None
+    # 两个阈值显式写入汇总，区分计算预算与序列名额的敏感性实验。
+    adaptive_token_pressure_threshold: float | None = None
+    adaptive_slot_pressure_threshold: float | None = None
 
     def as_dict(self) -> dict[str, Any]:
         """返回可直接写入 CSV/JSON 的元数据字典。"""
@@ -706,11 +709,6 @@ def _load_run(run_dir: Path, config: dict[str, Any]) -> LoadedRun:
         if coalescing_config is not None
         else "disabled"
     )
-    append_gate = (
-        str(coalescing_config.get("append_gate", "none"))
-        if coalescing_config is not None
-        else "none"
-    )
 
     def config_float(field_name: str) -> float | None:
         """读取当前合并 JSON 中的可选浮点参数。"""
@@ -800,10 +798,15 @@ def _load_run(run_dir: Path, config: dict[str, Any]) -> LoadedRun:
         expected_coalescing=expected_coalescing,
         coalescing_config_json=canonical_json,
         update_policy=update_policy,
-        append_gate=append_gate,
         soft_window_ms=config_float("soft_window_ms"),
         hard_deadline_ms=config_float("hard_deadline_ms"),
         ttft_deadline_ms=config_float("ttft_deadline_ms"),
+        adaptive_token_pressure_threshold=config_float(
+            "adaptive_token_pressure_threshold"
+        ),
+        adaptive_slot_pressure_threshold=config_float(
+            "adaptive_slot_pressure_threshold"
+        ),
     )
     return LoadedRun(
         run_dir=run_dir,
@@ -1061,10 +1064,15 @@ def _configuration_summaries(
                 "update_chunk_interval_s": metadata.update_chunk_interval_s,
                 "coalescing_config_json": metadata.coalescing_config_json,
                 "update_policy": metadata.update_policy,
-                "append_gate": metadata.append_gate,
                 "soft_window_ms": metadata.soft_window_ms,
                 "hard_deadline_ms": metadata.hard_deadline_ms,
                 "ttft_deadline_ms": metadata.ttft_deadline_ms,
+                "adaptive_token_pressure_threshold": (
+                    metadata.adaptive_token_pressure_threshold
+                ),
+                "adaptive_slot_pressure_threshold": (
+                    metadata.adaptive_slot_pressure_threshold
+                ),
                 "arrival_process": metadata.arrival_process,
                 "model": metadata.model,
                 "max_concurrency": metadata.max_concurrency,
@@ -1123,7 +1131,6 @@ def _combined_request_rows(
                         metadata.coalescing_config_json
                     ),
                     "analysis_update_policy": metadata.update_policy,
-                    "analysis_append_gate": metadata.append_gate,
                     **request_row,
                 }
             )

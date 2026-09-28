@@ -162,10 +162,10 @@ repetition/presence/frequency penalty 均为默认值，否则 masked 路径会�
 无服务状态机，完整模型/P-D/replay 仍需运行验证。更多说明见
 [Masked-Padding.md](../../Masked-Padding.md)。
 
-启用严格 Append gate 与固定窗口的 P 节点提交示例：
+启用 Update 固定窗口合并的 P 节点提交示例：
 
 ```shell
-PROMPT_STREAM_UPDATE_COALESCING_CONFIG='{"append_gate":"hold_until_append_finished","update_policy":"fixed_window","soft_window_ms":20,"hard_deadline_ms":80}' \
+PROMPT_STREAM_UPDATE_COALESCING_CONFIG='{"update_policy":"fixed_window","soft_window_ms":20,"hard_deadline_ms":80}' \
 MODEL_PATH=<MODEL_PATH> \
 SERVED_MODEL_NAME=<SERVED_MODEL_NAME> \
 sbatch --nodelist=<P_HOST> research/scripts/server/start_p_node.sbatch
@@ -260,7 +260,7 @@ sbatch --nodelist=g2c9 research/scripts/server/start_p_node.sbatch
 
 ```shell
 VLLM_NIXL_SIDE_CHANNEL_HOST=g2c9 \
-PROMPT_STREAM_UPDATE_COALESCING_CONFIG='{"append_gate":"hold_until_append_finished","update_policy":"fixed_window","soft_window_ms":20,"hard_deadline_ms":80}' \
+PROMPT_STREAM_UPDATE_COALESCING_CONFIG='{"update_policy":"fixed_window","soft_window_ms":20,"hard_deadline_ms":80}' \
 MODEL_PATH=/workplace/home/huangxinying/Models/Qwen2.5-3B/ \
 SERVED_MODEL_NAME=qwen2.5-3b \
 GPU_MEMORY_UTILIZATION=0.6 \

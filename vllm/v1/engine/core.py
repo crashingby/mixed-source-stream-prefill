@@ -156,7 +156,7 @@ class EngineCore:
             block_size=scheduler_block_size,
             hash_block_size=hash_block_size,
         )
-        # 缓存可选合并器能力，避免关闭实验功能时触碰新调度路径。
+        # 合并器能力只控制 deadline；所有 PromptStream 共用 dormant 停放。
         self.prompt_stream_update_coalescer_enabled = (
             self.scheduler.has_prompt_stream_update_coalescer()
         )
@@ -492,13 +492,8 @@ class EngineCore:
         if self.prompt_stream_update_coalescer_enabled:
             self.scheduler.flush_due_update_coalescing(time.monotonic())
 
-        # 关闭合并器时保留原有 has_requests() 判定；仅启用后才把 dormant
-        # Request 从立即可运行的 EngineCore work 中排除。
-        has_scheduler_work = (
-            self.scheduler.has_runnable_engine_work()
-            if self.prompt_stream_update_coalescer_enabled
-            else self.scheduler.has_requests()
-        )
+        # dormant 仍属于未结束请求，但不能独自触发空的模型执行。
+        has_scheduler_work = self.scheduler.has_runnable_engine_work()
         if not has_scheduler_work:
             return {}, False
         scheduler_output = self.scheduler.schedule(self._should_throttle_prefills())
@@ -557,7 +552,11 @@ class EngineCore:
 
         model_executed = False
         deferred_scheduler_output = None
-        if self.scheduler.has_requests():
+        # 无时间 deadline 的 adaptive 也要在检查空闲前利用新的计算机会。
+        if self.prompt_stream_update_coalescer_enabled:
+            self.scheduler.flush_due_update_coalescing(time.monotonic())
+        # 仅有 dormant 时不再提交空 batch；下方仍会消费已提交的结果。
+        if self.scheduler.has_runnable_engine_work():
             scheduler_output = self.scheduler.schedule(self._should_throttle_prefills())
             with self.log_error_detail(scheduler_output):
                 exec_future = self.model_executor.execute_model(
@@ -588,7 +587,7 @@ class EngineCore:
                 # Add this step's future to the queue.
                 batch_queue.appendleft((future, scheduler_output, exec_future))
                 if len(batch_queue) < self.batch_queue_size and (
-                    model_executed or self.scheduler.has_requests()
+                    model_executed or self.scheduler.has_runnable_engine_work()
                 ):
                     # Don't block on next worker response unless the queue is full
                     # or there are no more requests to schedule.
@@ -1258,13 +1257,8 @@ class EngineCoreProc(EngineCore):
 
     def has_work(self) -> bool:
         """Returns true if the engine should be stepped."""
-        # 普通 scheduler 保持原 has_requests() 语义；合并器启用后，dormant
-        # Request 只由 source event 或 deadline 唤醒，不应触发忙循环。
-        has_scheduler_work = (
-            self.scheduler.has_runnable_engine_work()
-            if self.prompt_stream_update_coalescer_enabled
-            else self.scheduler.has_requests()
-        )
+        # dormant 由新事件或 deadline 唤醒；在途 batch 仍必须继续收尾。
+        has_scheduler_work = self.scheduler.has_runnable_engine_work()
         return self.engines_running or has_scheduler_work or bool(self.batch_queue)
 
     def is_running(self) -> bool:
@@ -1276,7 +1270,7 @@ class EngineCoreProc(EngineCore):
         while self._handle_shutdown():
             # 1) Poll the input queue until there is work to do.
             self._process_input_queue()
-            # 2) 仅启用合并器时，同线程放行已经到期的 Update 窗口。
+            # 2) 同线程处理时间到期或执行背压解除后的 Update 窗口。
             if self.prompt_stream_update_coalescer_enabled:
                 self.scheduler.flush_due_update_coalescing(time.monotonic())
             # 3) Step the engine core and return the outputs.
@@ -1289,6 +1283,12 @@ class EngineCoreProc(EngineCore):
 
         waited = False
         while not self.has_work() and self.is_running():
+            if self.prompt_stream_update_coalescer_enabled:
+                # abort/零 forward/回包可释放最后一个名额；阻塞等输入前必须
+                # 再检查无 deadline 的窗口，否则没有新事件时会永久睡眠。
+                self.scheduler.flush_due_update_coalescing(time.monotonic())
+                if self.has_work():
+                    break
             # Notify callbacks waiting for engine to become idle.
             self._notify_idle_state_callbacks()
             if self.input_queue.empty():
@@ -1313,7 +1313,7 @@ class EngineCoreProc(EngineCore):
                         timeout=timeout if block else None,
                     )
                 else:
-                    # 关闭合并器时严格保留原有无限期阻塞调用路径。
+                    # 未启用合并时没有定时器，等待新事件或 abort 唤醒。
                     req = self.input_queue.get(block=block)
                 self._handle_client_request(*req)
             except queue.Empty:
@@ -1343,11 +1343,7 @@ class EngineCoreProc(EngineCore):
         # If no model execution happened but there is still scheduler work
         # (e.g. WAITING_FOR_REMOTE_KVS or delayed KV connector frees), yield
         # the GIL briefly to allow background transfer threads to make progress.
-        has_scheduler_work = (
-            self.scheduler.has_runnable_engine_work()
-            if self.prompt_stream_update_coalescer_enabled
-            else self.scheduler.has_requests()
-        )
+        has_scheduler_work = self.scheduler.has_runnable_engine_work()
         if not model_executed and has_scheduler_work:
             time.sleep(0.001)
 
@@ -1407,7 +1403,6 @@ class EngineCoreProc(EngineCore):
         if (
             self.shutdown_state == EngineShutdownState.SHUTTING_DOWN
             and self.vllm_config.shutdown_timeout > 0
-            and self.prompt_stream_update_coalescer_enabled
         ):
             # A runnable stream request may become dormant only after its
             # in-flight work completes during drain. No new source event can
@@ -1922,8 +1917,10 @@ class DPEngineCoreProc(EngineCoreProc):
         # ignore_start_dp_wave) before any rank starts stepping. Uses
         # the existing all-reduce which is safe because engines are
         # stopped.
+        # 纯 dormant 不维持 DP wave，但已提交的 batch 仍须跨 rank 收尾。
         has_global_unfinished = ParallelConfig.has_unfinished_dp(
-            self.dp_group, self.scheduler.has_unfinished_requests()
+            self.dp_group,
+            self.scheduler.has_runnable_engine_work() or bool(self.batch_queue),
         )
 
         if has_global_unfinished:
@@ -1998,7 +1995,10 @@ class DPEngineCoreProc(EngineCoreProc):
             executed = self._process_engine_step()
             self._maybe_publish_request_counts()
 
-            local_unfinished_reqs = self.scheduler.has_unfinished_requests()
+            # 未封口的 dormant 不需要 collective；在途 batch 必须先耗尽。
+            local_unfinished_reqs = (
+                self.scheduler.has_runnable_engine_work() or bool(self.batch_queue)
+            )
             if not executed:
                 if not local_unfinished_reqs and not self.engines_running:
                     # All engines are idle.

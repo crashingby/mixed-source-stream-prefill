@@ -173,7 +173,7 @@ class SchedulerConfig:
     """流式 Prompt Update 合并配置。
 
     ``None`` 保持现有的逐事件 Update 行为；传入配置对象后，EngineCore 与
-    Scheduler 才创建请求级合并状态并处理相应 deadline。
+    Scheduler 才创建请求级合并状态，处理定时策略或执行背压准入。
     """
 
     prompt_stream_masked_padding: bool = False

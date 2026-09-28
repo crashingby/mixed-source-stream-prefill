@@ -3,11 +3,10 @@
 
 import enum
 import json
-import math
 import time
 from collections import deque
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass, field, fields
+from dataclasses import dataclass, field, fields, replace
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -16,6 +15,11 @@ from vllm.multimodal.inputs import MultiModalFeatureSpec
 from vllm.pooling_params import PoolingParams
 from vllm.sampling_params import SamplingParams
 from vllm.utils import length_from_prompt_token_ids_or_embeds
+from vllm.v1.core.sched.update_coalescing import (
+    UpdateCoalescingContext,
+    UpdateCoalescingPolicy,
+    create_update_coalescing_policy,
+)
 from vllm.v1.engine import (
     EngineCoreEvent,
     EngineCoreEventType,
@@ -88,23 +92,10 @@ class UpdateAdmissionStatus(enum.Enum):
     CANCELLED_BY_RECOVERY = "cancelled_by_recovery"
 
 
-class AppendGatePhase(enum.Enum):
-    """表示 Append gate 当前允许 Update admission 的阶段。"""
-
-    # Append 尚未结束，严格 gate 会阻止 Update work 物化。
-    WAITING_FOR_APPEND = "waiting_for_append"
-    # Append source 已封闭，严格 gate 已经打开。
-    APPEND_FINISHED = "append_finished"
-    # Update 先结束并触发近似早放行。
-    EARLY_RELEASE = "early_release"
-
-
 @dataclass
-class AppendUpdateGateState:
-    """保存单请求 Append gate、source barrier 和 Append epoch。"""
+class PromptStreamSourceState:
+    """保存合并请求的 source 封闭状态和已接受、已物化的 Append 版本。"""
 
-    # gate 的可读阶段，便于 scheduler 日志区分严格与近似路径。
-    phase: AppendGatePhase = AppendGatePhase.WAITING_FOR_APPEND
     # 第一版只允许一个真实 Append source；start 合成事件不计入该限制。
     append_source_id: str | None = None
     # 第一版只允许一个 Update source。
@@ -130,6 +121,8 @@ class UpdateCoalescingState:
     config: "PromptStreamUpdateCoalescingConfig"
     # Request 进入 EngineCore 时对应的 monotonic 时间，用于 TTFT deadline。
     request_start_time: float
+    # 每个请求构建一次无共享可变状态的策略对象，后续通过统一接口决策。
+    policy: UpdateCoalescingPolicy = field(init=False)
     # 窗口内最新且唯一可覆盖的完整 Update 快照。
     latest_pending_token_ids: tuple[int, ...] | None = None
     # 最近一次已 admission 的完整快照，即逻辑执行链尾部。
@@ -140,37 +133,26 @@ class UpdateCoalescingState:
     first_pending_time: float | None = None
     # 当前窗口最近一次 Update 到达的 monotonic 时间。
     last_update_time: float | None = None
-    # 最近一次合法 Update 的跨窗口到达时间。
-    last_observed_update_time: float | None = None
     # 最近一次合法 Update 到达时绑定的 Append epoch。跨 epoch 的 eager
     # 反事实不能复用旧 Update LCP，必须按从零 Prefill 计数。
     last_observed_update_append_epoch: int | None = None
-    # interval 与 gain EWMA 各自拥有独立的跨窗口观测数。
-    interval_observation_count: int = 0
-    gain_observation_count: int = 0
     # policy 计算出的软、硬与 TTFT 绝对 deadline。
     soft_deadline: float | None = None
     hard_deadline: float | None = None
     ttft_deadline: float | None = None
-    # Adaptive 每次新 Update 只允许 Scheduler 按当时负载重算
-    # 一次绝对 soft deadline。recovery 不能重新打开该开关。
-    adaptive_deadline_needs_refresh: bool = False
-    # policy 已要求 flush、但 admission 暂时被 gate 阻挡。
-    flush_ready: bool = False
-    # sticky ready 的首次触发原因，仅用于日志与实验统计。
-    flush_ready_reason: str | None = None
     # deadline heap 使用的惰性失效代数。
     generation: int = 0
     # 当前窗口累计的 Update 事件与假想 eager token 成本。
     pending_event_count: int = 0
     hypothetical_eager_tokens: int = 0
-    # 到达间隔与覆盖收益的请求级 EWMA。
-    interval_ewma: float | None = None
-    merge_gain_ewma: float | None = None
     # 统计口径中的最近一次逻辑 admission。它不随 preemption 回退，避免
     # 恢复物理 KV 时把同一目标重复计为算法创建的 work。
     stats_last_admitted_token_ids: tuple[int, ...] = ()
     stats_last_admitted_append_epoch: int | None = None
+
+    def __post_init__(self) -> None:
+        """按启动配置创建策略；调度反馈通过不可变 context 单独传入。"""
+        self.policy = create_update_coalescing_policy(self.config)
 
 
 @dataclass
@@ -565,11 +547,14 @@ class PromptStreamState:
     # 当前正在 chunked prefill 的 work item；一个 work item 中途不可切换，
     # 防止覆写 PREFIX_APPEND 尾部 padding 后再用旧 padding 作为 Update 前缀。
     active_work_item: PromptStreamWorkItem | None = None
+    # UPDATE 阶段已提交、尚未收到结果的 GPU step 数。调度会乐观清空 active，
+    # 因而执行背压必须另外等待这些 step；Append/Question 不计入此字段。
+    num_update_inflight_steps: int = 0
     # 下一次选中 Update work 时需要执行的 UPDATE 域截断边界。事件到达时不
     # 立刻释放块，避免破坏仍在运行或排队等待的旧 Update work。
     pending_update_kv_truncation_keep_tokens: int | None = None
-    # 启用实验开关后保存 Append gate；默认关闭路径保持 None。
-    append_update_gate: AppendUpdateGateState | None = None
+    # 合并器保存 source 封闭和 work 执行依赖；默认关闭路径保持 None。
+    coalescing_sources: PromptStreamSourceState | None = None
     # 唯一尚未 admission 的 Update 窗口；默认关闭路径保持 None。
     update_coalescing: UpdateCoalescingState | None = None
     # 显式 Question work 的去重与完成状态。
@@ -1193,43 +1178,43 @@ class Request:
                 f"request_id={self.request_id}."
             )
 
-        gate = AppendUpdateGateState()
+        source_state = PromptStreamSourceState()
         # start 使用的空 APPEND 事件只是 Request 类型标记，不占用真实 source。
         for source_id in prompt_stream.source_order:
             if source_id == "__prompt_stream_start__":
                 continue
             source = prompt_stream.sources[source_id]
             if source.source_type == PromptSourceType.APPEND:
-                if gate.append_source_id is not None:
+                if source_state.append_source_id is not None:
                     raise ValueError(
                         "Prompt stream Update coalescing supports exactly one "
                         f"Append source: request_id={self.request_id}."
                     )
-                gate.append_source_id = source_id
-                gate.append_source_finished = source.finished
+                source_state.append_source_id = source_id
+                source_state.append_source_finished = source.finished
             else:
-                if gate.update_source_id is not None:
+                if source_state.update_source_id is not None:
                     raise ValueError(
                         "Prompt stream Update coalescing supports exactly one "
                         f"Update source: request_id={self.request_id}."
                     )
-                gate.update_source_id = source_id
-                gate.update_source_finished = source.finished
+                source_state.update_source_id = source_id
+                source_state.update_source_finished = source.finished
 
         start_time = time.monotonic() if now is None else now
-        prompt_stream.append_update_gate = gate
+        prompt_stream.coalescing_sources = source_state
         prompt_stream.update_coalescing = UpdateCoalescingState(
             config=config,
             request_start_time=start_time,
             last_admitted_token_ids=tuple(
                 prompt_stream.update_committed_token_ids
             ),
-            last_admitted_append_epoch=gate.update_committed_append_epoch,
+            last_admitted_append_epoch=source_state.update_committed_append_epoch,
             stats_last_admitted_token_ids=tuple(
                 prompt_stream.update_committed_token_ids
             ),
             stats_last_admitted_append_epoch=(
-                gate.update_committed_append_epoch
+                source_state.update_committed_append_epoch
             ),
         )
 
@@ -1246,24 +1231,6 @@ class Request:
         """判断当前 Request 是否启用了实验性 Update 合并。"""
         return self.prompt_stream_update_coalescing_state is not None
 
-    def is_prompt_stream_update_admission_allowed(self) -> bool:
-        """判断 Append gate 是否允许把当前窗口物化为 Update work。"""
-        state = self.prompt_stream_update_coalescing_state
-        if state is None:
-            return True
-        assert self.prompt_stream is not None
-        gate = self.prompt_stream.append_update_gate
-        assert gate is not None
-        if state.config.append_gate == "none":
-            return True
-        if gate.append_source_finished:
-            return True
-        return bool(
-            state.config.append_gate
-            == "hold_until_append_or_update_finished"
-            and gate.update_source_finished
-        )
-
     def on_prompt_stream_update_snapshot(
         self,
         previous_token_ids: list[int],
@@ -1272,9 +1239,9 @@ class Request:
     ) -> None:
         """把合法 Update 快照合并进唯一未 admission 窗口。
 
-        该接口只维护逻辑快照、deadline 和 EWMA，不修改 UPDATE KV，也不
+        该接口只维护逻辑快照、deadline 和 token 统计，不修改 UPDATE KV，也不
         创建 work。Scheduler 随后调用 ``flush_prompt_stream_update`` 完成
-        policy 与 gate 的二阶段判定。
+        policy 的放行判定。
 
         Args:
             previous_token_ids: 同一 source 的上一条完整原始快照。
@@ -1285,12 +1252,10 @@ class Request:
         if state is None:
             return
         assert self.prompt_stream is not None
-        gate = self.prompt_stream.append_update_gate
-        assert gate is not None
+        source_state = self.prompt_stream.coalescing_sources
+        assert source_state is not None
         timestamp = time.monotonic() if now is None else now
-        config = state.config
-
-        current_append_epoch = gate.append_epoch
+        current_append_epoch = source_state.append_epoch
         same_observed_append_context = (
             state.last_observed_update_append_epoch is None
             or state.last_observed_update_append_epoch == current_append_epoch
@@ -1301,126 +1266,47 @@ class Request:
             else 0
         )
         eager_tokens = len(new_token_ids) - raw_lcp
-        # 合并收益属于 policy 层，必须相对跨 recovery 不回退的
-        # admission 链尾计算。物理 KV 丢失不是新 Update 带来的收益。
-        base_token_ids = list(state.stats_last_admitted_token_ids)
-        same_admitted_append_context = (
-            not base_token_ids
-            or state.stats_last_admitted_append_epoch == current_append_epoch
-        )
-        base_lcp = (
-            self._get_common_prefix_len(base_token_ids, new_token_ids)
-            if same_admitted_append_context
-            else 0
-        )
-        merged_tokens = len(new_token_ids) - base_lcp
-        merge_gain = max(0, eager_tokens - merged_tokens)
-
         # 事件通过协议校验且内容真实变化后，才进入 eager 反事实累计。
         self.prompt_stream.update_events_accepted += 1
         self.prompt_stream.total_eager_update_prefill_tokens += eager_tokens
 
-        if state.last_observed_update_time is not None:
-            interval = max(
-                0.0,
-                timestamp - state.last_observed_update_time,
-            )
-            alpha = config.interval_ewma_alpha
-            state.interval_ewma = (
-                interval
-                if state.interval_ewma is None
-                else (1.0 - alpha) * state.interval_ewma + alpha * interval
-            )
-            state.interval_observation_count += 1
-        state.last_observed_update_time = timestamp
+        # Append 上下文版本用于下一次事件的 eager 反事实统计。
         state.last_observed_update_append_epoch = current_append_epoch
-
-        gain_alpha = config.gain_ewma_alpha
-        state.merge_gain_ewma = (
-            float(merge_gain)
-            if state.merge_gain_ewma is None
-            else (1.0 - gain_alpha) * state.merge_gain_ewma
-            + gain_alpha * merge_gain
-        )
-        state.gain_observation_count += 1
 
         if state.first_pending_time is None:
             state.first_pending_time = timestamp
-            if config.update_policy in (
-                "fixed_window",
-                "quiet_debounce",
-                "adaptive",
-            ):
-                state.hard_deadline = (
-                    timestamp + config.hard_deadline_ms / 1000.0
-                )
-            if (
-                config.update_policy
-                in ("fixed_window", "quiet_debounce", "adaptive")
-                and config.ttft_deadline_ms is not None
-            ):
-                state.ttft_deadline = (
-                    state.request_start_time
-                    + config.ttft_deadline_ms / 1000.0
-                )
 
         state.latest_pending_token_ids = tuple(new_token_ids)
         state.last_update_time = timestamp
         state.pending_event_count += 1
         state.hypothetical_eager_tokens += eager_tokens
         state.generation += 1
-
-        # sticky flush_ready 一旦置位，新快照只能覆盖目标，不能重新延后执行。
-        if state.flush_ready:
-            return
-        if config.update_policy == "fixed_window":
-            assert state.first_pending_time is not None
-            state.soft_deadline = (
-                state.first_pending_time + config.soft_window_ms / 1000.0
-            )
-        elif config.update_policy == "quiet_debounce":
-            state.soft_deadline = timestamp + config.soft_window_ms / 1000.0
-        elif config.update_policy == "adaptive":
-            wait_s = self._get_prompt_stream_adaptive_wait_s(prefill_queue_load=0.0)
-            state.soft_deadline = timestamp + wait_s
-            state.adaptive_deadline_needs_refresh = True
-        else:
-            state.soft_deadline = None
+        # Request 维护窗口/统计，策略独立决定是否设置或刷新 deadline。
+        state.policy.on_snapshot(state, timestamp)
 
     def on_prompt_stream_source_finished(
         self,
         source_type: PromptSourceType,
         now: float | None = None,
     ) -> None:
-        """更新 source barrier；Append finished 只开 gate，不强制 flush。"""
+        """记录 source 封闭；Append finished 不强制放行 Update 窗口。"""
         del now  # 接口与 controller 时钟保持一致，当前状态更新本身不计时。
         state = self.prompt_stream_update_coalescing_state
         if state is None:
             return
         assert self.prompt_stream is not None
-        gate = self.prompt_stream.append_update_gate
-        assert gate is not None
+        source_state = self.prompt_stream.coalescing_sources
+        assert source_state is not None
         if source_type == PromptSourceType.APPEND:
-            gate.append_source_finished = True
-            gate.final_append_epoch = gate.append_epoch
-            gate.phase = AppendGatePhase.APPEND_FINISHED
+            source_state.append_source_finished = True
+            source_state.final_append_epoch = source_state.append_epoch
         else:
-            gate.update_source_finished = True
-            if (
-                state.config.append_gate
-                == "hold_until_append_or_update_finished"
-                and not gate.append_source_finished
-            ):
-                gate.phase = AppendGatePhase.EARLY_RELEASE
+            source_state.update_source_finished = True
 
     def get_prompt_stream_update_deadline(self) -> float | None:
         """返回当前窗口下一次需要 EngineCore 唤醒的绝对 monotonic 时间。"""
         state = self.prompt_stream_update_coalescing_state
-        if (
-            state is None
-            or state.latest_pending_token_ids is None
-            or state.flush_ready
-        ):
+        if state is None or state.latest_pending_token_ids is None:
             return None
         deadlines = (
             deadline
@@ -1433,103 +1319,109 @@ class Request:
         )
         return min(deadlines, default=None)
 
-    def _get_prompt_stream_adaptive_wait_s(
-        self,
-        prefill_queue_load: float,
-    ) -> float:
-        """按 EWMA 收益模型计算自适应 soft window，单位为秒。"""
-        state = self.prompt_stream_update_coalescing_state
-        if state is None:
-            return 0.0
-        config = state.config
-        max_wait_s = config.soft_window_ms / 1000.0
-        prior_weight = config.cold_start_prior_weight
+    def has_outstanding_prompt_stream_update(self) -> bool:
+        """检查已放行 Update 的 pending、active 与 GPU 在途生命周期。
 
-        observed_rate = (
-            None
-            if state.interval_ewma is None
-            else 1.0 / max(state.interval_ewma, 1e-9)
+        只读工作状态，不用已经乐观推进的 committed 快照推断 GPU 完成。
+        recovery-only Update 同样参与背压；零 forward work 消费后自然解除。
+        """
+        stream = self.prompt_stream
+        if stream is None:
+            return False
+        if stream.num_update_inflight_steps:
+            return True
+        if (
+            stream.active_work_item is not None
+            and stream.active_work_item.phase == PromptStreamExecutionPhase.UPDATE
+        ):
+            return True
+        return any(
+            work.phase == PromptStreamExecutionPhase.UPDATE
+            for work in stream.pending_work_items
         )
-        observed_gain = state.merge_gain_ewma
 
-        def blend(
-            observed: float | None,
-            observation_count: int,
-            prior: float | None,
-        ) -> float | None:
-            weighted_sum = 0.0
-            total_weight = 0.0
-            if observed is not None and observation_count > 0:
-                weighted_sum += observation_count * observed
-                total_weight += observation_count
-            # prior=None 表示没有先验，不能稀释真实观测。
-            if prior is not None and prior_weight > 0:
-                weighted_sum += prior_weight * prior
-                total_weight += prior_weight
-            if total_weight <= 0:
-                return None
-            return weighted_sum / total_weight
+    def get_prompt_stream_runnable_token_demand(self, block_size: int) -> int:
+        """只读估计当前或下一项已放行 work 的剩余 token 需求。
 
-        arrival_rate = blend(
-            observed_rate,
-            state.interval_observation_count,
-            config.arrival_rate_prior_per_s,
-        )
-        merge_gain = blend(
-            observed_gain,
-            state.gain_observation_count,
-            config.merge_gain_prior_tokens,
-        )
-        if arrival_rate is None or merge_gain is None or arrival_rate <= 0:
-            return 0.0
-
-        load_price = 1.0 + config.load_price_scale * max(0.0, prefill_queue_load)
-        delay_price = config.delay_price
-        marginal_value = load_price * merge_gain * arrival_rate
-        if marginal_value <= delay_price or marginal_value <= 0:
-            return 0.0
-        if delay_price == 0:
-            return max_wait_s
-        wait_s = math.log(marginal_value / delay_price) / arrival_rate
-        return min(max(wait_s, 0.0), max_wait_s)
+        不调用 prepare、不截断 KV，也不把尚未 admission 的快照算成负载。
+        PA 包含物理 padding；待执行 Update 扣除冻结 LCP。零 forward work
+        暂记一个调度单位，以便 scheduler 有机会消费其逻辑状态转换。
+        Scheduler 另按每请求 chunk 上限裁剪，并纳入尚未回包的批次。
+        """
+        stream = self.prompt_stream
+        if stream is None:
+            return max(
+                0,
+                self.num_tokens_with_spec + self.num_output_placeholders
+                - self.num_computed_tokens,
+            )
+        work = stream.active_work_item
+        if work is None and not stream.prefix_append_bootstrap_completed:
+            # 模板是唯一必须首先调度的工作，包括末块对齐。
+            size = len(stream.prefix_token_ids)
+            return max(1, (size + block_size - 1) // block_size * block_size)
+        is_active = work is not None
+        if work is None and stream.pending_work_items:
+            work = stream.pending_work_items[0]
+        if work is None:
+            # 已进入 decode 的流式请求仍有可执行 token；纯 dormant 返回零。
+            if stream.question_work_completed:
+                return max(
+                    0,
+                    self.num_tokens_with_spec + self.num_output_placeholders
+                    - self.num_computed_tokens,
+                )
+            return 0
+        if work.phase == PromptStreamExecutionPhase.PREFIX_APPEND:
+            target = (
+                (work.prefix_append_logical_len + block_size - 1)
+                // block_size * block_size
+            )
+            computed = (
+                work.num_computed_tokens if is_active
+                else stream.prefix_append_committed_logical_len
+            )
+        elif work.phase == PromptStreamExecutionPhase.UPDATE:
+            target = len(work.update_token_ids or ())
+            computed = (
+                work.num_computed_tokens if is_active
+                else work.update_common_prefix_len
+            )
+        else:
+            target = len(work.question_token_ids or ())
+            computed = work.num_computed_tokens if is_active else 0
+        return max(1, target - computed)
 
     def is_prompt_stream_update_flush_due(
         self,
         now: float,
-        prefill_queue_load: float = 0.0,
+        *,
+        context: UpdateCoalescingContext | None = None,
     ) -> bool:
-        """判断当前 Update policy 是否已经要求 flush。"""
+        """先检查最终快照出口，再委托配置选中的策略判断 admission。
+
+        无 Scheduler context 时视为无全局积压，但仍检查本请求执行背压。
+        此默认行为适用于 Request 单元测试；服务端统一传入真实调度反馈。
+        """
         state = self.prompt_stream_update_coalescing_state
         if state is None or state.latest_pending_token_ids is None:
             return False
-        if state.flush_ready:
-            return True
         assert self.prompt_stream is not None
-        gate = self.prompt_stream.append_update_gate
-        assert gate is not None
-        policy = state.config.update_policy
-        if policy == "immediate":
+        sources = self.prompt_stream.coalescing_sources
+        assert sources is not None
+        # final snapshot 不再有覆盖收益，终止事件必须越过所有压力限制。
+        if sources.update_source_finished or self.prompt_stream.finished:
             return True
-        if policy == "full_merge":
-            return gate.update_source_finished or self.prompt_stream.finished
-        if (
-            policy == "adaptive"
-            and state.last_update_time is not None
-            and state.adaptive_deadline_needs_refresh
-        ):
-            adaptive_deadline = state.last_update_time + (
-                self._get_prompt_stream_adaptive_wait_s(prefill_queue_load)
-            )
-            state.soft_deadline = adaptive_deadline
-            state.adaptive_deadline_needs_refresh = False
-        return any(
-            deadline is not None and now >= deadline
-            for deadline in (
-                state.soft_deadline,
-                state.hard_deadline,
-                state.ttft_deadline,
-            )
-        ) or gate.update_source_finished or self.prompt_stream.finished
+        if context is None:
+            context = UpdateCoalescingContext(now=now)
+        context = replace(
+            context,
+            has_outstanding_update=(
+                context.has_outstanding_update
+                or self.has_outstanding_prompt_stream_update()
+            ),
+        )
+        return state.policy.should_flush(state, context)
 
     def flush_prompt_stream_update(
         self,
@@ -1537,12 +1429,12 @@ class Request:
         reason: str,
         *,
         force: bool = False,
-        prefill_queue_load: float = 0.0,
+        context: UpdateCoalescingContext | None = None,
     ) -> bool:
-        """在 policy 与 gate 都允许时把唯一窗口冻结为 Update work。
+        """在 policy 满足条件时把唯一窗口冻结为 Update work。
 
         Returns:
-            成功创建 work 返回 True；继续合并或被 gate 阻挡返回 False。
+            成功创建 work 返回 True；继续合并或没有窗口返回 False。
         """
         state = self.prompt_stream_update_coalescing_state
         if state is None or state.latest_pending_token_ids is None:
@@ -1550,24 +1442,17 @@ class Request:
             return False
         should_flush = force or self.is_prompt_stream_update_flush_due(
             now,
-            prefill_queue_load,
+            context=context,
         )
         if not should_flush:
             return False
-        if not self.is_prompt_stream_update_admission_allowed():
-            # ready 是黏性的；后续 Update 仅覆盖 target，不撤销到期事实。
-            if not state.flush_ready:
-                state.flush_ready = True
-                state.flush_ready_reason = reason
-                state.generation += 1
-            return False
 
         assert self.prompt_stream is not None
-        gate = self.prompt_stream.append_update_gate
-        assert gate is not None
+        source_state = self.prompt_stream.coalescing_sources
+        assert source_state is not None
         target = state.latest_pending_token_ids
         base = state.last_admitted_token_ids
-        required_append_epoch = gate.append_epoch
+        required_append_epoch = source_state.append_epoch
         same_append_context = (
             not base
             or state.last_admitted_append_epoch == required_append_epoch
@@ -1635,9 +1520,6 @@ class Request:
         state.soft_deadline = None
         state.hard_deadline = None
         state.ttft_deadline = None
-        state.adaptive_deadline_needs_refresh = False
-        state.flush_ready = False
-        state.flush_ready_reason = None
         state.pending_event_count = 0
         state.hypothetical_eager_tokens = 0
         state.generation += 1
@@ -1656,25 +1538,24 @@ class Request:
         ):
             return False
         state = prompt_stream.update_coalescing
-        gate = prompt_stream.append_update_gate
+        source_state = prompt_stream.coalescing_sources
         if state is not None:
-            assert gate is not None
+            assert source_state is not None
             if (
-                not gate.append_source_finished
-                or not gate.update_source_finished
+                not source_state.append_source_finished
+                or not source_state.update_source_finished
                 or state.latest_pending_token_ids is not None
-                or state.flush_ready
             ):
                 return False
             update_source = (
-                prompt_stream.sources.get(gate.update_source_id)
-                if gate.update_source_id is not None
+                prompt_stream.sources.get(source_state.update_source_id)
+                if source_state.update_source_id is not None
                 else None
             )
             latest_update = tuple(update_source.token_ids) if update_source else ()
             if state.last_admitted_token_ids != latest_update:
                 return False
-            required_append_epoch = gate.append_epoch
+            required_append_epoch = source_state.append_epoch
         else:
             required_append_epoch = 0
 
@@ -1697,8 +1578,13 @@ class Request:
         return True
 
     def should_make_prompt_stream_dormant(self) -> bool:
-        """判断请求是否只在等待事件、deadline 或 Append gate。"""
-        if self.prompt_stream is None or self.prompt_stream.update_coalescing is None:
+        """判断流式请求是否已耗尽 work，仅等待新输入或合并 deadline。
+
+        停放适用于所有 PromptStream，不依赖 Update 合并开关。模板、
+        active/pending work 和抢占后重建的 work 均须先完成；Scheduler
+        另外确认该请求没有尚未回包的 GPU step，才真正迁出运行队列。
+        """
+        if self.prompt_stream is None:
             return False
         prompt_stream = self.prompt_stream
         if not prompt_stream.prefix_append_bootstrap_completed:
@@ -1772,11 +1658,11 @@ class Request:
             or tuple(self.prompt_stream.update_committed_token_ids)
             == latest_update_token_ids
         )
-        gate = self.prompt_stream.append_update_gate
+        source_state = self.prompt_stream.coalescing_sources
         final_append_materialized = (
-            gate is None
-            or gate.final_append_epoch is None
-            or gate.committed_append_epoch == gate.final_append_epoch
+            source_state is None
+            or source_state.final_append_epoch is None
+            or source_state.committed_append_epoch == source_state.final_append_epoch
         )
         return (
             self.prompt_stream.prefix_append_bootstrap_completed
@@ -1791,7 +1677,6 @@ class Request:
                 or (
                     self.prompt_stream.update_coalescing.latest_pending_token_ids
                     is None
-                    and not self.prompt_stream.update_coalescing.flush_ready
                 )
             )
             and self.prompt_stream.prefix_append_committed_logical_len
@@ -2009,7 +1894,7 @@ class Request:
                 f"received={event.sequence_no}."
             )
 
-        gate = prompt_stream.append_update_gate
+        source_state = prompt_stream.coalescing_sources
         if expected_source_type == PromptSourceType.UPDATE:
             for existing_source_id in prompt_stream.source_order:
                 existing_source = prompt_stream.sources[existing_source_id]
@@ -2019,12 +1904,12 @@ class Request:
                         f"update source, but request_id={self.request_id} "
                         f"already has source_id={existing_source_id}."
                     )
-        elif gate is not None and event.source_id != "__prompt_stream_start__":
-            if gate.append_source_id is not None:
+        elif source_state is not None and event.source_id != "__prompt_stream_start__":
+            if source_state.append_source_id is not None:
                 raise ValueError(
                     "Prompt stream Update coalescing supports exactly one "
                     f"Append source, but request_id={self.request_id} already "
-                    f"has source_id={gate.append_source_id}."
+                    f"has source_id={source_state.append_source_id}."
                 )
 
         source = PromptSourceState(
@@ -2040,11 +1925,11 @@ class Request:
         )
         prompt_stream.sources[event.source_id] = source
         prompt_stream.source_order.append(event.source_id)
-        if gate is not None and event.source_id != "__prompt_stream_start__":
+        if source_state is not None and event.source_id != "__prompt_stream_start__":
             if expected_source_type == PromptSourceType.APPEND:
-                gate.append_source_id = event.source_id
+                source_state.append_source_id = event.source_id
             else:
-                gate.update_source_id = event.source_id
+                source_state.update_source_id = event.source_id
         return source
 
     def _record_prompt_stream_update_kv_truncation(self, keep_tokens: int) -> None:
@@ -2115,10 +2000,10 @@ class Request:
         # source 分组重排交错到达的 chunks。
         source.token_ids.extend(event.token_ids or [])
         prompt_stream.append_token_ids.extend(event.token_ids or [])
-        gate = prompt_stream.append_update_gate
-        if gate is not None and event.token_ids:
+        source_state = prompt_stream.coalescing_sources
+        if source_state is not None and event.token_ids:
             # epoch 只随真实 Append 内容增长；空 start marker 不推进上下文版本。
-            gate.append_epoch += 1
+            source_state.append_epoch += 1
         source.version = max(source.version, event.version)
         source.next_sequence_no += 1
         source.last_arrival_time = event.arrival_time
@@ -2135,7 +2020,9 @@ class Request:
                     prefix_append_logical_len=(
                         self.get_prompt_stream_prefix_append_len()
                     ),
-                    target_append_epoch=(gate.append_epoch if gate is not None else 0),
+                    target_append_epoch=(
+                        source_state.append_epoch if source_state is not None else 0
+                    ),
                 )
             )
         return self._sync_prompt_from_stream_state(old_prompt_token_ids)
@@ -2331,13 +2218,18 @@ class Request:
         if prompt_stream.update_coalescing is not None:
             now = time.monotonic()
             self.on_prompt_stream_source_finished(source.source_type, now)
-            # Update finished 是终止性 flush；Append finished 只开 gate 并复查
-            # 已经由 policy 判定到期的原窗口。
-            self.flush_prompt_stream_update(
-                now,
-                reason=f"{source.source_type.value}_source_finished",
-                force=source.source_type == PromptSourceType.UPDATE,
-            )
+            # Update finished 必须放行最终快照。Append finished 不代表更新结束；
+            # 背压策略必须等 Scheduler 带真实全局负载评估，不能用默认空闲 context。
+            policy = prompt_stream.update_coalescing.policy
+            if (
+                source.source_type == PromptSourceType.UPDATE
+                or not policy.requires_scheduler_feedback
+            ):
+                self.flush_prompt_stream_update(
+                    now,
+                    reason=f"{source.source_type.value}_source_finished",
+                    force=source.source_type == PromptSourceType.UPDATE,
+                )
             self.enqueue_question_if_ready()
         return PromptStreamMutation.noop(
             self.num_prompt_tokens,
@@ -2376,16 +2268,16 @@ class Request:
 
         old_prompt_token_ids = self._rebuild_prompt_from_stream_state()
         if prompt_stream.update_coalescing is not None:
-            gate = prompt_stream.append_update_gate
-            assert gate is not None
+            source_state = prompt_stream.coalescing_sources
+            assert source_state is not None
             append_source = (
-                prompt_stream.sources.get(gate.append_source_id)
-                if gate.append_source_id is not None
+                prompt_stream.sources.get(source_state.append_source_id)
+                if source_state.append_source_id is not None
                 else None
             )
             update_source = (
-                prompt_stream.sources.get(gate.update_source_id)
-                if gate.update_source_id is not None
+                prompt_stream.sources.get(source_state.update_source_id)
+                if source_state.update_source_id is not None
                 else None
             )
             for source, source_type in (
@@ -2408,14 +2300,17 @@ class Request:
                         f"finished={source.finished}."
                     )
                 if not source.finished:
-                    # SOURCE_FINISHED 可提前打开 gate；若前端省略它，请求级
+                    # SOURCE_FINISHED 可提前封闭来源；若前端省略它，请求级
                     # barrier 仍可在确认没有乱序缺口后封闭该来源。
                     source.finished = True
                     source.last_arrival_time = event.arrival_time
                     self.on_prompt_stream_source_finished(source_type)
-            if not gate.append_source_finished or not gate.update_source_finished:
+            if (
+                not source_state.append_source_finished
+                or not source_state.update_source_finished
+            ):
                 raise RuntimeError(
-                    "Prompt stream gate state disagrees with sealed sources: "
+                    "Prompt stream source state disagrees with sealed sources: "
                     f"request_id={self.request_id}."
                 )
 
@@ -2663,20 +2558,23 @@ class Request:
         # 的 work，避免把它留成永远无法 advance 的 active work。
         while prompt_stream.pending_work_items:
             work_item = prompt_stream.pending_work_items[0]
-            gate = prompt_stream.append_update_gate
+            source_state = prompt_stream.coalescing_sources
             if (
-                gate is not None
+                source_state is not None
                 and work_item.phase != PromptStreamExecutionPhase.PREFIX_APPEND
-                and gate.committed_append_epoch
+                and source_state.committed_append_epoch
                 != work_item.required_append_epoch
             ):
-                if gate.committed_append_epoch < work_item.required_append_epoch:
+                if (
+                    source_state.committed_append_epoch
+                    < work_item.required_append_epoch
+                ):
                     # 依赖尚未物化，保留 FIFO 队首等待 Append work。
                     return
                 raise RuntimeError(
                     "Prompt stream work observed a newer Append epoch than its "
                     f"frozen dependency: request_id={self.request_id}, "
-                    f"committed_epoch={gate.committed_append_epoch}, "
+                    f"committed_epoch={source_state.committed_append_epoch}, "
                     f"required_epoch={work_item.required_append_epoch}."
                 )
             prompt_stream.pending_work_items.popleft()
@@ -2704,23 +2602,8 @@ class Request:
                         "committed Update snapshot: "
                         f"request_id={self.request_id}."
                     )
-                state = prompt_stream.update_coalescing
-                if (
-                    gate is not None
-                    and state is not None
-                    and state.config.append_gate
-                    == "hold_until_append_finished"
-                    and frozen_update
-                    and gate.update_committed_append_epoch
-                    != work_item.required_append_epoch
-                ):
-                    raise RuntimeError(
-                        "Strict prompt stream QUESTION observed UPDATE KV from "
-                        "the wrong Append epoch: "
-                        f"request_id={self.request_id}, "
-                        f"committed_epoch={gate.update_committed_append_epoch}, "
-                        f"required_epoch={work_item.required_append_epoch}."
-                    )
+                # Update 允许保留较早 Append 上下文下的近似 KV；Question
+                # 仍须通过最终快照校验和队首的最终 Append 执行依赖检查。
                 work_item.prefix_append_token_ids = tuple(
                     self._get_prefix_append_physical_token_ids(
                         work_item.prefix_append_logical_len
@@ -2772,17 +2655,17 @@ class Request:
 
             execution_base = work_item.execution_base_token_ids
             if (
-                gate is not None
+                source_state is not None
                 # 空基准没有 UPDATE KV 可以复用，Append epoch 与执行无关。
                 and execution_base
                 and work_item.execution_base_append_epoch
-                != gate.update_committed_append_epoch
+                != source_state.update_committed_append_epoch
             ):
                 raise RuntimeError(
                     "Prompt stream UPDATE execution base uses the wrong "
                     f"Append epoch: request_id={self.request_id}, "
                     f"base_epoch={work_item.execution_base_append_epoch}, "
-                    f"committed_epoch={gate.update_committed_append_epoch}."
+                    f"committed_epoch={source_state.update_committed_append_epoch}."
                 )
             if (
                 execution_base is not None
@@ -2815,8 +2698,8 @@ class Request:
                 # 延后截断，然后继续消费后续 work / Question。
                 prompt_stream.update_num_computed_tokens = len(update_token_ids)
                 prompt_stream.update_committed_token_ids = list(update_token_ids)
-                if gate is not None:
-                    gate.update_committed_append_epoch = (
+                if source_state is not None:
+                    source_state.update_committed_append_epoch = (
                         work_item.required_append_epoch
                     )
                 # 零 forward 截断同样结算物理 attempt 与 policy admission。
@@ -3104,10 +2987,10 @@ class Request:
                         active_work_item.prefix_append_logical_len
                     )
                     prompt_stream.prefix_append_bootstrap_completed = True
-                    gate = prompt_stream.append_update_gate
-                    if gate is not None:
-                        gate.committed_append_epoch = max(
-                            gate.committed_append_epoch,
+                    source_state = prompt_stream.coalescing_sources
+                    if source_state is not None:
+                        source_state.committed_append_epoch = max(
+                            source_state.committed_append_epoch,
                             active_work_item.target_append_epoch,
                         )
                     prompt_stream.active_work_item = None
@@ -3131,13 +3014,13 @@ class Request:
             if active_work_item is not None:
                 active_work_item.num_computed_tokens = local_num_computed_tokens
                 if local_num_computed_tokens >= update_len:
-                    # 到这里该 Update work 的完整快照已经真实写入 UPDATE 域，
-                    # 才能推进 committed 状态并允许下一代 work 复用其 LCP。
+                    # 这里推进的是调度侧的乐观进度，GPU 可能尚未回包。
+                    # 背压通过独立 num_update_inflight_steps 等待真实完成。
                     assert update_token_ids is not None
                     prompt_stream.update_committed_token_ids = list(update_token_ids)
-                    gate = prompt_stream.append_update_gate
-                    if gate is not None:
-                        gate.update_committed_append_epoch = (
+                    source_state = prompt_stream.coalescing_sources
+                    if source_state is not None:
+                        source_state.update_committed_append_epoch = (
                             active_work_item.required_append_epoch
                         )
                     self._complete_prompt_stream_update_work(
@@ -3203,8 +3086,8 @@ class Request:
         """按 latest-only 语义重建物理 KV，并保留 policy/window 状态。
 
         资源 recovery 可以折叠尚未完成的旧 admission，但必须给每个旧 ID
-        写入唯一终态。尚未 admission 的 coalescing window、绝对 deadline、
-        sticky ready 和 EWMA 均保持不变，避免 repeated preemption 延长等待。
+        写入唯一终态。尚未 admission 的 coalescing window、绝对 deadline
+        和窗口 token 统计均保持不变，避免 repeated preemption 延长等待。
 
         Args:
             reason: Scheduler 提供的互斥 recovery 原因。
@@ -3290,10 +3173,10 @@ class Request:
         prompt_stream.pending_update_kv_truncation_keep_tokens = None
         prompt_stream.question_work_enqueued = False
         prompt_stream.question_work_completed = False
-        gate = prompt_stream.append_update_gate
-        if gate is not None:
-            gate.committed_append_epoch = 0
-            gate.update_committed_append_epoch = None
+        source_state = prompt_stream.coalescing_sources
+        if source_state is not None:
+            source_state.committed_append_epoch = 0
+            source_state.update_committed_append_epoch = None
 
         # recovery 必须先重建最终 PA。模板 bootstrap 由 work selector 创建；
         # 若存在 Append，再追加一个从模板末尾追到完整 PA 的 recovery work。
@@ -3305,7 +3188,7 @@ class Request:
                         self.get_prompt_stream_prefix_append_len()
                     ),
                     target_append_epoch=(
-                        gate.append_epoch if gate is not None else 0
+                        source_state.append_epoch if source_state is not None else 0
                     ),
                     execution_origin=PromptStreamExecutionOrigin.RECOVERY,
                 )
@@ -3322,7 +3205,9 @@ class Request:
             and (carried_admission_id is not None or bool(latest_update_token_ids))
         )
         if should_recover_update:
-            required_append_epoch = gate.append_epoch if gate is not None else 0
+            required_append_epoch = (
+                source_state.append_epoch if source_state is not None else 0
+            )
             prompt_stream.pending_work_items.append(
                 PromptStreamWorkItem(
                     phase=PromptStreamExecutionPhase.UPDATE,
@@ -3346,7 +3231,7 @@ class Request:
             # 已完成的空快照无需 forward，但逻辑链尾仍应明确为空。
             state.last_admitted_token_ids = ()
             state.last_admitted_append_epoch = (
-                gate.append_epoch if gate is not None else 0
+                source_state.append_epoch if source_state is not None else 0
             )
 
         # Question 可以提前排在 recovery work 后面，但执行时仍受 FIFO、

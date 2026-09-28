@@ -23,6 +23,9 @@ DATA_DIR="${DATA_DIR:-research/data/mix_source}"
 OUTPUT_DIR="${OUTPUT_DIR:-research/scripts/replay/update_coalescing/results}"
 PROXY_URL="${PROXY_URL:-}"
 MODEL="${MODEL:-qwen2.5-3b}"
+# 共享回放器用模型 chat template，tokenizer 路径与 REST served name 不同。
+TOKENIZER_MODEL="${TOKENIZER_MODEL:-${MODEL_PATH:-}}"
+TOKENIZER_TRUST_REMOTE_CODE="${TOKENIZER_TRUST_REMOTE_CODE:-0}"
 
 COALESCING_PROFILE="${COALESCING_PROFILE:-fixed-window}"
 P_NODE_CONFIG_JSON="$(build_coalescing_config)"
@@ -56,6 +59,10 @@ if [[ -z "${PROXY_URL}" ]]; then
   echo "PROXY_URL must point to the reachable proxy host, not implicit localhost." >&2
   exit 2
 fi
+if [[ -z "${TOKENIZER_MODEL}" ]]; then
+  echo "TOKENIZER_MODEL (or MODEL_PATH) must be set for chat templates." >&2
+  exit 2
+fi
 if (( NUM_REPEATS <= 0 )); then
   echo "NUM_REPEATS must be positive." >&2
   exit 2
@@ -72,6 +79,8 @@ echo "COALESCING_PROFILE=${COALESCING_PROFILE}"
 echo "EXPECTED_COALESCING=${EXPECTED_COALESCING}"
 echo "P_NODE_CONFIG_JSON=${P_NODE_CONFIG_JSON:-disabled}"
 echo "PROXY_URL=${PROXY_URL}"
+echo "TOKENIZER_MODEL=${TOKENIZER_MODEL}"
+echo "TOKENIZER_TRUST_REMOTE_CODE=${TOKENIZER_TRUST_REMOTE_CODE}"
 echo "QPS_LIST=${QPS_LIST}"
 echo "UPDATE_INTERVAL_LIST=${UPDATE_INTERVAL_LIST}"
 echo "NUM_REPEATS=${NUM_REPEATS}"
@@ -97,6 +106,7 @@ run_replay() {
     --max-requests "${max_requests}"
     --proxy-url "${PROXY_URL}"
     --model "${MODEL}"
+    --tokenizer-model "${TOKENIZER_MODEL}"
     --qps "${qps}"
     --arrival-process "${ARRIVAL_PROCESS}"
     --random-seed "${random_seed}"
@@ -119,6 +129,9 @@ run_replay() {
     --ttft-only
   )
 
+  if [[ "${TOKENIZER_TRUST_REMOTE_CODE}" == "1" ]]; then
+    replay_args+=(--tokenizer-trust-remote-code)
+  fi
   if [[ -n "${P_NODE_CONFIG_JSON}" ]]; then
     replay_args+=(
       --p-node-coalescing-config-json "${P_NODE_CONFIG_JSON}"

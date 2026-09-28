@@ -51,6 +51,7 @@ from vllm.v1.core.sched.request_queue import (
     SchedulingPolicy,
     create_request_queue,
 )
+from vllm.v1.core.sched.update_coalescing import UpdateCoalescingContext
 from vllm.v1.core.sched.utils import check_stop, remove_all
 from vllm.v1.engine import EngineCoreEventType, EngineCoreOutput, EngineCoreOutputs
 from vllm.v1.kv_cache_interface import KVCacheConfig
@@ -58,6 +59,7 @@ from vllm.v1.metrics.perf import ModelMetrics, PerfStats
 from vllm.v1.metrics.stats import PrefixCacheStats, SchedulerStats
 from vllm.v1.outputs import DraftTokenIds, KVConnectorOutput, ModelRunnerOutput
 from vllm.v1.request import (
+    PromptStreamExecutionPhase,
     PromptStreamKVSegment,
     PromptStreamRecoveryReason,
     Request,
@@ -73,43 +75,35 @@ logger = init_logger(__name__)
 
 
 class PromptStreamUpdateCoalescingController:
-    """维护 Update deadline 与暂时没有可运行 work 的长期请求。"""
+    """维护策略唤醒索引和在途负载；请求停放仍由 Scheduler 管理。"""
 
     def __init__(self, config: PromptStreamUpdateCoalescingConfig) -> None:
         self.config = config
         self._deadline_heap: list[tuple[float, str, int]] = []
         self._registered_deadlines: dict[str, tuple[float, int]] = {}
-        self._dormant_reasons: dict[str, str] = {}
-
-    @property
-    def num_dormant_requests(self) -> int:
-        return len(self._dormant_reasons)
-
-    def is_dormant(self, request_id: str) -> bool:
-        return request_id in self._dormant_reasons
-
-    def mark_dormant(self, request_id: str, reason: str) -> None:
-        self._dormant_reasons[request_id] = reason
-
-    def pop_dormant(self, request_id: str) -> str | None:
-        return self._dormant_reasons.pop(request_id, None)
-
-    def pop_oldest_dormant_request_id(self) -> str | None:
-        if not self._dormant_reasons:
-            return None
-        request_id = next(iter(self._dormant_reasons))
-        del self._dormant_reasons[request_id]
-        return request_id
-
-    def get_dormant_request_ids(self) -> tuple[str, ...]:
-        return tuple(self._dormant_reasons)
+        # dict 保留首次窗口登记顺序；只有 adaptive 未放行窗口进入此集合。
+        self.adaptive_request_ids: dict[str, None] = {}
+        # 普通与流式请求的在途 token 都占用计算余量；仅 adaptive 开启时维护。
+        self.inflight_tokens: dict[str, int] = {}
 
     def remove_request(self, request_id: str) -> None:
+        """移除请求的有效 deadline；堆中旧条目由 generation 校验丢弃。"""
         self._registered_deadlines.pop(request_id, None)
-        self._dormant_reasons.pop(request_id, None)
+        self.adaptive_request_ids.pop(request_id, None)
+        # 在途 token 由对应回包释放，abort/recovery 不能提前声称 GPU 空闲。
 
     def refresh_deadline(self, request: Request) -> None:
+        """刷新时间/调度反馈索引，不把无 deadline 的 adaptive 窗口遗漏。"""
         state = request.prompt_stream_update_coalescing_state
+        if (
+            state is not None
+            and state.policy.requires_scheduler_feedback
+            and state.latest_pending_token_ids is not None
+            and not request.is_finished()
+        ):
+            self.adaptive_request_ids.setdefault(request.request_id, None)
+        else:
+            self.adaptive_request_ids.pop(request.request_id, None)
         deadline = request.get_prompt_stream_update_deadline()
         if state is None or deadline is None:
             self._registered_deadlines.pop(request.request_id, None)
@@ -303,6 +297,11 @@ class Scheduler(SchedulerInterface):
         # requests skipped in waiting flow due async deps or constraints.
         self.skipped_waiting = create_request_queue(self.policy)
         self.running: list[Request] = []
+        # 所有 PromptStream 共用停放表；不依赖是否启用 Update 合并。
+        # dict 保留停放顺序，供显存不足时沿用最早停放请求优先的驱逐规则。
+        self._prompt_stream_dormant_reasons: dict[str, str] = {}
+        # work 进度在 schedule 后提前推进，GPU 未回包前不能据此停放请求。
+        self._prompt_stream_inflight_steps: dict[str, int] = {}
         # dormant 请求离开 worker persistent batch 时，通过下一次
         # SchedulerOutput 一次性发送 remove；同一步唤醒时允许先删后加。
         self._prompt_stream_worker_removal_req_ids: set[str] = set()
@@ -537,11 +536,98 @@ class Scheduler(SchedulerInterface):
     def has_prompt_stream_update_coalescer(self) -> bool:
         return self._prompt_stream_update_coalescer is not None
 
-    def _get_prompt_stream_prefill_queue_load(self) -> float:
-        num_runnable_requests = (
-            len(self.running) + len(self.waiting) + len(self.skipped_waiting)
+    def _get_prompt_stream_update_context(
+        self,
+        request: Request,
+        now: float,
+    ) -> UpdateCoalescingContext:
+        """为策略构建只读反馈，分别估计 token 与运行名额的竞争。
+
+        adaptive 的需求仅来自已准入 work 和尚未回包的批次，不把合并窗口
+        计入积压。以每请求下一 work 为粒度，避免把历史快照长度重复累加。
+        此处不读取 KV 使用率，不根据抢占决定是否合并。
+        """
+        controller = self._prompt_stream_update_coalescer
+        assert controller is not None
+        if controller.config.update_policy != "adaptive":
+            return UpdateCoalescingContext(now=now)
+        if self._pause_state != PauseState.UNPAUSED:
+            # 暂停期间仅 terminal flush 可建立最终 work，普通候选继续覆盖。
+            return UpdateCoalescingContext(
+                now=now, token_pressure=float("inf"), slot_pressure=float("inf")
+            )
+
+        token_capacity = max(1, self.max_num_scheduled_tokens)
+        chunk_limit = self.scheduler_config.long_prefill_token_threshold
+        next_step_demand = 0
+        num_competing_requests = 0
+        seen: set[str] = set()
+        for candidate in itertools.chain(
+            self.running, self.waiting, self.skipped_waiting
+        ):
+            request_id = candidate.request_id
+            if request_id in seen or candidate.is_finished():
+                continue
+            seen.add(request_id)
+            # 外部依赖阻塞只排除尚不能运行的需求；此前提交的批次仍计入负载。
+            demand = (
+                0 if self._is_blocked_waiting_status(candidate.status)
+                else candidate.get_prompt_stream_runnable_token_demand(self.block_size)
+            )
+            if chunk_limit > 0:
+                demand = min(demand, chunk_limit)
+            inflight = controller.inflight_tokens.get(request_id, 0)
+            # 已提交一轮与下一轮需求取较大值，避免把流水重叠重复加成两轮。
+            demand = min(max(demand, inflight), token_capacity)
+            if demand > 0:
+                next_step_demand += demand
+                num_competing_requests += 1
+
+        # abort/抢占可能已将请求移出队列，但已提交的 GPU 批次尚未结束。
+        for request_id, num_tokens in controller.inflight_tokens.items():
+            if request_id not in seen and num_tokens > 0:
+                next_step_demand += min(num_tokens, token_capacity)
+                num_competing_requests += 1
+        return UpdateCoalescingContext(
+            now=now,
+            has_outstanding_update=request.has_outstanding_prompt_stream_update(),
+            token_pressure=next_step_demand / token_capacity,
+            slot_pressure=num_competing_requests / max(1, self.max_num_running_reqs),
         )
-        return num_runnable_requests / max(1, self.max_num_running_reqs)
+
+    def _flush_prompt_stream_update(
+        self,
+        request: Request,
+        now: float,
+        reason: str,
+        *,
+        context: UpdateCoalescingContext | None = None,
+    ) -> bool:
+        """统一准入规则；批量检查可复用尚未改变的全局压力快照。"""
+        controller = self._prompt_stream_update_coalescer
+        assert controller is not None
+        state = request.prompt_stream_update_coalescing_state
+        flushed = False
+        if state is not None and state.latest_pending_token_ids is not None:
+            stream = request.prompt_stream
+            assert stream is not None
+            sources = stream.coalescing_sources
+            assert sources is not None
+            is_terminal = sources.update_source_finished or stream.finished
+            if (
+                state.policy.requires_scheduler_feedback
+                and request.has_outstanding_prompt_stream_update()
+                and not is_terminal
+            ):
+                # 本请求仍有旧 Update 时无需扫描全局队列，保留唯一可覆盖窗口。
+                controller.refresh_deadline(request)
+                return False
+            if context is None:
+                context = self._get_prompt_stream_update_context(request, now)
+            flushed = request.flush_prompt_stream_update(now, reason, context=context)
+        # flush 后从候选集合移除；仍未放行时保留原登记顺序。
+        controller.refresh_deadline(request)
+        return flushed
 
     def _enable_prompt_stream_update_coalescing(
         self,
@@ -557,17 +643,18 @@ class Scheduler(SchedulerInterface):
         state = request.prompt_stream_update_coalescing_state
         if state is None or state.latest_pending_token_ids is None:
             return "stream_input"
-        if not request.is_prompt_stream_update_admission_allowed():
-            return "append_gate"
         if request.get_prompt_stream_update_deadline() is not None:
             return "update_deadline"
         return "update_policy"
 
     def _make_prompt_stream_request_dormant(self, request: Request) -> bool:
-        controller = self._prompt_stream_update_coalescer
-        if controller is None or not request.should_make_prompt_stream_dormant():
+        """将无可执行 work 的流式请求停放，保留 segment KV 并释放运行名额。"""
+        if not request.should_make_prompt_stream_dormant():
             return False
-        if controller.is_dormant(request.request_id):
+        # active work 可能在调度后已被清空，但最后一批 GPU 写入尚未完成。
+        if self._prompt_stream_inflight_steps.get(request.request_id, 0):
+            return False
+        if request.request_id in self._prompt_stream_dormant_reasons:
             return True
         if request.status not in (
             RequestStatus.RUNNING,
@@ -586,15 +673,14 @@ class Scheduler(SchedulerInterface):
         )
         request.status = RequestStatus.WAITING
         self._prompt_stream_worker_removal_req_ids.add(request.request_id)
-        controller.mark_dormant(
-            request.request_id,
-            self._get_prompt_stream_dormant_reason(request),
+        self._prompt_stream_dormant_reasons[request.request_id] = (
+            self._get_prompt_stream_dormant_reason(request)
         )
         return True
 
     def _wake_prompt_stream_request(self, request: Request) -> bool:
-        controller = self._prompt_stream_update_coalescer
-        if controller is None or controller.pop_dormant(request.request_id) is None:
+        """把产生可执行 work 的停放请求放回 waiting，等待正常资源准入。"""
+        if self._prompt_stream_dormant_reasons.pop(request.request_id, None) is None:
             return False
         if request.is_finished():
             return False
@@ -612,28 +698,28 @@ class Scheduler(SchedulerInterface):
         self._enqueue_waiting_request(request)
         return True
 
-    def _reconcile_prompt_stream_request(self, request: Request) -> None:
-        controller = self._prompt_stream_update_coalescer
-        if (
-            controller is None
-            or not request.is_prompt_stream_update_coalescing_enabled()
-        ):
+    def _reconcile_prompt_stream_request(
+        self, request: Request, *, evaluate_coalescing: bool = True
+    ) -> None:
+        """协调停放与唤醒；已完成策略判断的调用方可跳过重复评估。"""
+        if not request.is_prompt_streaming():
             return
+        controller = self._prompt_stream_update_coalescer
         if request.is_finished():
-            controller.remove_request(request.request_id)
+            self._prompt_stream_dormant_reasons.pop(request.request_id, None)
+            if controller is not None:
+                controller.remove_request(request.request_id)
             return
 
-        now = time.monotonic()
-        request.flush_prompt_stream_update(
-            now,
-            reason="scheduler_reconcile",
-            prefill_queue_load=self._get_prompt_stream_prefill_queue_load(),
-        )
+        # 合并器只负责何时形成 Update work；默认逐事件路径直接复用同一 FIFO。
+        if controller is not None and evaluate_coalescing:
+            self._flush_prompt_stream_update(
+                request, time.monotonic(), reason="scheduler_reconcile"
+            )
         request.enqueue_question_if_ready()
-        controller.refresh_deadline(request)
         if request.should_make_prompt_stream_dormant():
             self._make_prompt_stream_request_dormant(request)
-        elif controller.is_dormant(request.request_id):
+        elif request.request_id in self._prompt_stream_dormant_reasons:
             self._wake_prompt_stream_request(request)
 
     def _evict_prompt_stream_request_kv(
@@ -645,8 +731,9 @@ class Scheduler(SchedulerInterface):
     ) -> None:
         """驱逐暂驻的 Prompt Stream KV，并记录准确的恢复原因。"""
         controller = self._prompt_stream_update_coalescer
-        assert controller is not None
-        controller.remove_request(request.request_id)
+        if controller is not None:
+            controller.remove_request(request.request_id)
+        self._prompt_stream_dormant_reasons.pop(request.request_id, None)
         self._prompt_stream_retained_waiting_req_ids.discard(
             request.request_id
         )
@@ -684,13 +771,15 @@ class Scheduler(SchedulerInterface):
         Returns:
             成功驱逐一个请求时返回 ``True``，否则返回 ``False``。
         """
-        controller = self._prompt_stream_update_coalescer
-        if controller is None:
-            return False
-        while (request_id := controller.pop_oldest_dormant_request_id()) is not None:
+        # 按停放先后回收 KV；停放表独立于合并器，默认逐事件路径同样可回收。
+        for request_id in tuple(self._prompt_stream_dormant_reasons):
             request = self.requests.get(request_id)
             if request is None or request.is_finished():
-                controller.remove_request(request_id)
+                self._prompt_stream_dormant_reasons.pop(request_id, None)
+                continue
+            if request_id == excluded_request_id:
+                continue
+            if self._prompt_stream_inflight_steps.get(request_id, 0):
                 continue
             dormant_recovery_reason = (
                 recovery_reason or PromptStreamRecoveryReason.DORMANT_EVICTION
@@ -707,6 +796,9 @@ class Scheduler(SchedulerInterface):
         # waiting request is admitted to running, that KV remains reclaimable.
         for request_id in tuple(self._prompt_stream_retained_waiting_req_ids):
             if request_id == excluded_request_id:
+                continue
+            # 唤醒后尚在等待准入的请求也必须没有未完成的 GPU 写入。
+            if self._prompt_stream_inflight_steps.get(request_id, 0):
                 continue
             request = self.requests.get(request_id)
             if request is None or request.is_finished():
@@ -736,30 +828,19 @@ class Scheduler(SchedulerInterface):
         self,
         evicted_requests: list[Request],
     ) -> None:
+        """在本轮分配结束后重新排入恢复 work，避免同轮驱逐与恢复反复循环。"""
         controller = self._prompt_stream_update_coalescer
-        if controller is None:
-            return
         # prepend 逆序执行，保留 dormant 驱逐前的相对顺序。
         for request in reversed(evicted_requests):
             if request.is_finished():
                 continue
-            request.flush_prompt_stream_update(
-                time.monotonic(),
-                reason="dormant_eviction_recovery",
-                prefill_queue_load=self._get_prompt_stream_prefill_queue_load(),
-            )
+            if controller is not None:
+                self._flush_prompt_stream_update(
+                    request, time.monotonic(), reason="dormant_eviction_recovery"
+                )
             request.enqueue_question_if_ready()
-            controller.refresh_deadline(request)
-            if request.should_make_prompt_stream_dormant():
-                request.status = RequestStatus.WAITING
-                self._prompt_stream_worker_removal_req_ids.add(
-                    request.request_id
-                )
-                controller.mark_dormant(
-                    request.request_id,
-                    self._get_prompt_stream_dormant_reason(request),
-                )
-            else:
+            if not self._make_prompt_stream_request_dormant(request):
+                # KV 已丢失，通常已有模板/segment 恢复 work，需要重新准入。
                 self.waiting.prepend_request(request)
 
     def get_next_prompt_stream_deadline(self) -> float | None:
@@ -769,28 +850,50 @@ class Scheduler(SchedulerInterface):
         return controller.get_next_deadline(self.requests)
 
     def flush_due_update_coalescing(self, now: float | None = None) -> int:
+        """释放到期窗口或已有计算机会的 adaptive 候选，返回放行数。
+
+        沿用 EngineCore 的同线程轮询入口；adaptive 没有 deadline，也不新增
+        定时线程。每放行一个候选即重新评估当前需求，避免同时唤醒整个集合。
+        """
         controller = self._prompt_stream_update_coalescer
         if controller is None:
             return 0
         timestamp = time.monotonic() if now is None else now
         num_flushed = 0
-        prefill_queue_load = self._get_prompt_stream_prefill_queue_load()
-        for request, reason in controller.pop_due_requests(
-            self.requests,
-            timestamp,
-        ):
-            flushed = request.flush_prompt_stream_update(
+        for request, reason in controller.pop_due_requests(self.requests, timestamp):
+            num_flushed += int(
+                self._flush_prompt_stream_update(request, timestamp, reason)
+            )
+            self._reconcile_prompt_stream_request(request, evaluate_coalescing=False)
+
+        # 只遍历未放行候选；失败不会改变负载，同一压力快照可供其余候选复用。
+        pressure_context: UpdateCoalescingContext | None = None
+        for request_id in tuple(controller.adaptive_request_ids):
+            request = self.requests.get(request_id)
+            if request is None or request.is_finished():
+                controller.remove_request(request_id)
+                continue
+            if pressure_context is None:
+                pressure_context = replace(
+                    self._get_prompt_stream_update_context(request, timestamp),
+                    # 各请求的执行背压由 Request 自己补充，不能复用前一请求的值。
+                    has_outstanding_update=False,
+                )
+            flushed = self._flush_prompt_stream_update(
+                request,
                 timestamp,
-                reason,
-                prefill_queue_load=prefill_queue_load,
+                reason="scheduler_capacity",
+                context=pressure_context,
             )
             num_flushed += int(flushed)
-            self._reconcile_prompt_stream_request(request)
+            self._reconcile_prompt_stream_request(request, evaluate_coalescing=False)
+            if flushed:
+                # 已放行 work 必须计入下一候选的压力，防止一次性群体准入。
+                pressure_context = None
         return num_flushed
 
     def has_runnable_engine_work(self) -> bool:
-        if self._prompt_stream_update_coalescer is None:
-            return self.has_requests()
+        # dormant 仍是未完成请求，但不能单独让 EngineCore 忙循环。
         if self._pause_state == PauseState.PAUSED_ALL:
             num_runnable_requests = 0
         elif self._pause_state == PauseState.PAUSED_NEW:
@@ -813,11 +916,8 @@ class Scheduler(SchedulerInterface):
         )
 
     def abort_dormant_prompt_stream_requests(self) -> list[tuple[str, int]]:
-        controller = self._prompt_stream_update_coalescer
-        if controller is None:
-            return []
         return self.finish_requests(
-            controller.get_dormant_request_ids(),
+            tuple(self._prompt_stream_dormant_reasons),
             RequestStatus.FINISHED_ABORTED,
         )
 
@@ -855,18 +955,16 @@ class Scheduler(SchedulerInterface):
 
         now = time.monotonic()
         if self._prompt_stream_update_coalescer is not None:
-            # 先兑现已经越过的窗口边界，再让本事件进入旧窗口或新窗口。
-            self.flush_due_update_coalescing(now)
+            # 定时策略先兑现越过的边界；adaptive 应先覆盖本次新快照再判断，
+            # 避免新版本已到达却在事件处理前抢先放行旧快照。
+            if self._prompt_stream_update_coalescer.config.update_policy != "adaptive":
+                self.flush_due_update_coalescing(now)
             self._enable_prompt_stream_update_coalescing(existing, now)
         existing.apply_prompt_stream_event(event)
         incoming.prompt_stream_event = None
         if self._prompt_stream_update_coalescer is not None:
-            existing.flush_prompt_stream_update(
-                now,
-                reason=f"event_{event.event_type.value}",
-                prefill_queue_load=(
-                    self._get_prompt_stream_prefill_queue_load()
-                ),
+            self._flush_prompt_stream_update(
+                existing, now, reason=f"event_{event.event_type.value}"
             )
             existing.enqueue_question_if_ready()
 
@@ -896,8 +994,7 @@ class Scheduler(SchedulerInterface):
                 RequestStatus.FINISHED_ERROR,
             )
             return
-        if self._prompt_stream_update_coalescer is not None:
-            self._reconcile_prompt_stream_request(existing)
+        self._reconcile_prompt_stream_request(existing)
 
     def _prepare_prompt_stream_execution(self, request: Request) -> None:
         """在计算 token budget 前刷新流式请求的阶段执行视图。"""
@@ -996,22 +1093,18 @@ class Scheduler(SchedulerInterface):
         req_index = 0
         while req_index < len(self.running) and token_budget > 0:
             request = self.running[req_index]
-            if self._prompt_stream_update_coalescer is not None:
+            if request.is_prompt_streaming():
                 self._reconcile_prompt_stream_request(request)
-                if self._prompt_stream_update_coalescer.is_dormant(
-                    request.request_id
-                ):
+                if request.request_id in self._prompt_stream_dormant_reasons:
                     # Request 已从 running 移除，保留当前下标。
                     continue
             self._prepare_prompt_stream_execution(request)
-            if self._prompt_stream_update_coalescer is not None:
+            if request.is_prompt_streaming():
                 # prepare may synchronously consume a zero-forward Update
                 # (for example, a strict-prefix snapshot). Reconcile again so
                 # an exhausted request is parked without waiting for GPU output.
                 self._reconcile_prompt_stream_request(request)
-                if self._prompt_stream_update_coalescer.is_dormant(
-                    request.request_id
-                ):
+                if request.request_id in self._prompt_stream_dormant_reasons:
                     continue
 
             if (
@@ -1130,12 +1223,9 @@ class Scheduler(SchedulerInterface):
                         )
                         running_allocation_failure_recorded = True
 
-                    if (
-                        self._prompt_stream_update_coalescer is not None
-                        and self._evict_one_dormant_prompt_stream_request(
-                            scheduled_timestamp,
-                            evicted_dormant_reqs,
-                        )
+                    if self._evict_one_dormant_prompt_stream_request(
+                        scheduled_timestamp,
+                        evicted_dormant_reqs,
                     ):
                         # dormant KV 已释放，使用相同参数重试。
                         continue
@@ -1243,20 +1333,16 @@ class Scheduler(SchedulerInterface):
 
                 request = request_queue.peek_request()
                 request_id = request.request_id
-                if self._prompt_stream_update_coalescer is not None:
+                if request.is_prompt_streaming():
                     self._reconcile_prompt_stream_request(request)
-                    if self._prompt_stream_update_coalescer.is_dormant(
-                        request.request_id
-                    ):
+                    if request.request_id in self._prompt_stream_dormant_reasons:
                         # Request 已从当前 RequestQueue 移除。
                         continue
                 self._prepare_prompt_stream_execution(request)
-                if self._prompt_stream_update_coalescer is not None:
+                if request.is_prompt_streaming():
                     # A zero-forward Update can be committed by prepare alone.
                     self._reconcile_prompt_stream_request(request)
-                    if self._prompt_stream_update_coalescer.is_dormant(
-                        request.request_id
-                    ):
+                    if request.request_id in self._prompt_stream_dormant_reasons:
                         # Request 已从当前 RequestQueue 移除。
                         continue
 
@@ -1539,13 +1625,10 @@ class Scheduler(SchedulerInterface):
                         )
                         waiting_allocation_failure_recorded = True
 
-                    if (
-                        self._prompt_stream_update_coalescer is None
-                        or not self._evict_one_dormant_prompt_stream_request(
-                            scheduled_timestamp,
-                            evicted_dormant_reqs,
-                            excluded_request_id=request.request_id,
-                        )
+                    if not self._evict_one_dormant_prompt_stream_request(
+                        scheduled_timestamp,
+                        evicted_dormant_reqs,
+                        excluded_request_id=request.request_id,
                     ):
                         break
 
@@ -1651,10 +1734,8 @@ class Scheduler(SchedulerInterface):
             if not defer_prefills:
                 self.prefill_capacity_bound = bool(self.waiting)
 
-        if self._prompt_stream_update_coalescer is not None:
-            self._finalize_dormant_prompt_stream_evictions(
-                evicted_dormant_reqs
-            )
+        if evicted_dormant_reqs:
+            self._finalize_dormant_prompt_stream_evictions(evicted_dormant_reqs)
 
         # Check if the scheduling constraints are satisfied.
         total_num_scheduled_tokens = sum(num_scheduled_tokens.values())
@@ -1842,29 +1923,17 @@ class Scheduler(SchedulerInterface):
         if self.log_stats:
             request.record_event(EngineCoreEventType.PREEMPTED, timestamp)
 
-        # Put the request back to the waiting queue.
-        controller = self._prompt_stream_update_coalescer
-        if (
-            controller is not None
-            and request.is_prompt_stream_update_coalescing_enabled()
-        ):
-            controller.remove_request(request.request_id)
-            request.flush_prompt_stream_update(
-                timestamp,
-                reason="preemption_recovery",
-                prefill_queue_load=self._get_prompt_stream_prefill_queue_load(),
-            )
+        # KV 丢失后通常有恢复 work，先回 waiting；只有真正无 work 才能停放。
+        if request.is_prompt_streaming():
+            self._prompt_stream_dormant_reasons.pop(request.request_id, None)
+            controller = self._prompt_stream_update_coalescer
+            if controller is not None:
+                controller.remove_request(request.request_id)
+                self._flush_prompt_stream_update(
+                    request, timestamp, reason="preemption_recovery"
+                )
             request.enqueue_question_if_ready()
-            controller.refresh_deadline(request)
-            if request.should_make_prompt_stream_dormant():
-                request.status = RequestStatus.WAITING
-                self._prompt_stream_worker_removal_req_ids.add(
-                    request.request_id
-                )
-                controller.mark_dormant(
-                    request.request_id,
-                    self._get_prompt_stream_dormant_reason(request),
-                )
+            if self._make_prompt_stream_request_dormant(request):
                 return
         self.waiting.prepend_request(request)
 
@@ -1879,8 +1948,25 @@ class Scheduler(SchedulerInterface):
         # 3. If some tokens (e.g. spec tokens) are rejected later, the number of
         #    computed tokens will be adjusted in update_from_output.
         num_scheduled_tokens = scheduler_output.num_scheduled_tokens
+        controller = self._prompt_stream_update_coalescer
         for req_id, num_scheduled_token in num_scheduled_tokens.items():
             request = self.requests[req_id]
+            if controller is not None and controller.config.update_policy == "adaptive":
+                controller.inflight_tokens[req_id] = (
+                    controller.inflight_tokens.get(req_id, 0) + num_scheduled_token
+                )
+            if request.is_prompt_streaming():
+                view = request.prompt_stream_execution_view
+                if view is not None and view.phase == PromptStreamExecutionPhase.UPDATE:
+                    assert request.prompt_stream is not None
+                    # 在 advance 清空 active 之前冻结本批阶段；回包不能读新视图。
+                    scheduler_output.prompt_stream_update_req_ids.add(req_id)
+                    request.prompt_stream.num_update_inflight_steps += 1
+
+                # 必须先登记在途步数，再提前推进可能清空 active work 的进度。
+                self._prompt_stream_inflight_steps[req_id] = (
+                    self._prompt_stream_inflight_steps.get(req_id, 0) + 1
+                )
             request.advance_prompt_stream_computed_tokens(num_scheduled_token)
             if self.defer_block_free:
                 # Record the in-flight step, to fence deferred block freeing.
@@ -2300,6 +2386,29 @@ class Scheduler(SchedulerInterface):
         stopped_preempted_reqs: set[Request] = set()
         for req_id, num_tokens_scheduled in num_scheduled_tokens.items():
             assert num_tokens_scheduled > 0
+            controller = self._prompt_stream_update_coalescer
+            if controller is not None and controller.config.update_policy == "adaptive":
+                remaining = (
+                    controller.inflight_tokens.get(req_id, 0) - num_tokens_scheduled
+                )
+                if remaining > 0:
+                    controller.inflight_tokens[req_id] = remaining
+                else:
+                    controller.inflight_tokens.pop(req_id, None)
+            request = self.requests.get(req_id)
+            if (
+                req_id in scheduler_output.prompt_stream_update_req_ids
+                and request is not None
+                and request.prompt_stream is not None
+            ):
+                assert request.prompt_stream.num_update_inflight_steps > 0
+                request.prompt_stream.num_update_inflight_steps -= 1
+            # 回包意味着该步 GPU 写入已经结束；失败/取消的输出也须归还计数。
+            num_inflight_steps = self._prompt_stream_inflight_steps.get(req_id, 0)
+            if num_inflight_steps == 1:
+                self._prompt_stream_inflight_steps.pop(req_id)
+            elif num_inflight_steps > 1:
+                self._prompt_stream_inflight_steps[req_id] = num_inflight_steps - 1
             if failed_kv_load_req_ids and req_id in failed_kv_load_req_ids:
                 # skip failed or rescheduled requests from KV load failure
                 continue
@@ -2497,12 +2606,11 @@ class Scheduler(SchedulerInterface):
             # This is a rare case and unlikely to impact performance.
             self.waiting.remove_requests(stopped_preempted_reqs)
 
-        if self._prompt_stream_update_coalescer is not None:
-            for req_id in num_scheduled_tokens:
-                request = self.requests.get(req_id)
-                if request is not None and not request.is_finished():
-                    # GPU 写入已经完成，此时才能安全停放刚耗尽 work 的请求。
-                    self._reconcile_prompt_stream_request(request)
+        for req_id in num_scheduled_tokens:
+            request = self.requests.get(req_id)
+            if request is not None and request.is_prompt_streaming():
+                # 仅最后一批在途写入完成后才能停放；合并关闭时规则相同。
+                self._reconcile_prompt_stream_request(request)
 
         if failed_kv_load_req_ids and not self.recompute_kv_load_failures:
             requests = [self.requests[req_id] for req_id in failed_kv_load_req_ids]
@@ -2521,6 +2629,9 @@ class Scheduler(SchedulerInterface):
         # KV Connector: update state for finished KV Transfers.
         if kv_connector_output:
             self._update_from_kv_xfer_finished(kv_connector_output)
+
+        if self._prompt_stream_update_coalescer is not None:
+            self.flush_due_update_coalescing()
 
         # Worker-side KV connector stats from the model runner output.
         kv_connector_stats: KVConnectorStats | None = (
@@ -2744,11 +2855,7 @@ class Scheduler(SchedulerInterface):
 
     def get_request_counts(self) -> tuple[int, int]:
         """Returns (num_running_reqs, num_waiting_reqs)."""
-        num_dormant = (
-            self._prompt_stream_update_coalescer.num_dormant_requests
-            if self._prompt_stream_update_coalescer is not None
-            else 0
-        )
+        num_dormant = len(self._prompt_stream_dormant_reasons)
         return (
             len(self.running),
             len(self.waiting) + len(self.skipped_waiting) + num_dormant,
@@ -2798,12 +2905,8 @@ class Scheduler(SchedulerInterface):
                 request.apply_prompt_stream_event(event)
                 request.prompt_stream_event = None
                 if self._prompt_stream_update_coalescer is not None:
-                    request.flush_prompt_stream_update(
-                        now,
-                        reason=f"event_{event.event_type.value}",
-                        prefill_queue_load=(
-                            self._get_prompt_stream_prefill_queue_load()
-                        ),
+                    self._flush_prompt_stream_update(
+                        request, now, reason=f"event_{event.event_type.value}"
                     )
                     request.enqueue_question_if_ready()
             if request.resumable:
@@ -2838,10 +2941,7 @@ class Scheduler(SchedulerInterface):
                         request.request_id,
                         RequestStatus.FINISHED_ERROR,
                     )
-            if (
-                self._prompt_stream_update_coalescer is not None
-                and request.request_id in self.requests
-            ):
+            if request.is_prompt_streaming() and request.request_id in self.requests:
                 self._reconcile_prompt_stream_request(request)
 
     def _mark_prompt_stream_request_terminal(self, request_id: str) -> None:
@@ -2939,6 +3039,8 @@ class Scheduler(SchedulerInterface):
             request.request_id
         )
         self._prompt_stream_worker_removal_req_ids.discard(request.request_id)
+        self._prompt_stream_dormant_reasons.pop(request.request_id, None)
+        self._prompt_stream_inflight_steps.pop(request.request_id, None)
         self._inflight_prefills.discard(request)
         connector_delay_free_blocks, kv_xfer_params = self._connector_finished(request)
         # 无 NIXL / P-only 请求仍要报告语义布局；不添加远端加载开关或租约。
@@ -3028,11 +3130,7 @@ class Scheduler(SchedulerInterface):
             + len(self.skipped_waiting)
             - self.num_waiting_for_streaming_input
         )
-        num_dormant = (
-            self._prompt_stream_update_coalescer.num_dormant_requests
-            if self._prompt_stream_update_coalescer is not None
-            else 0
-        )
+        num_dormant = len(self._prompt_stream_dormant_reasons)
         return num_waiting + len(self.running) + num_dormant
 
     def has_finished_requests(self) -> bool:
@@ -3045,10 +3143,7 @@ class Scheduler(SchedulerInterface):
         num_in_queues = (
             len(self.waiting) + len(self.skipped_waiting) + len(self.running)
         )
-        if self._prompt_stream_update_coalescer is not None:
-            num_in_queues += (
-                self._prompt_stream_update_coalescer.num_dormant_requests
-            )
+        num_in_queues += len(self._prompt_stream_dormant_reasons)
         return len(self.requests) > num_in_queues
 
     def has_requests(self) -> bool:

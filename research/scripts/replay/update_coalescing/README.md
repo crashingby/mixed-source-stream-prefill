@@ -9,7 +9,11 @@ RESTFUL API 回放同一批 mixed-source 请求，同时测量：
 - 不同策略、窗口、Update 到达频率和 QPS 下的成功率与尾延迟。
 
 合并策略是 **P 节点 Engine 启动级配置**。P 节点存活期间不能由 replay 请求切换
-策略。每次修改 profile、Append gate、window 或 Adaptive 参数，都必须重启 P。
+策略。每次修改 profile、window 或 adaptive 压力阈值，都必须重启 P。
+
+当前主自适应策略为 **`COALESCING_PROFILE=adaptive`**：按本请求执行背压与全局计算
+积压放行，不设置固定等待上限。历史结果必须按生成时的代码版本与配置区分，
+不能仅凭目录中的策略名称与当前结果混合分析。
 
 ## 目录与脚本
 
@@ -91,7 +95,7 @@ sbatch --nodelist="${P_NODE}" \
 #### Slurm 资源参数
 
 脚本内置的默认 allocation 是：一个节点、一张 GPU、16 个 CPU、64 GiB 内存、最长
-12 小时。常用提交选项如下：
+24 小时。常用提交选项如下：
 
 | `sbatch` 选项 | 脚本默认值 | 何时调整 |
 | --- | ---: | --- |
@@ -100,7 +104,7 @@ sbatch --nodelist="${P_NODE}" \
 | `--gres` | `gpu:1` | 当前实现按单 GPU P 节点测试，不建议修改。 |
 | `--cpus-per-task` | `16` | tokenization 或 HTTP 前端 CPU 不足时调整。 |
 | `--mem` | `64G` | 模型加载或数据处理需要更多主存时调整。 |
-| `--time` | `12:00:00` | P 必须覆盖该 profile 下全部 replay 的运行时间。 |
+| `--time` | `24:00:00` | P 必须覆盖该 profile 下全部 replay 的运行时间。 |
 
 Slurm 会设置当前 job 可见的 GPU。通常不要再手写 `CUDA_VISIBLE_DEVICES`，否则可能
 覆盖 Slurm 的 GPU 隔离结果。
@@ -133,11 +137,11 @@ Append/Update 事件。提高它可能缓解并发请求 admission 限制，但�
 | 环境变量 | 适用 profile | 用途 |
 | --- | --- | --- |
 | `COALESCING_PROFILE` | 全部 | 必须显式指定，避免意外使用默认 `fixed-window`。 |
-| `APPEND_GATE` | 除 `disabled`、`immediate-controller` 外 | 选择 Append gate；主实验默认 `hold_until_append_finished`。 |
-| `SOFT_WINDOW_MS` | fixed、debounce、adaptive | soft window，默认 `20` ms。 |
-| `HARD_DEADLINE_MS` | fixed、debounce、adaptive | hard deadline，默认 `80` ms。 |
-| `TTFT_DEADLINE_MS` | fixed、debounce、adaptive | 可选请求级 deadline；不启用时不传或设为 `null`。 |
-| EWMA、prior、price 变量 | adaptive | 控制在线估计与等待成本。 |
+| `SOFT_WINDOW_MS` | fixed、debounce | soft window，默认 `20` ms。 |
+| `HARD_DEADLINE_MS` | fixed、debounce | hard deadline，默认 `80` ms。 |
+| `TTFT_DEADLINE_MS` | fixed、debounce | 可选请求级 deadline；不启用时不传或设为 `null`。 |
+| `ADAPTIVE_TOKEN_PRESSURE_THRESHOLD` | adaptive | token 需求压力阈值，默认 `1.0`，必须大于 0。 |
+| `ADAPTIVE_SLOT_PRESSURE_THRESHOLD` | adaptive | 可执行请求数 / 序列名额阈值，默认 `1.0`，必须大于 0。 |
 | `PROMPT_STREAM_UPDATE_COALESCING_CONFIG` | custom | 完整 JSON；其它 profile 会由 helper 自动生成，不要手动同时设置。 |
 
 **同一个 P job 的 Engine 配置不会随 replay 改变。** 修改上述任意合并参数后，都要
@@ -146,8 +150,8 @@ Append/Update 事件。提高它可能缓解并发请求 admission 限制，但�
 ### `replay_update_coalescing.py`
 
 这是单次回放入口。它通过 proxy 依次发送 start、Append/Update、source finished 和
-finish_ttft 请求。客户端只复现事件时间线；Update admission、window、deadline 和
-Append gate 全部由 P 节点执行。
+finish_ttft 请求。客户端只复现事件时间线；Update admission、window 和 deadline
+全部由 P 节点执行。
 
 ### `run_policy_sweep.sbatch`
 
@@ -179,7 +183,6 @@ P 已经就绪。典型提交方式是：
 ```shell
 PROXY_URL="${PROXY_URL}" \
 COALESCING_PROFILE=fixed-window \
-APPEND_GATE=hold_until_append_finished \
 SOFT_WINDOW_MS=20 \
 HARD_DEADLINE_MS=80 \
 MAX_REQUESTS=512 \
@@ -197,11 +200,11 @@ sbatch research/scripts/replay/update_coalescing/run_policy_sweep.sbatch
 | replay 环境变量 | 对应 P 配置 | 约束 |
 | --- | --- | --- |
 | `COALESCING_PROFILE` | P 的 profile | 必须相同。 |
-| `APPEND_GATE` | P 的 `append_gate` | 使用该变量的 profile 必须相同。 |
-| `SOFT_WINDOW_MS` | P 的 `soft_window_ms` | fixed、debounce、adaptive 必须相同。 |
-| `HARD_DEADLINE_MS` | P 的 `hard_deadline_ms` | fixed、debounce、adaptive 必须相同。 |
+| `SOFT_WINDOW_MS` | P 的 `soft_window_ms` | fixed、debounce 必须相同。 |
+| `HARD_DEADLINE_MS` | P 的 `hard_deadline_ms` | fixed、debounce 必须相同。 |
 | `TTFT_DEADLINE_MS` | P 的 `ttft_deadline_ms` | P 设置时 replay 也必须设置。 |
-| Adaptive EWMA、prior、price 变量 | P 的 Adaptive 字段 | 每个字段都必须相同。 |
+| `ADAPTIVE_TOKEN_PRESSURE_THRESHOLD` | P 的同名 JSON 字段（小写） | adaptive 必须相同。 |
+| `ADAPTIVE_SLOT_PRESSURE_THRESHOLD` | P 的同名 JSON 字段（小写） | adaptive 必须相同。 |
 | `PROMPT_STREAM_UPDATE_COALESCING_CONFIG` | custom JSON | `custom` profile 下必须完全相同。 |
 
 `MODEL` 还必须等于 P 的 `SERVED_MODEL_NAME`，但它不是 coalescing JSON 的一部分。
@@ -251,8 +254,8 @@ offered QPS；这正是高负载结果必须同时报告成功率和完成吞吐
 | `UPDATE_INTERVAL_LIST` | `0.2 0.01` | 同一请求 Update source 内相邻快照的间隔，也是 sweep 维度。 |
 | `SOURCE_FINISH_DELAY` | `0.0` | 最后数据事件 ACK 后，再发送 source finished 的延迟。 |
 
-这些参数改变 source 的相对结束顺序，可能显著影响 Append gate。正式对比时必须固定
-除目标消融维度以外的所有 source timing。
+这些参数改变 source 的交错和相对结束顺序，会影响 Update 执行时可见的 Append
+前缀。正式对比时必须固定除目标消融维度以外的所有 source timing。
 
 #### 连接、输出与失败处理参数
 
@@ -262,6 +265,8 @@ offered QPS；这正是高负载结果必须同时报告成功率和完成吞吐
 | `DATA_DIR` | `research/data/mix_source` | mixed-source 输入目录。 |
 | `OUTPUT_DIR` | `.../update_coalescing/results` | 正式结果根目录。 |
 | `MODEL` | `qwen2.5-3b` | REST 模型名，必须等于 P 的 served model name。 |
+| `TOKENIZER_MODEL` | `${MODEL_PATH}`（若存在） | **必填其一**；回放节点可读的模型目录或 HF ID，用于 `apply_chat_template`，不是 served name。 |
+| `TOKENIZER_TRUST_REMOTE_CODE` | `0` | 设为 `1` 时允许 tokenizer remote code。 |
 | `HTTP_TIMEOUT` | `600` | 普通 HTTP 操作超时，单位秒。 |
 | `SSE_TIMEOUT` | `120` | 等待 P 首 token 的 SSE 超时，单位秒。 |
 | `MAX_TOKENS` | `64` | 生成参数；本 sbatch 固定 TTFT-only，P 首 token 后即结束。 |
@@ -292,7 +297,7 @@ Slurm replay 通常运行在其它节点，应使用 proxy 所在节点 hostname
 `summarize_coalescing.py` 生成：
 
 - `run_summary.csv`：每次独立 run 的指标。
-- `configuration_summary.csv`：相同 workload 和配置的重复实验汇总。
+- `configuration_summary.csv`：相同 workload 和完整配置 JSON 的重复实验汇总，包含两个 adaptive 压力阈值列。
 - `combined_request_metrics.csv`：全部请求级记录与实验元数据。
 - `summary.json`：结构化汇总。
 
@@ -311,75 +316,90 @@ Slurm replay 通常运行在其它节点，应使用 proxy 所在节点 hostname
 
 实验脚本用 `COALESCING_PROFILE` 统一生成 JSON。
 
-| Profile | `append_gate` | `update_policy` | 实验含义 |
-| --- | --- | --- | --- |
-| `disabled` | 不适用 | 不启用 controller | 原始逐 Update FIFO，是主要无合并基线。 |
-| `immediate-controller` | `none` | `immediate` | 每条 Update 立即 admission，用于测 controller 开销。 |
-| `strict-immediate` | 默认 `hold_until_append_finished` | `immediate` | policy 立即 ready，但受 Append gate 阻挡。 |
-| `fixed-window` | 默认 `hold_until_append_finished` | `fixed_window` | 从窗口第一条 Update 开始等待固定 soft window。 |
-| `quiet-debounce` | 默认 `hold_until_append_finished` | `quiet_debounce` | 每条有效 Update 刷新 soft deadline。 |
-| `adaptive` | 默认 `hold_until_append_finished` | `adaptive` | 使用 EWMA 在线决定等待时间。 |
-| `full-merge` | 默认 `hold_until_append_finished` | `full_merge` | 等待 source finished 或最终 Prompt barrier。 |
-| `custom` | 由 JSON 决定 | 由 JSON 决定 | 使用完整手写 JSON。 |
+| Profile | `update_policy` | 实验含义 |
+| --- | --- | --- |
+| `disabled` | 不启用 controller | 原始逐 Update FIFO，是主要无合并基线。 |
+| `immediate-controller` | `immediate` | 每条 Update 立即 admission，是 controller 内的无等待基线；跨 Append epoch 时会从 LCP=0 重算。 |
+| `fixed-window` | `fixed_window` | 从窗口第一条 Update 开始等待固定 soft window。 |
+| `quiet-debounce` | `quiet_debounce` | 每条有效 Update 刷新 soft deadline。 |
+| `adaptive` | `adaptive` | 本请求无未完成 Update 且全局有计算余量时放行，没有时间 deadline。 |
+| `full-merge` | `full_merge` | 等待 Update source finished 或最终 Prompt barrier。 |
+| `custom` | 由 JSON 决定 | 使用完整手写 JSON。 |
 
-除 `immediate-controller` 固定使用 `none` 外，其它 profile 可通过 `APPEND_GATE` 选择：
+**Update 放行只由自身合并策略决定，不要求 Append source 已结束。** Update work
+执行时仍需等待其依赖的 Prefix/Append KV 写入完成；这是执行依赖，不是 source
+结束条件。Question 仍等待它所需的 Append 和最终 Update work 完成。
 
-```text
-none
-hold_until_append_finished
-hold_until_append_or_update_finished
-```
-
-`fixed-window`、`quiet-debounce`、`adaptive` 和 `full-merge` 都能与这些 gate 组合。
-主实验固定 `hold_until_append_finished`，只对胜出策略做 gate 消融。
+`full-merge` 只等待最终 Update 快照，不额外等待 Append source 结束。因此所有
+策略都保留本系统的近似语义：早期 Update KV 可能没有关注到后来到达的 Append。
 
 ### 窗口参数
 
-`fixed-window`、`quiet-debounce` 和 `adaptive` 使用：
+`fixed-window` 和 `quiet-debounce` 使用：
 
 - `SOFT_WINDOW_MS`：soft window 上限，默认 `20` ms。
 - `HARD_DEADLINE_MS`：从窗口首事件计算的硬截止时间，默认 `80` ms。
 - `TTFT_DEADLINE_MS`：可选请求级 TTFT deadline，默认 `null`。
 
 实验脚本要求 `SOFT_WINDOW_MS <= HARD_DEADLINE_MS`。`full-merge` 不使用这些
-window deadline。
+window deadline。`adaptive` 同样不使用时间窗口、hard deadline 或 TTFT deadline。
 
-### Adaptive 参数
+### Adaptive：执行背压与全局压力
 
 | 环境变量 | 默认值 | 含义 |
 | --- | ---: | --- |
-| `INTERVAL_EWMA_ALPHA` | `0.25` | Update 到达间隔 EWMA 的平滑系数。 |
-| `GAIN_EWMA_ALPHA` | `0.25` | 合并收益 EWMA 的平滑系数。 |
-| `COLD_START_PRIOR_WEIGHT` | `8` | 冷启动先验的等效观测权重。 |
-| `ARRIVAL_RATE_PRIOR_PER_S` | `null` | 可选的 Update 到达率先验。 |
-| `MERGE_GAIN_PRIOR_TOKENS` | `null` | 可选的 token 收益先验。 |
-| `DELAY_PRICE` | `1` | 等待成本权重。 |
-| `LOAD_PRICE_SCALE` | `0` | 系统负载对等待成本的缩放。 |
+| `ADAPTIVE_TOKEN_PRESSURE_THRESHOLD` | `1.0` | 已可执行工作的下一轮 token 需求 / 单轮 token budget 的放行阈值。 |
+| `ADAPTIVE_SLOT_PRESSURE_THRESHOLD` | `1.0` | 已可执行请求数 / `MAX_NUM_SEQS` 的放行阈值。 |
+
+两个阈值均须为有限正数。只有两类压力都低于各自阈值，且本请求不存在未完成 Update，
+才进行普通放行。默认 `1.0` 表示已有工作达到一轮计算预算或序列容量时继续合并。
+降低阈值会更早抑制中间版本；提高阈值会更积极放行。它们是启发式参数，不是 GPU 利用率，
+也不是上一轮 budget 的使用比例。候选已有 Append work 同样占名额，但不要求 Append 源结束。
+
+“未完成 Update”包括 pending、active 和最后一个 GPU 步骤尚未回包的 work；
+已经放行的 work 不会被新事件覆盖。新快照只覆盖合并缓冲，前驱完成后重新判断。
+压力来自已有可执行 work，排除纯等输入的 dormant、尚未放行的合并快照，以及
+等待远程 KV / grammar 等外部依赖的请求。已调度但仍在 GPU 的 token 也计入；新需求按长 prefill 阈值和单轮 budget 截断。每次
+成功放行后刷新压力，失败候选复用当前上下文，避免多个候选同时依据旧余量全部放行。
+候选自身尚未放行的快照不预先计入，保证大于一轮 budget 的快照仍能正常分块计算。
+
+`SOURCE_FINISHED(Update)` 或最终 Question 到达会强制放行最后快照，允许终止阶段
+越过普通背压条件；Question 仍排在最后 Update 后面。这意味着策略没有毫秒级 admission
+保证，也不承诺最优 TTFT。只要其他工作完成释放计算机会，Scheduler 会主动重新检查，
+不要求再来一条 Update 才能唤醒 dormant 请求。
+
+本策略不根据 KV 使用率、抢占次数或 ANNS 是否趋于稳定来决策。主实验尽量使用
+足够显存，仍记录已有 preemption / recovery 指标确认干扰。完整实现说明见
+[合并设计笔记](../../../Volatility-Aware_Bounded_Update_Coalescing.md)。
 
 ## 实验设计
 
-Update 合并不是简单地让所有 Update 等待更久，而是在有限等待内减少重复 Prefill，
+Update 合并不是简单地让所有 Update 等待更久，而是按执行机会或配置的窗口减少重复 Prefill，
 同时控制最终用户问题的 TTFT。实验需要回答：
 
 - **计算是否减少**：相同 Update 序列下，admitted work 和 Update Prefill token
   是否下降。
 - **节省是否转化为性能收益**：不同 QPS 下，TTFT 和尾延迟是否改善。
-- **等待代价是否可控**：window、deadline 和 Append gate 是否造成额外等待。
-- **Adaptive 是否值得**：是否比调优后的 fixed/debounce 更稳健。
+- **等待代价是否可控**：window 和 deadline 是否造成额外等待。
+- **Adaptive 是否值得**：执行背压和全局压力是否比 fixed/debounce 更稳健。
+- **终止后的剩余工作**：延后计算是否把成本转移到了 Question 到达后，抵消少算 token 的收益。
 
 当前实验边界是一个真实 Append source 和一个 Update source。
 
 ### 控制组与主策略
 
-- `disabled` 是原始逐 Update FIFO 行为。
-- `immediate-controller` 启用 controller，但不等待、不使用 gate。它应与
-  `disabled` 接近，用于排除 controller 热路径开销。
+- `disabled` 是原始逐 Update FIFO 行为，按相邻 Update 快照的 source-local LCP
+  复用 KV，允许复用部分 KV 没有关注后来到达的 Append。
+- `immediate-controller` 启用 controller，每条有效 Update 立即放行。已有规则会
+  在前后两次 admission 的 Append epoch 不同时将 LCP 置为 0，重新计算 Update。
+  因此它与 `disabled` 的跨 epoch 差异既可能包含 controller 开销，也可能包含额外
+  Prefill，不能把全部差异归因于 CPU 调度路径。
 - `full-merge` 只计算最终目标快照，给出最少 Update work 的参考，但不保证 TTFT
   最优。
 
-主策略比较固定 `append_gate=hold_until_append_finished`，再比较 `immediate`、
-`fixed_window`、`quiet_debounce`、`adaptive` 和 `full_merge`。最后单独做 gate
-消融，避免把 policy 和 gate 的影响混在一起。
+controller 内的主策略比较 `immediate`、`fixed_window`、`quiet_debounce`、
+`adaptive` 和 `full_merge`。这些策略保留相同的跨 Append epoch 复用规则，只改变
+Update 的放行时机与合并程度；`disabled` 单独作为原始分段近似计算基线。
 
 ### Workload 维度
 
@@ -412,8 +432,9 @@ $$
 
 #### Append 与 Update 的结束顺序
 
-后续 gate 消融至少覆盖 Append 先结束、两者接近同时结束、Update 先结束三种时序。
+时序敏感性实验可覆盖 Append 先结束、两者接近同时结束、Update 先结束三种情况。
 通过 initial delay、chunk interval 和事件数量控制，不与所有策略参数做笛卡尔积。
+Update 依照自身策略放行，早期 Update KV 可以保留未关注后续 Append 的近似。
 
 ### 每次回放自动采集的指标
 
@@ -487,29 +508,30 @@ $$
 跨请求使用总量之比，不平均请求级 ratio。分母为 0 或字段不适用时保留空值。
 `scheduled_update_prefill_tokens` 是调度口径；算法节省主要比较 eager 与 admitted。
 
-当前尚未导出 `flush_reason`、`window_wait_ms` 和 `append_gate_block_ms`，第一版实验
-不从客户端时序推测这些内部指标。
+当前尚未导出 `flush_reason` 和 `window_wait_ms`，第一版实验不从客户端时序
+推测这些内部指标。
 
 ### 分阶段实验计划
 
 不测试全部参数的笛卡尔积，而是逐层筛选。
 
-#### 阶段 A：正确性与 controller 开销
+#### 阶段 A：正确性与 controller 基线
 
-- 使用单请求或低 QPS 比较 `disabled` 和 `immediate-controller`。
+- 使用单请求或低 QPS 比较 `disabled` 和 `immediate-controller`。若要单独评估
+  controller 开销，需保持 Update admission 之间的 Append epoch 不变，并确认
+  两条路径的实际 Prefill 工作量相同；交错事件下同时报告额外重算。
 - 检查成功率、最终 Update 快照和 QUESTION barrier。
 - 结合 `research/scripts/simple_test` 覆盖零 token Update、截断和 source finished
   顺序。
 
 #### 阶段 B：策略初筛
 
-固定 QPS `1`、Update interval `0.2 0.01`、严格 Append gate 和 `20/80 ms` 窗口，
+固定 QPS `1`、Update interval `0.2 0.01`；时间策略用 `20/80 ms` 窗口，adaptive 用 `1.0/1.0` 压力阈值，
 依次比较：
 
 ```text
 disabled
 immediate-controller
-strict-immediate
 fixed-window
 quiet-debounce
 adaptive
@@ -533,24 +555,18 @@ full-merge
 每一行都是新的 Engine 配置，都要重启 P。选出合理 soft window 后，再单独改变 hard
 或 `TTFT_DEADLINE_MS`。
 
-#### 阶段 D：Adaptive 敏感性
+#### 阶段 D：Adaptive 压力敏感性
 
-- EWMA alpha 同步测试 `0.1 / 0.25 / 0.5`。
-- `COLD_START_PRIOR_WEIGHT` 测试 `0 / 4 / 8`。
-- `DELAY_PRICE` 测试 `0.5 / 1 / 2`。
-- `LOAD_PRICE_SCALE` 先比较 `0` 与一个非零值。
-- arrival/gain prior 只比较 `null` 与从调优集得到的一组先验。
-
-一次只改变一组参数，P 启动与 replay 审计必须使用相同值。
+- 先固定两个压力阈值为 `1.0`，比较 immediate、fixed/debounce、adaptive、full-merge。
+- 一次只改变一个压力阈值，例如 `0.5 / 1.0 / 2.0`；每次重启 P，并同步 replay 审计值。
+- 固定 `MAX_NUM_SEQS` 与 token budget；它们同时影响调度能力与压力归一化。
+- 结合 TTFT、admitted work、实际 scheduled token 判断：少算是否抵消终止阶段的补算成本。
+- 不将“已调度 token / budget”当作 GPU 利用率；长短快照都需要覆盖。
 
 #### 阶段 E：主负载实验
 
-选出 `disabled`、最佳 fixed/debounce、最佳 Adaptive 和 `full-merge`，再运行完整
+选出 `disabled`、最佳 fixed/debounce、adaptive 和 `full-merge`，再运行完整
 QPS 和 Update interval sweep，用于论文主表与主图。
-
-#### 阶段 F：Append gate 消融
-
-固定胜出 policy 及参数，只改变 `APPEND_GATE`。三个 gate 对应三个独立 P 启动。
 
 ## 实验执行流程
 
@@ -566,6 +582,8 @@ mkdir -p research/scripts/logs
 export P_NODE=g2c9
 export MODEL_PATH=/workplace/home/huangxinying/Models/Qwen2.5-3B
 export SERVED_MODEL_NAME=qwen2.5-3b
+export TOKENIZER_MODEL="${MODEL_PATH}"
+export DATA_DIR=research/data/mix_source_perf_qwen
 
 # 必须是所有 Slurm replay 节点都能访问的 proxy 地址。
 export PROXY_HOST=g2c14
@@ -579,11 +597,16 @@ P 节点启用合并时要求 DP=1、单 in-flight batch、关闭 async scheduli
 NIXL pull producer。通用 P 启动脚本已传入 `--no-async-scheduling`。D 节点不要
 设置合并配置。
 
+公共变量中的 Qwen 路径是本地可复制示例，发布时可替换为 `<MODEL_PATH>`。性能数据使用
+`mix_source_perf_qwen`；较长的 `mix_source` 质量数据可能超过示例 `MAX_MODEL_LEN=4096`，
+不要只改数据目录却沿用不匹配的长度配置。所有策略必须使用同一模型、tokenizer 和样本集。
+
 ### 按策略启动 P 节点
 
 以下命令使用上面的公共变量，每次只启动一个 profile。
 
 每个小节先给出 P 启动命令，再给出 P ready 后参数匹配的正式 sweep 命令。
+以下 sweep 会继承公共变量中的 `TOKENIZER_MODEL` 与 `DATA_DIR`；不要省略公共变量准备。
 下面统一使用 512 个请求、4 个 QPS、3 个 Update interval 和 3 次重复；
 这些 workload 参数可以调整，但不同策略做公平对比时应保持一致。
 
@@ -637,38 +660,10 @@ SOURCE_FINISH_DELAY=0 WARMUP_REQUESTS=8 \
 sbatch research/scripts/replay/update_coalescing/run_policy_sweep.sbatch
 ```
 
-#### `strict-immediate`
-
-```shell
-COALESCING_PROFILE=strict-immediate \
-APPEND_GATE=hold_until_append_finished \
-MODEL_PATH="${MODEL_PATH}" SERVED_MODEL_NAME="${SERVED_MODEL_NAME}" \
-GPU_MEMORY_UTILIZATION=0.6 MAX_MODEL_LEN=4096 MAX_NUM_SEQS=16 \
-sbatch --nodelist="${P_NODE}" \
-  research/scripts/replay/update_coalescing/start_p_node_coalescing.sbatch
-```
-
-P ready 后，对应的 sweep 命令为：
-
-```shell
-PROXY_URL="${PROXY_URL}" \
-COALESCING_PROFILE=strict-immediate \
-APPEND_GATE=hold_until_append_finished \
-MODEL="${SERVED_MODEL_NAME}" \
-MAX_REQUESTS=512 \
-QPS_LIST="0.5 1 2 4" \
-UPDATE_INTERVAL_LIST="0.5 0.2 0.01" \
-NUM_REPEATS=3 BASE_RANDOM_SEED=2026 \
-MAX_CONCURRENCY=8 APPEND_CHUNK_INTERVAL=0.5 \
-SOURCE_FINISH_DELAY=0 WARMUP_REQUESTS=8 \
-sbatch research/scripts/replay/update_coalescing/run_policy_sweep.sbatch
-```
-
 #### `fixed-window`
 
 ```shell
 COALESCING_PROFILE=fixed-window \
-APPEND_GATE=hold_until_append_finished \
 SOFT_WINDOW_MS=20 HARD_DEADLINE_MS=80 \
 MODEL_PATH="${MODEL_PATH}" SERVED_MODEL_NAME="${SERVED_MODEL_NAME}" \
 GPU_MEMORY_UTILIZATION=0.6 MAX_MODEL_LEN=4096 MAX_NUM_SEQS=16 \
@@ -681,7 +676,6 @@ P ready 后，对应的 sweep 命令为：
 ```shell
 PROXY_URL="${PROXY_URL}" \
 COALESCING_PROFILE=fixed-window \
-APPEND_GATE=hold_until_append_finished \
 SOFT_WINDOW_MS=20 HARD_DEADLINE_MS=80 \
 MODEL="${SERVED_MODEL_NAME}" \
 MAX_REQUESTS=512 \
@@ -697,7 +691,6 @@ sbatch research/scripts/replay/update_coalescing/run_policy_sweep.sbatch
 
 ```shell
 COALESCING_PROFILE=quiet-debounce \
-APPEND_GATE=hold_until_append_finished \
 SOFT_WINDOW_MS=20 HARD_DEADLINE_MS=80 \
 MODEL_PATH="${MODEL_PATH}" SERVED_MODEL_NAME="${SERVED_MODEL_NAME}" \
 GPU_MEMORY_UTILIZATION=0.6 MAX_MODEL_LEN=4096 MAX_NUM_SEQS=16 \
@@ -710,7 +703,6 @@ P ready 后，对应的 sweep 命令为：
 ```shell
 PROXY_URL="${PROXY_URL}" \
 COALESCING_PROFILE=quiet-debounce \
-APPEND_GATE=hold_until_append_finished \
 SOFT_WINDOW_MS=20 HARD_DEADLINE_MS=80 \
 MODEL="${SERVED_MODEL_NAME}" \
 MAX_REQUESTS=512 \
@@ -722,37 +714,27 @@ SOURCE_FINISH_DELAY=0 WARMUP_REQUESTS=8 \
 sbatch research/scripts/replay/update_coalescing/run_policy_sweep.sbatch
 ```
 
-#### `adaptive`
+#### `adaptive`：当前推荐的自适应实验
+
+下面是成对的 P 启动与 replay 命令；不传任何时间窗口。
 
 ```shell
 COALESCING_PROFILE=adaptive \
-APPEND_GATE=hold_until_append_finished \
-SOFT_WINDOW_MS=20 HARD_DEADLINE_MS=80 \
-INTERVAL_EWMA_ALPHA=0.25 GAIN_EWMA_ALPHA=0.25 \
-COLD_START_PRIOR_WEIGHT=8 DELAY_PRICE=1 LOAD_PRICE_SCALE=0 \
+ADAPTIVE_TOKEN_PRESSURE_THRESHOLD=1.0 \
+ADAPTIVE_SLOT_PRESSURE_THRESHOLD=1.0 \
 MODEL_PATH="${MODEL_PATH}" SERVED_MODEL_NAME="${SERVED_MODEL_NAME}" \
 GPU_MEMORY_UTILIZATION=0.6 MAX_MODEL_LEN=4096 MAX_NUM_SEQS=16 \
 sbatch --nodelist="${P_NODE}" \
   research/scripts/replay/update_coalescing/start_p_node_coalescing.sbatch
 ```
 
-如需冷启动先验，在 P 启动和 replay 两边同时增加：
-
-```shell
-ARRIVAL_RATE_PRIOR_PER_S=20 \
-MERGE_GAIN_PRIOR_TOKENS=256
-```
-
-P ready 后，对应的 sweep 命令如下。EWMA、prior 和 price 参数必须与上面的 P 启动
-命令一致：
+P ready、proxy 指向该 P 后，提交相同配置的 sweep：
 
 ```shell
 PROXY_URL="${PROXY_URL}" \
 COALESCING_PROFILE=adaptive \
-APPEND_GATE=hold_until_append_finished \
-SOFT_WINDOW_MS=20 HARD_DEADLINE_MS=80 \
-INTERVAL_EWMA_ALPHA=0.25 GAIN_EWMA_ALPHA=0.25 \
-COLD_START_PRIOR_WEIGHT=8 DELAY_PRICE=1 LOAD_PRICE_SCALE=0 \
+ADAPTIVE_TOKEN_PRESSURE_THRESHOLD=1.0 \
+ADAPTIVE_SLOT_PRESSURE_THRESHOLD=1.0 \
 MODEL="${SERVED_MODEL_NAME}" \
 MAX_REQUESTS=512 \
 QPS_LIST="0.5 1 2 4" \
@@ -763,11 +745,14 @@ SOURCE_FINISH_DELAY=0 WARMUP_REQUESTS=8 \
 sbatch research/scripts/replay/update_coalescing/run_policy_sweep.sbatch
 ```
 
+快速验证时，把同一条 replay 命令中的 `MAX_REQUESTS=64`、`QPS_LIST="1"`、
+`UPDATE_INTERVAL_LIST="0.01"`、`NUM_REPEATS=1`、`WARMUP_REQUESTS=0` 即可；
+压力阈值保持与 P 一致。它们只用于核对真实配置，replay 不会改变服务端策略。
+
 #### `full-merge`
 
 ```shell
 COALESCING_PROFILE=full-merge \
-APPEND_GATE=hold_until_append_finished \
 MODEL_PATH="${MODEL_PATH}" SERVED_MODEL_NAME="${SERVED_MODEL_NAME}" \
 GPU_MEMORY_UTILIZATION=0.6 MAX_MODEL_LEN=4096 MAX_NUM_SEQS=16 \
 sbatch --nodelist="${P_NODE}" \
@@ -779,7 +764,6 @@ P ready 后，对应的 sweep 命令为：
 ```shell
 PROXY_URL="${PROXY_URL}" \
 COALESCING_PROFILE=full-merge \
-APPEND_GATE=hold_until_append_finished \
 MODEL="${SERVED_MODEL_NAME}" \
 MAX_REQUESTS=512 \
 QPS_LIST="0.5 1 2 4" \
@@ -794,7 +778,7 @@ sbatch research/scripts/replay/update_coalescing/run_policy_sweep.sbatch
 
 ```shell
 COALESCING_PROFILE=custom \
-PROMPT_STREAM_UPDATE_COALESCING_CONFIG='{"append_gate":"none","update_policy":"fixed_window","soft_window_ms":10,"hard_deadline_ms":40}' \
+PROMPT_STREAM_UPDATE_COALESCING_CONFIG='{"update_policy":"fixed_window","soft_window_ms":10,"hard_deadline_ms":40}' \
 MODEL_PATH="${MODEL_PATH}" SERVED_MODEL_NAME="${SERVED_MODEL_NAME}" \
 GPU_MEMORY_UTILIZATION=0.6 MAX_MODEL_LEN=4096 MAX_NUM_SEQS=16 \
 sbatch --nodelist="${P_NODE}" \
@@ -807,7 +791,7 @@ P ready 后，对应的 sweep 命令如下。`PROMPT_STREAM_UPDATE_COALESCING_CO
 ```shell
 PROXY_URL="${PROXY_URL}" \
 COALESCING_PROFILE=custom \
-PROMPT_STREAM_UPDATE_COALESCING_CONFIG='{"append_gate":"none","update_policy":"fixed_window","soft_window_ms":10,"hard_deadline_ms":40}' \
+PROMPT_STREAM_UPDATE_COALESCING_CONFIG='{"update_policy":"fixed_window","soft_window_ms":10,"hard_deadline_ms":40}' \
 MODEL="${SERVED_MODEL_NAME}" \
 MAX_REQUESTS=512 \
 QPS_LIST="0.5 1 2 4" \
@@ -836,14 +820,13 @@ hostname 和端口时，proxy 不需要因 profile 改变而重启。
 ```shell
 PROXY_URL="${PROXY_URL}" \
 COALESCING_PROFILE=fixed-window \
-APPEND_GATE=hold_until_append_finished \
 SOFT_WINDOW_MS=20 HARD_DEADLINE_MS=80 \
 QPS_LIST="1" UPDATE_INTERVAL_LIST="0.01" \
 MAX_REQUESTS=64 NUM_REPEATS=1 WARMUP_REQUESTS=0 \
 sbatch research/scripts/replay/update_coalescing/run_policy_sweep.sbatch
 ```
 
-profile、gate 和 window 必须与当前 P 完全一致。查看 replay 日志：
+profile 和 window 必须与当前 P 完全一致。查看 replay 日志：
 
 ```shell
 REPLAY_JOB_ID=1235
@@ -873,7 +856,6 @@ tail -f "research/scripts/logs/replay-coalescing-${REPLAY_JOB_ID}.out"
 ```shell
 PROXY_URL="${PROXY_URL}" \
 COALESCING_PROFILE=fixed-window \
-APPEND_GATE=hold_until_append_finished \
 SOFT_WINDOW_MS=20 HARD_DEADLINE_MS=80 \
 MODEL=qwen2.5-3b MAX_REQUESTS=512 \
 QPS_LIST="0.5 1 2 4" \
@@ -906,6 +888,8 @@ scancel "${P_JOB_ID}"
 | `DATA_DIR` | `research/data/mix_source` | mixed-source 数据目录。 |
 | `OUTPUT_DIR` | `.../update_coalescing/results` | 正式结果根目录。 |
 | `MODEL` | `qwen2.5-3b` | REST 请求中的 served model。 |
+| `TOKENIZER_MODEL` | `${MODEL_PATH}`（若存在） | 必须提供可读 tokenizer 路径，用目标模型的 chat template。 |
+| `TOKENIZER_TRUST_REMOTE_CODE` | `0` | 需要远程 tokenizer 实现时设为 `1`。 |
 | `MAX_REQUESTS` | `256` | 每个 run 的样本数。 |
 | `QPS_LIST` | `1` | 空格分隔的逻辑请求到达率。 |
 | `UPDATE_INTERVAL_LIST` | `0.2 0.01` | Update source 内事件间隔，单位秒。 |
@@ -953,6 +937,9 @@ token 后，服务端 stats 缺失、类型错误、recovery-aware 守恒不一�
 汇总只池化 `workload_id`、P 配置、QPS 和 Update interval 相同的重复实验；不同
 样本、Append 时序、并发度或模型不会被静默混合。
 
+本轮实验请指定独立的 `OUTPUT_DIR`，汇总时让 `--input-root` 指向同一目录。历史
+版本的策略语义可能不同，旧结果保留归档，不应与本轮结果混入同一组策略对比。
+
 ```shell
 .venv/bin/python \
   research/scripts/replay/update_coalescing/plot_coalescing_tradeoff.py \
@@ -983,6 +970,11 @@ trade-off。若要同时比较不同 Update interval 和 QPS 下的策略表现�
 可靠性阈值。策略矩阵要求输入中只包含一个 `workload_id`；若汇总结果含有多个
 workload，必须通过 `--workload-id <WORKLOAD_ID>` 选择一个。
 
+同一 adaptive profile 的不同压力配置会按完整 JSON 独立汇总；trade-off 图例会显示
+`tokens=...` 与 `slots=...`。策略矩阵一个 profile 在同一 `(interval, QPS)` 单元格
+只允许一个配置，因此先选定一组压力阈值，或把不同敏感性实验写入独立结果根目录后分别汇总。
+已有历史结果不改写；分析时核对代码版本和完整配置，不能只改目录名来充当新策略结果。
+
 两个绘图脚本均可用 `--qps`、`--append-chunk-interval`、
 `--update-chunk-interval`、`--profile` 和 `--workload-id` 过滤数据。需要保留多个值
 时重复传入同一个参数，例如 `--qps 1 --qps 2 --qps 4`。绘图默认同时要求首 token
@@ -1000,11 +992,10 @@ load 不会互相计算支配关系。`disabled` 的 eager/saved 字段为空，
 1. 用 `MAX_REQUESTS=64`、QPS `1`、Update interval `0.01` 验证每个 profile。
 2. 用 QPS `1`、Update interval `0.2 0.01`、每点 3 次进行策略初筛。
 3. 对 `fixed-window` 和 `quiet-debounce` 筛选窗口，每个窗口重启一次 P。
-4. 对 Adaptive 做少量 EWMA 和 price 参数敏感性实验。
-5. 选出 `disabled`、最佳 fixed/debounce、最佳 Adaptive 和 `full-merge`，运行
+4. 对 adaptive 做少量 token / slot 压力阈值敏感性实验。
+5. 选出 `disabled`、最佳 fixed/debounce、adaptive 和 `full-merge`，运行
    `QPS_LIST="0.5 1 2 4"` 的正式负载实验。
-6. 固定胜出参数，只改变 `APPEND_GATE` 做消融。
-7. 汇总结果，检查成功率后绘制四联图。
+6. 汇总结果，检查成功率后绘制四联图。
 
 每一步都遵循：
 

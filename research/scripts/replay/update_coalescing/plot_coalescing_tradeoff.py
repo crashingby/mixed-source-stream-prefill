@@ -48,7 +48,6 @@ class ConfigurationPoint:
     update_interval_s: float | None
     coalescing_config_json: str
     update_policy: str
-    append_gate: str
     soft_window_ms: float | None
     hard_deadline_ms: float | None
     num_requests: int
@@ -63,6 +62,9 @@ class ConfigurationPoint:
     mean_saved_tokens: float | None
     mean_invalidated_tokens: float | None
     token_saving_ratio: float | None
+    # 压力参数只影响 adaptive；旧结果缺少字段时仍可按原配置绘图。
+    adaptive_token_pressure_threshold: float | None = None
+    adaptive_slot_pressure_threshold: float | None = None
 
     @property
     def series_key(self) -> tuple[str, float | None, str, str]:
@@ -279,7 +281,6 @@ def _point_from_row(
             row.get("coalescing_config_json", "null") or "null"
         ),
         update_policy=update_policy,
-        append_gate=row.get("append_gate", "unknown") or "unknown",
         soft_window_ms=_optional_float(
             row.get("soft_window_ms"),
             context=f"{context_prefix}:soft_window_ms",
@@ -287,6 +288,14 @@ def _point_from_row(
         hard_deadline_ms=_optional_float(
             row.get("hard_deadline_ms"),
             context=f"{context_prefix}:hard_deadline_ms",
+        ),
+        adaptive_token_pressure_threshold=_optional_float(
+            row.get("adaptive_token_pressure_threshold"),
+            context=f"{context_prefix}:adaptive_token_pressure_threshold",
+        ),
+        adaptive_slot_pressure_threshold=_optional_float(
+            row.get("adaptive_slot_pressure_threshold"),
+            context=f"{context_prefix}:adaptive_slot_pressure_threshold",
         ),
         num_requests=_required_int(
             row.get("num_requests"),
@@ -336,7 +345,6 @@ def load_configuration_points(summary_path: Path) -> list[ConfigurationPoint]:
         "update_chunk_interval_s",
         "coalescing_config_json",
         "update_policy",
-        "append_gate",
         "num_requests",
         "num_runs",
         "success_rate",
@@ -416,11 +424,19 @@ def _format_interval(interval_s: float | None) -> str:
 def _format_config_suffix(point: ConfigurationPoint) -> str:
     """在 profile 标签不唯一时生成简短的策略参数后缀。"""
     fields = [point.update_policy]
+    if point.update_policy == "adaptive":
+        # 新策略不使用 window/deadline，避免把配置默认值画成实际计时规则。
+        token_threshold = point.adaptive_token_pressure_threshold
+        slot_threshold = point.adaptive_slot_pressure_threshold
+        if token_threshold is not None:
+            fields.append(f"tokens={token_threshold:g}")
+        if slot_threshold is not None:
+            fields.append(f"slots={slot_threshold:g}")
+        return ", ".join(fields)
     if point.soft_window_ms is not None:
         fields.append(f"w={point.soft_window_ms:g}ms")
     if point.hard_deadline_ms is not None:
         fields.append(f"h={point.hard_deadline_ms:g}ms")
-    fields.append(f"gate={point.append_gate}")
     return ", ".join(fields)
 
 

@@ -40,9 +40,9 @@ DEFAULT_OUTPUT = Path(
 DEFAULT_PROFILE_ORDER = (
     "disabled",
     "immediate-controller",
-    "strict-immediate",
     "fixed-window",
     "quiet-debounce",
+    "adaptive",
     "full-merge",
 )
 

@@ -186,6 +186,8 @@ def test_p_only_finish_manifest_without_connector(aborted: bool) -> None:
     # 模拟无 connector 的资源释放边界，不能隐式创建 GPU 或模型。
     scheduler = Scheduler.__new__(Scheduler)
     scheduler._prompt_stream_update_coalescer = None
+    scheduler._prompt_stream_dormant_reasons = {}
+    scheduler._prompt_stream_inflight_steps = {}
     scheduler._prompt_stream_retained_waiting_req_ids = set()
     scheduler._prompt_stream_worker_removal_req_ids = set()
     scheduler._inflight_prefills = set()

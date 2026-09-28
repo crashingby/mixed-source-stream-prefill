@@ -19,7 +19,8 @@
 - **历史实验包含两项有意近似。** 第一项是 `PREFIX_APPEND` 尾部 block 对齐 padding 会真正参与 attention；第二项是早先计算完成的 Update 不会因后来 Append 增长而回滚重算。新加入的可选 Masked Padding 路径针对第一项，历史结果不能视为新路径实验。
 - **性能结果支持分段计算的主张，但存在高压拐点。** 在 Qwen2.5-3B + Triton、每组 512 请求的实验中，QPS 为 0.5、1、2 时 Segmented 的 TTFT 分位数总体最好；QPS=4 时事件拆分造成的调度排队使它落后于一次性 Normal 请求。
 - **输出质量没有观察到总体退化，但不等价。** 4980 条 SQuAD v2 对齐请求中，Normal 为 51.81 EM / 66.36 F1，Segmented 为 52.89 EM / 67.12 F1；不过有 121 条 Normal 正确样本在 Segmented 中变错，因此不能宣称逐请求严格等价。
-- **Update coalescing 已接入源码。** 它在 Update work 准入前维护唯一可覆盖窗口，支持 Append gate、五种 Update policy、deadline 唤醒、dormant 请求和抢占恢复指标。实验表明收益集中在 Update 高频、P 节点有排队压力的区域，不是无条件优化。
+- **流式请求统一停放。** 所有 PromptStream 在模板完成、active/pending work 耗尽且无 GPU 在途步骤时进入 dormant，保留 KV 并释放 running 名额；新 work 到达后经 waiting 重新准入，与 Update 合并开关无关。完整规则见 [Scheduler 笔记](Scheduler.md)。
+- **Update coalescing 已接入源码。** 它在 Update work 准入前维护唯一可覆盖窗口，支持六种 Update policy、时间与执行反馈唤醒、dormant 请求和抢占恢复指标；policy 满足即放行，不等待 Append source 结束。实验表明收益集中在 Update 高频、P 节点有排队压力的区域，不是无条件优化。
 - **Masked Padding 已实现，等待完整模型/P-D 验证。** `--prompt-stream-masked-padding` 启用 Triton range mask 与 RoPE 位置修正，保持物理 block 拓扑；已通过无服务状态机、proxy 和单 kernel 测试，尚未重新运行完整性能及质量实验。
 
 ## 问题模型与核心思想
@@ -107,7 +108,7 @@ TTFT-only 请求从一开始就不携带 KV transfer 参数，因此 NIXL connec
 | --- | --- | --- |
 | `APPEND` | 本次新增的 delta token | 更新 Append 日志，并创建 `PREFIX_APPEND` work。 |
 | `UPDATE` | 当前版本的完整 Update 快照 | 计算 source-local LCP；立即 admission 或进入合并窗口。 |
-| `SOURCE_FINISHED` | 无内容 | 封闭指定来源，并可能打开 gate 或触发 flush。 |
+| `SOURCE_FINISHED` | 无内容 | 封闭指定来源；Update source 结束会触发最终窗口 flush。 |
 | `PROMPT_FINISHED` | 非空最终问题 | 标记“用户问题已到达”，处理最终 Update，并尝试创建显式 Question work。 |
 
 每个事件还携带 `request_id`、`source_id`、`source_type`、`chunk_id`、`version`、`sequence_no` 和 `arrival_time`。其中 `chunk_id` 是来源内幂等键；`sequence_no` 用于检测缺口和乱序；`arrival_time` 用于排队与合并统计。
@@ -145,7 +146,7 @@ TTFT-only 请求从一开始就不携带 KV transfer 参数，因此 NIXL connec
 
 - 非空 Append 事件产生一个 `PREFIX_APPEND` work。
 - 未启用合并器时，每个有效 Update 事件立即产生一个 `UPDATE` work。
-- 启用合并器时，Update 先进入唯一合并窗口，满足 policy 与 gate 后才产生 `UPDATE` work。
+- 启用合并器时，Update 先进入唯一合并窗口，满足 policy 后即产生 `UPDATE` work；物理执行仍等待冻结的 Append epoch。
 - 最终问题满足 barrier 后产生唯一 `QUESTION` work。
 
 所有已经 admission 的 work 按进入请求的顺序保存在同一个 `deque`：
@@ -187,7 +188,7 @@ pending_work_items: [work_1, work_2, ..., QUESTION]
 未启用合并器时，Question 被追加到已有 FIFO 尾部，因此自然等待先前所有 Append/Update work。启用合并器时还必须满足：
 
 - Append 与 Update 来源已经封闭；`PROMPT_FINISHED` 可以在确认无序号缺口后原子地封闭尚未显式结束的可选来源。
-- 唯一 Update 合并窗口已被 flush，不存在 `latest_pending_token_ids` 或被 gate 阻挡的 `flush_ready`。
+- 唯一 Update 合并窗口已被 flush，不存在 `latest_pending_token_ids`。
 - 最新逻辑 Update 已经 admission。
 - `question_work_enqueued` 仍为 false，以保证只创建一次。
 
@@ -337,7 +338,7 @@ $$
 
 系统不会仅因新 Append 到达就使已经完成的 Update KV 失效。这保留了 Append/Update overlap 与少算 token 的收益，但意味着 Update 可能没有关注到后来 Append 的内容。
 
-这两项近似互相独立。后续 Masked Padding 只能消除第一项；第二项需要严格 Append gate，或在 Append 增长后重算相关 Update。
+这两项近似互相独立。后续 Masked Padding 只能消除第一项；第二项需要在最终 Append 上下文确定后重算相关 Update；当前仍保留这项时序近似。
 
 ## P/D KV 交接与首 token 边界
 
@@ -406,7 +407,6 @@ Segmented KV 解决了“Update 变化不应让 Append KV 一起失效”，但�
 Update source 最新逻辑快照
   -> UpdateCoalescingState 中唯一可覆盖窗口
   -> policy 判定 ready
-  -> Append gate 判定 admission_allowed
   -> 冻结不可变 UPDATE work
   -> pending_work_items
 ~~~
@@ -424,70 +424,54 @@ Update source 最新逻辑快照
 
 正常时间线是 $U_o -> U_p -> U_e -> U_c$。$U_e$ 可以领先于 $U_c$，因为 admission 不等于立即获得 GPU。flush 时，新目标必须相对 $U_e$ 计算逻辑执行 LCP，而不是一律相对较旧的 $U_c$；真正开始执行时再校验物理 committed KV 与冻结执行基准一致。
 
-### 两条正交策略轴
+### Update 合并策略
 
-Update policy 只回答“窗口是否已经应该 flush”；Append gate 只回答“已经 ready 的窗口现在能否创建 work”。
+Update policy 决定“窗口是否已经应该 flush”，达到条件便创建冻结 work，不再将 Append source
+是否结束作为额外的准入约束。
 
-Append gate 包含：
-
-| gate | 行为 |
+| policy | flush 条件 |
 | --- | --- |
-| `none` | 不等待 Append，Update 按 admission 时可见的 Append epoch 执行。 |
-| `hold_until_append_finished` | Append source 结束前不 admission Update；用于最终 Update 看到完整 Append 的严格路径。 |
-| `hold_until_append_or_update_finished` | Append 或 Update 任一 source 结束即可打开 gate；是允许早放行的近似路径。 |
-
-Update policy 包含：
-
-| policy | ready 条件 |
-| --- | --- |
-| `immediate` | 每条有效 Update 都立即要求 flush。 |
+| `immediate` | 每条有效 Update 都立即 flush。 |
 | `fixed_window` | soft deadline 固定锚定窗口第一条 Update，不随新事件刷新。 |
-| `quiet_debounce` | 每条新 Update 都把 soft deadline 刷新为“最近事件时间 + 窗口”。 |
-| `adaptive` | 使用到达间隔与合并收益的 EWMA 在线计算候选等待时间。 |
-| `full_merge` | 仅在 Update source 结束或 `PROMPT_FINISHED` 时 ready。 |
+| `quiet_debounce` | 每条有效新 Update 将 soft deadline 刷新为“最近事件时间 + 窗口”。 |
+| `adaptive` | 无固定 deadline；本请求没有未完成 Update 且全局 token / slot 压力低于阈值时放行。 |
+| `full_merge` | 仅在 Update source 结束或 `PROMPT_FINISHED` 时 flush。 |
 
-`disabled` 不是 policy 值，而是启动配置为 `None`：每个 Update 直接走旧的即时 admission 路径。`immediate-controller` 表示合并器开启、`append_gate=none`、`update_policy=immediate`；它与 disabled 的逻辑准入近似相同，但经过 controller、统计和 dormant 控制路径。
+`disabled` 表示启动配置为 `None`：每个 Update 直接走原来的即时 admission 路径。
+`immediate-controller` 表示合并器开启且 `update_policy=immediate`，不等待合并窗口，但仍经过
+controller 和统计路径。两者现在共享 dormant 停放 / waiting 唤醒机制；当前 controller 的
+epoch 检查同样保留，因此两条路径的实际计算成本仍应分别观察。
 
 ### Flush 与 admission
 
-~~~text
-should_flush_by_policy = 当前 policy 已满足 ready 条件
+- policy 尚未满足：保留 $U_p$，继续吸收新快照。
+- policy 已满足：以 $U_e$ 为执行基准，将最新 $U_p$ 冻结成 work，推进 $U_e$ 并清空窗口。
+- Append source 结束：记录来源封闭状态和最终 epoch；不为 Update 增加额外等待，也不重置窗口。
+- Update source 结束或 `PROMPT_FINISHED`：flush 尚未放行的最新 Update。`full_merge` 不要求
+  两个源同时结束，Update 先结束时也会放行。
 
-admission_allowed =
-    append_gate == none
-    or append_source_finished
-    or (
-        append_gate == hold_until_append_or_update_finished
-        and update_source_finished
-    )
-~~~
+对 fixed_window 和 quiet_debounce，soft deadline 控制合并等待，hard deadline 限制
+最长等待，可选 TTFT
+deadline 从请求 start 起限制放行时间。**这些 deadline 不保证 work 立即执行**：冻结的 Append
+epoch 必须已经物理提交，FIFO、token budget 和 KV 资源仍可能产生排队。
 
-- policy 尚未 ready：保留 $U_p$，继续吸收新快照。
-- policy ready 且 gate 打开：以 $U_e$ 为执行基准，把最新 $U_p$ 冻结成 work。
-- policy ready 但 gate 关闭：保留窗口并设置黏性的 `flush_ready=True`；新 Update 仍可覆盖 $U_p$，但不能撤销 ready，也不能重置已经承担的等待时间。
-- Append 后来结束时，controller 立即复查原窗口；它不会创建一个从零开始计时的新窗口。
+来源状态位于 `PromptStreamState.coalescing_sources`，类型为 `PromptStreamSourceState`；
+source id、封闭状态和 epoch 继续服务协议与执行依赖。固定模板先算、Question 最后执行的
+barrier 都保留。启用 controller 后，跨 epoch 的下一代 Update 仍按零 LCP 重算；已完成 Update
+不会只因 Append 后续增长而自动重放。
 
-soft deadline 控制正常合并等待，hard deadline 限制 policy 自己可延后的上界，可选 TTFT deadline 从请求 start 起限制总预算。严格 Append gate 造成的额外等待可能超过 Update hard deadline，因为 gate 表达上下文依赖，而不是普通合并等待；这部分必须与 window wait 分开统计。
+### Adaptive 的执行背压决策
 
-### Adaptive 的 EWMA 决策
+`adaptive` 通过独立策略类判断：本请求 pending / active 中没有 Update work，且没有
+UPDATE 阶段 GPU 在途批次，同时整体 token 需求和运行名额需求低于各自阈值时才放行。
+默认两个阈值均为 1.0；不使用固定等待时间，不把 KV 容量或抢占次数作为策略信号。
 
-EWMA（指数加权移动平均）分别估计 Update 到达间隔与覆盖中间快照可节省的 token 数。设到达率为 $\lambda$、合并收益为 $G$，带负载价格的边际等待价值为：
+压力仅估计当前或队首已放行 work，包含普通请求和未回包批次，排除纯 dormant 与未放行
+快照。每次放行后重新计压；Update source finished / PROMPT_FINISHED 越过压力限制，
+最终快照与 Question 仍按 FIFO 执行。该实现尚未获得新服务实验结论。
 
-$$
-V=(1+s\cdot load)\,G\lambda.
-$$
-
-若 $V$ 不超过等待时延价格 $D$，立即 flush；否则候选等待为：
-
-$$
-w=\operatorname{clip}\left(
-\frac{\log(V/D)}{\lambda},
-0,
-w_{\max}
-\right).
-$$
-
-最终 deadline 仍受 soft/hard/TTFT 边界约束。当前 Adaptive 代码已经接入，但尚未完成系统调参和正式结果，因此不能把它作为已经证实优于固定策略的结论。
+策略类由 `create_update_coalescing_policy()` 根据启动配置创建。Request 维护窗口和 work，
+Scheduler 提供只读反馈，EngineCore 在空闲前重评无 deadline 的候选。
 
 ### Deadline、dormant 与并发
 
@@ -496,11 +480,18 @@ $$
 - FastAPI/router 只投递 EngineCore 输入。
 - Request、deadline heap、work 和 KV 状态都由 EngineCore/Scheduler 主线程串行修改。
 - controller 使用 `(deadline, request_id, generation)` 最小堆；generation 让旧 deadline 惰性失效。
-- 没有可运行 work、只等待新事件或 deadline 的长期请求会进入 dormant 集合，不占据普通 running/waiting 调度循环。
+- 所有 PromptStream 在模板完成、没有 active/pending work、不能 decode 且无 GPU 在途步骤时，进入 Scheduler 的 dormant 集合；该机制不依赖 controller 开关。
 - EngineCore 空闲时把原本无限阻塞的 `input_queue.get()` 改成最多等待到最近 deadline；超时后同一主线程调用 `flush_due_update_coalescing()`。
 - source 事件、deadline 和 work 完成回调都在同一控制线程排序，不会与 GPU 计算中途并发改写同一 work。
 
-功能关闭时不会创建 controller、deadline heap 或 dormant 状态，普通 Scheduler 和 Prompt Stream 的即时 Update 路径保持原语义。
+功能关闭时不创建 controller、deadline heap 或请求级合并窗口，Update 仍即时 admission；
+dormant 是所有 PromptStream 共有的调度机制。停放保留分段 KV，产生 work 后先进入 waiting，
+再按运行名额、token budget 和 KV 资源准入 running。Scheduler 单独跟踪在途步骤，保证 worker
+结果返回前不会提前停放。显存压力下的 dormant / retained-waiting 驱逐继续走恢复流程。
+
+EngineCore 的 runnable 判定与 shutdown 清理同样覆盖关闭合并的 PromptStream；只有合并
+策略的 deadline 查询、反馈候选检查和 flush 由配置控制。详细对象归属、状态转换和验证边界见
+[流式请求调度规则](Scheduler.md)。
 
 ### 抢占下的统计口径
 
@@ -521,18 +512,10 @@ Update 合并是启动级选项，通过一个 JSON 配置传入 P 节点：
 
 ~~~shell
 --prompt-stream-update-coalescing-config '{
-  "append_gate": "hold_until_append_finished",
   "update_policy": "fixed_window",
   "soft_window_ms": 20,
   "hard_deadline_ms": 80,
-  "ttft_deadline_ms": null,
-  "interval_ewma_alpha": 0.25,
-  "gain_ewma_alpha": 0.25,
-  "cold_start_prior_weight": 8,
-  "arrival_rate_prior_per_s": null,
-  "merge_gain_prior_tokens": null,
-  "delay_price": 1,
-  "load_price_scale": 0
+  "ttft_deadline_ms": null
 }'
 ~~~
 
@@ -569,12 +552,15 @@ Update 合并是启动级选项，通过一个 JSON 配置传入 P 节点：
 
 ### Update coalescing 实验
 
-现有正式矩阵比较了 `disabled`、`immediate-controller`、`strict-immediate`、`fixed-window`、`quiet-debounce` 和 `full-merge`；Adaptive 尚未进入最终策略对比。
+以下是移除 Append 来源完成约束之前的历史矩阵结果，其中部分实验额外等待 Append 封闭。
+这些数值保留作历史探索记录，不能作为当前五种 policy 的新结果。当前实验入口保留
+`disabled`、`immediate-controller`、`fixed-window`、`quiet-debounce`、`adaptive` 和
+`full-merge`；新背压自适应尚未进入已报告的最终策略对比。
 
 已观察到的主规律是：
 
 - 所有合并策略都能够实质减少 Update admission 与 prefill token；例如短 Update interval 下，fixed-window 的策略 token saving ratio 约为 37%，full-merge 约为 46%。
-- **减少 token 不保证降低 TTFT。** 在 Update interval 为 0.2 s 或 0.5 s、QPS 不高时，窗口等待和 gate 等待通常大于少算 token 的收益，disabled 往往更快。
+- **减少 token 不保证降低 TTFT。** 在 Update interval 为 0.2 s 或 0.5 s、QPS 不高时，旧实验的窗口等待和来源完成等待通常大于少算 token 的收益，disabled 往往更快。
 - 最清晰的收益区域是 Update interval=0.01 s、QPS=1/2。以 p95 为例：QPS=1 时 disabled 为 276.9 ms、full-merge 为 259.7 ms；QPS=2 时 disabled 为 410.6 ms、fixed-window 为 367.5 ms、full-merge 为 313.4 ms。
 - 更高压力下虽然某些配置仍显示数值收益，但 preemption、dormant eviction 和 recovery token 占比明显上升，不能只用一条 TTFT 线归因于 coalescing policy。
 
@@ -716,7 +702,7 @@ manifest 经 proxy 传给 D；P-only 也返回语义描述但不申请传输租�
 - 当前第一版 Update coalescing 限制一个 Append 源和一个 Update 源。
 - REST 客户端必须保证所有要纳入回答的知识事件已经收到 P 的 ACK 后，再提交 `PROMPT_FINISHED`；请求内 FIFO 能保证已接受 work 不被 Question 越过，但不能补回尚未发送到 P 的事件。
 - 默认配置及历史实验的 padding 仍参与 attention；可选 Masked Padding 已接入，完整服务验证尚未完成。
-- `append_gate=none` 和早放行 gate 保留 Update 看不到后到 Append 的近似；只有严格 gate 或重算能够消除这项时序近似。
+- Update 按已冻结 Append 上下文执行，可能看不到后到 Append；如需消除这项时序近似，需在最终上下文确定后重算。
 - 高 QPS 下事件拆分会放大全局调度压力；`MAX_NUM_SEQS` 只能改变同时驻留上限，不能从根本消除一个逻辑请求包含多个 prefill work 的服务需求。
 - TP=2 + NIXL producer 曾出现启动阶段 KV memory registration / shared-memory broadcast 阻塞，当前仍在 `TODO.md` 中跟踪；TTFT-only 可禁用 KV transfer 规避，但完整 P/D TP 路径仍需继续定位。
 
@@ -739,7 +725,7 @@ manifest 经 proxy 传给 D；P-only 也返回语义描述但不申请传输租�
 
 - [RESTFUL.md](RESTFUL.md)：REST 协议、P/D proxy 和 tokenization 边界。
 - [KV_BLOCK_MANAGEMENT.md](KV_BLOCK_MANAGEMENT.md)：两 segment block 所有权、分配和拼接的详细源码说明。
-- [Volatility-Aware_Bounded_Update_Coalescing.md](Volatility-Aware_Bounded_Update_Coalescing.md)：Update 合并的公式、策略、gate、deadline 与实验设计。
+- [Volatility-Aware_Bounded_Update_Coalescing.md](Volatility-Aware_Bounded_Update_Coalescing.md)：Update 合并的五种策略、执行背压和 deadline、执行依赖与实验设计。
 - [Approximate-Calculation-Evaluation.md](Approximate-Calculation-Evaluation.md)：两项近似与 SQuAD EM/F1 质量实验。
 - [Masked-Padding.md](Masked-Padding.md)：中间 padding 的 mask、位置修正与 Triton 改造方案。
 - [TODO.md](TODO.md)：尚未解决的工程问题和后续排查记录。
@@ -748,6 +734,7 @@ manifest 经 proxy 传给 D；P-only 也返回语义描述但不申请传输租�
 
 当前项目已经完成第一项创新的核心工程闭环：把混合来源 Prompt Stream 从 `EngineCoreRequest` 隔离到长期 `Request` 后，以显式事件、FIFO work 和双 segment KV 管理贯通 Scheduler、worker、NIXL 与 REST proxy；性能实验验证了中低负载下提前分段 prefill 的 TTFT 收益，质量实验也给出了近似影响的可量化边界。
 
-第二项 Update coalescing 已经从设计进入可运行实现，并证明“减少 Update token”与“降低 TTFT”之间存在可研究的条件性权衡。其下一步重点不是继续堆固定参数，而是用 Adaptive policy 识别高频、高负载收益区，同时把抢占/recovery 成本纳入决策。
+第二项 Update coalescing 已经从设计进入可运行实现，并证明“减少 Update token”与“降低 TTFT”之间存在可研究的条件性权衡。其下一步重点不是继续堆固定参数，而是验证基于执行背压和调度需求的 Adaptive policy。当前不把抢占/recovery 成本纳入
+放行决策，实验单独记录恢复指标以识别干扰。
 
-当前的正确性改进 Masked Padding 已进入源码：保留双 segment block 拓扑，在 Triton 路径增加中间 key range mask 与模型位置修正，下一步是完整模型和 P/D 的验证。Append-after-Update 的时序近似仍独立存在，应通过严格 gate 与现有近似路径继续做性能和质量对照。
+当前的正确性改进 Masked Padding 已进入源码：保留双 segment block 拓扑，在 Triton 路径增加中间 key range mask 与模型位置修正，下一步是完整模型和 P/D 的验证。Append-after-Update 的时序近似仍独立存在，应继续与普通完整 Prefill 做性能和质量对照。

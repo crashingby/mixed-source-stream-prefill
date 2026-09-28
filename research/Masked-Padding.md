@@ -501,8 +501,9 @@ Masked padding 只能消除
 - mask 无法把缺失的 Append 信息补进已经生成的 Update KV，也不能无损修改已旋转的
   Update key 位置。
 
-只有严格的 Append gate 保证 Update 在最终 Append 后计算，或在 Append 增长后重新计算
-相应 Update，最终结果才可能与普通完整 prefill 严格对齐。因此后续实验仍需分别消融：
+只有在最终 Append 上下文确定后重新计算相应 Update，最终结果才可能与普通完整
+prefill 严格对齐。当前方案保留执行时可见前缀的近似，不等待 Append source 结束。
+因此后续实验仍需分别评估：
 
 - padding 近似；
 - Append-after-Update 时序近似。

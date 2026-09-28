@@ -208,9 +208,22 @@ def _assert_token_views_consistent(request: Request) -> None:
     )
 
 
-def test_rapid_events_preserve_prefill_phase_order() -> None:
+@pytest.mark.parametrize("coalescing_enabled", [False, True])
+def test_rapid_events_preserve_prefill_phase_order(
+    coalescing_enabled: bool,
+) -> None:
     """Finish 快速到达时仍必须按 PA、Update、Question 顺序提交。"""
     request = _make_request([1, 2, 3])
+    if coalescing_enabled:
+        # 长窗口保持 Update 未放行，验证 finish 强制放行后 Question 排在尾部。
+        request.enable_prompt_stream_update_coalescing(
+            PromptStreamUpdateCoalescingConfig(
+                update_policy="fixed_window",
+                soft_window_ms=10000.0,
+                hard_deadline_ms=20000.0,
+            ),
+            now=0.0,
+        )
     _start_request(request)
     _finish_active_view(request)
 
@@ -280,9 +293,17 @@ def test_rapid_events_preserve_prefill_phase_order() -> None:
     _assert_token_views_consistent(request)
 
 
-def test_update_can_run_before_later_append_and_freezes_prefix_snapshot() -> None:
-    """Update 先获调度时，不得读取尚未提交的 Append KV。"""
+@pytest.mark.parametrize("coalescing_enabled", [False, True])
+def test_update_can_run_before_later_append_and_freezes_prefix_snapshot(
+    coalescing_enabled: bool,
+) -> None:
+    """Update 冻结当时前缀，随后 Question 可读取保留的近似 Update KV。"""
     request = _make_request([1, 2, 3])
+    if coalescing_enabled:
+        request.enable_prompt_stream_update_coalescing(
+            PromptStreamUpdateCoalescingConfig(update_policy="immediate"),
+            now=0.0,
+        )
     _start_request(request)
     _finish_active_view(request)
 
@@ -295,6 +316,8 @@ def test_update_can_run_before_later_append_and_freezes_prefix_snapshot() -> Non
             source_type=PromptSourceType.UPDATE,
         )
     )
+    if coalescing_enabled:
+        assert request.flush_prompt_stream_update(now=1.0, reason="test_immediate")
     request.apply_prompt_stream_event(
         _make_event(
             PromptStreamEventType.APPEND,
@@ -321,6 +344,26 @@ def test_update_can_run_before_later_append_and_freezes_prefix_snapshot() -> Non
 
     assert request.prompt_stream is not None
     assert request.prompt_stream.prefix_append_committed_logical_len == 4
+
+    # 后来的 Append 不重算旧 Update；Question 必须允许这种近似上下文。
+    request.apply_prompt_stream_event(
+        _make_event(
+            PromptStreamEventType.PROMPT_FINISHED,
+            [20],
+            source_id="question",
+            source_type=None,
+        )
+    )
+    assert request.prompt_stream.question_work_enqueued
+    assert not request.enqueue_question_if_ready()
+    request.prepare_prompt_stream_execution(4)
+    view = request.prompt_stream_execution_view
+    assert view is not None
+    assert view.phase == PromptStreamExecutionPhase.QUESTION
+    assert list(view.token_ids) == [1, 2, 3, 4, 10, 11, 20]
+    assert view.num_computed_tokens == 6
+    _finish_active_view(request)
+    assert request.can_decode_from_prompt_stream()
 
 
 def test_empty_final_question_is_rejected() -> None:
@@ -611,11 +654,121 @@ def test_prompt_stream_stats_without_coalescing_tracks_each_update() -> None:
     )
 
 
+def test_coalescing_config_rejects_removed_append_gate() -> None:
+    """已删除的配置字段必须报错，避免旧配置被静默忽略。"""
+    with pytest.raises(ValueError, match="append_gate"):
+        PromptStreamUpdateCoalescingConfig(**{"append_gate": "none"})
+
+
+@pytest.mark.parametrize(
+    "policy",
+    ["immediate", "fixed_window", "quiet_debounce", "adaptive"],
+)
+def test_coalescing_policy_flushes_before_append_source_finishes(policy: str) -> None:
+    """各策略正常满足放行条件时均无需等待 Append 结束。"""
+    request = _make_request([1, 2, 3, 4])
+    request.enable_prompt_stream_update_coalescing(
+        PromptStreamUpdateCoalescingConfig(
+            update_policy=policy,
+            soft_window_ms=20.0,
+            hard_deadline_ms=80.0,
+        ),
+        now=0.0,
+    )
+    _start_request(request)
+    _finish_active_view(request)
+    request.apply_prompt_stream_event(
+        _make_event(
+            PromptStreamEventType.APPEND,
+            [5],
+            source_id="append",
+            source_type=PromptSourceType.APPEND,
+        )
+    )
+    request.prepare_prompt_stream_execution(4)
+    _finish_active_view(request)
+
+    with patch("vllm.v1.request.time.monotonic", return_value=10.0):
+        request.apply_prompt_stream_event(
+            _make_event(
+                PromptStreamEventType.UPDATE,
+                [10, 11],
+                source_id="update",
+                source_type=PromptSourceType.UPDATE,
+            )
+        )
+
+    assert request.prompt_stream is not None
+    assert not request.prompt_stream.sources["append"].finished
+    assert request.flush_prompt_stream_update(now=10.1, reason="test_policy_due")
+    # 同一窗口只能创建一次 work；重复 deadline 检查不得重复 admission。
+    assert not request.flush_prompt_stream_update(now=10.1, reason="test_duplicate")
+    request.prepare_prompt_stream_execution(4)
+    view = request.prompt_stream_execution_view
+    assert view is not None
+    assert view.phase == PromptStreamExecutionPhase.UPDATE
+    assert view.num_computed_tokens == 8
+    assert list(view.token_ids) == [1, 2, 3, 4, 5, 4, 4, 4, 10, 11]
+    _finish_active_view(request)
+    assert request.prompt_stream.update_committed_token_ids == [10, 11]
+    assert not request.prompt_stream.sources["append"].finished
+
+
+def test_full_merge_flushes_when_only_update_source_finishes() -> None:
+    """Full merge 由 Update source 结束触发，Append 仍可继续增长。"""
+    request = _make_request([1, 2, 3, 4])
+    request.enable_prompt_stream_update_coalescing(
+        PromptStreamUpdateCoalescingConfig(update_policy="full_merge"),
+        now=0.0,
+    )
+    _start_request(request)
+    _finish_active_view(request)
+    request.apply_prompt_stream_event(
+        _make_event(
+            PromptStreamEventType.APPEND,
+            [],
+            source_id="append",
+            source_type=PromptSourceType.APPEND,
+        )
+    )
+    request.apply_prompt_stream_event(
+        _make_event(
+            PromptStreamEventType.UPDATE,
+            [10, 11],
+            source_id="update",
+            source_type=PromptSourceType.UPDATE,
+        )
+    )
+    assert not request.flush_prompt_stream_update(now=100.0, reason="test_wait_final")
+
+    request.apply_prompt_stream_event(
+        _make_event(
+            PromptStreamEventType.SOURCE_FINISHED,
+            None,
+            source_id="update",
+            source_type=PromptSourceType.UPDATE,
+            sequence_no=1,
+        )
+    )
+    assert request.prompt_stream is not None
+    assert not request.prompt_stream.sources["append"].finished
+    state = request.prompt_stream_update_coalescing_state
+    assert state is not None
+    assert state.latest_pending_token_ids is None
+    assert state.last_admitted_token_ids == (10, 11)
+    assert not request.prompt_stream.question_work_enqueued
+    request.prepare_prompt_stream_execution(4)
+    view = request.prompt_stream_execution_view
+    assert view is not None
+    assert view.phase == PromptStreamExecutionPhase.UPDATE
+    _finish_active_view(request)
+    assert request.prompt_stream.update_committed_token_ids == [10, 11]
+
+
 def test_prompt_stream_stats_track_coalesced_update_window() -> None:
     """两个 Update 快照合并为一个 work 时应记录真实节省与执行成本。"""
     request = _make_request([1, 2, 3, 4])
     coalescing_config = PromptStreamUpdateCoalescingConfig(
-        append_gate="none",
         update_policy="fixed_window",
         soft_window_ms=100.0,
         hard_deadline_ms=200.0,
@@ -682,7 +835,6 @@ def test_append_only_prompt_stream_stats_have_no_update_counterfactual() -> None
     """Append-only 请求不应输出不适用的 Update 合并收益数值。"""
     request = _make_request([1, 2, 3, 4])
     coalescing_config = PromptStreamUpdateCoalescingConfig(
-        append_gate="none",
         update_policy="immediate",
     )
     request.enable_prompt_stream_update_coalescing(
@@ -999,10 +1151,9 @@ def test_completed_update_kv_loss_creates_recovery_only_attempt() -> None:
 
 
 def test_recovery_preserves_empty_coalescing_window_state() -> None:
-    """合法空快照与 bounded-window 的 deadline/EWMA 必须原样保留。"""
+    """合法空快照与 bounded-window 的 deadline/token 统计 必须原样保留。"""
     request = _make_request([1, 2, 3, 4])
     config = PromptStreamUpdateCoalescingConfig(
-        append_gate="hold_until_append_finished",
         update_policy="fixed_window",
         soft_window_ms=100.0,
         hard_deadline_ms=200.0,
@@ -1035,38 +1186,24 @@ def test_recovery_preserves_empty_coalescing_window_state() -> None:
     assert state.latest_pending_token_ids == ()
     state.first_pending_time = 11.0
     state.last_update_time = 12.0
-    state.last_observed_update_time = 12.0
     state.last_observed_update_append_epoch = 7
-    state.interval_observation_count = 3
-    state.gain_observation_count = 4
     state.soft_deadline = 13.0
     state.hard_deadline = 14.0
     state.ttft_deadline = 15.0
-    state.flush_ready = True
-    state.flush_ready_reason = "test_gate_blocked"
     state.generation = 8
     state.pending_event_count = 2
     state.hypothetical_eager_tokens = 9
-    state.interval_ewma = 0.125
-    state.merge_gain_ewma = 6.5
     preserved_fields = (
         "latest_pending_token_ids",
         "first_pending_time",
         "last_update_time",
-        "last_observed_update_time",
         "last_observed_update_append_epoch",
-        "interval_observation_count",
-        "gain_observation_count",
         "soft_deadline",
         "hard_deadline",
         "ttft_deadline",
-        "flush_ready",
-        "flush_ready_reason",
         "generation",
         "pending_event_count",
         "hypothetical_eager_tokens",
-        "interval_ewma",
-        "merge_gain_ewma",
     )
     before = {
         field_name: getattr(state, field_name)
@@ -1434,60 +1571,10 @@ def test_prompt_stream_exact_transfer_uses_manifest_token_boundary() -> None:
     assert is_async
 
 
-def test_adaptive_recovery_preserves_absolute_soft_deadline() -> None:
-    """Recovery 不得按抢占时负载重算 Adaptive deadline。"""
-    request = _make_request([1, 2, 3, 4])
-    config = PromptStreamUpdateCoalescingConfig(
-        append_gate="none",
-        update_policy="adaptive",
-        soft_window_ms=500.0,
-        hard_deadline_ms=1000.0,
-        cold_start_prior_weight=100.0,
-        arrival_rate_prior_per_s=1.0,
-        merge_gain_prior_tokens=1.2,
-        delay_price=1.0,
-        load_price_scale=1.0,
-    )
-    request.enable_prompt_stream_update_coalescing(config, now=0.0)
-    _start_request(request)
-    _finish_active_view(request)
-
-    with patch("vllm.v1.request.time.monotonic", return_value=10.0):
-        request.apply_prompt_stream_event(
-            _make_event(
-                PromptStreamEventType.UPDATE,
-                [10, 11],
-                source_id="update",
-                source_type=PromptSourceType.UPDATE,
-            )
-        )
-
-    state = request.prompt_stream_update_coalescing_state
-    assert state is not None
-    assert state.adaptive_deadline_needs_refresh
-    assert not request.is_prompt_stream_update_flush_due(
-        now=10.01,
-        prefill_queue_load=0.0,
-    )
-    deadline_before_recovery = state.soft_deadline
-    assert deadline_before_recovery is not None
-    assert not state.adaptive_deadline_needs_refresh
-
-    request.reset_prompt_stream_computed_state(
-        PromptStreamRecoveryReason.RUNNING_PREEMPTION
-    )
-    assert not request.is_prompt_stream_update_flush_due(
-        now=10.01,
-        prefill_queue_load=1.0,
-    )
-    assert state.soft_deadline == deadline_before_recovery
-
-
-def test_merge_gain_uses_policy_base_after_recovery() -> None:
+def test_token_savings_use_policy_base_after_recovery() -> None:
     """Recovery 回退物理 KV 时不得污染 Update 合并收益。"""
     request = _make_request([1, 2, 3, 4])
     config = PromptStreamUpdateCoalescingConfig(
-        append_gate="none",
         update_policy="fixed_window",
         soft_window_ms=1000.0,
         hard_deadline_ms=2000.0,
@@ -1527,8 +1614,6 @@ def test_merge_gain_uses_policy_base_after_recovery() -> None:
     assert state is not None
     assert state.last_admitted_token_ids == ()
     assert state.stats_last_admitted_token_ids == (10, 11, 12)
-    state.merge_gain_ewma = None
-    state.gain_observation_count = 0
 
     request.apply_prompt_stream_event(
         _make_event(
@@ -1540,4 +1625,10 @@ def test_merge_gain_uses_policy_base_after_recovery() -> None:
             sequence_no=2,
         )
     )
-    assert state.merge_gain_ewma == 2.0
+    # Recovery 回退执行基准，但 policy 成本仍相对之前准入的快照计算。
+    assert request.flush_prompt_stream_update(
+        now=2.0, reason="test_after_recovery", force=True
+    )
+    assert request.prompt_stream is not None
+    assert request.prompt_stream.total_eager_update_prefill_tokens == 9
+    assert request.prompt_stream.total_admitted_update_prefill_tokens == 4
