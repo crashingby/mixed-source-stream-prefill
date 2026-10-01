@@ -92,8 +92,8 @@ RUN_METADATA_FIELDS = (
     "soft_window_ms",
     "hard_deadline_ms",
     "ttft_deadline_ms",
-    "adaptive_token_pressure_threshold",
-    "adaptive_slot_pressure_threshold",
+    "load_aware_token_pressure_threshold",
+    "load_aware_slot_pressure_threshold",
 )
 
 SUMMARY_METRIC_FIELDS = (
@@ -141,8 +141,8 @@ CONFIGURATION_SUMMARY_FIELDS = (
     "soft_window_ms",
     "hard_deadline_ms",
     "ttft_deadline_ms",
-    "adaptive_token_pressure_threshold",
-    "adaptive_slot_pressure_threshold",
+    "load_aware_token_pressure_threshold",
+    "load_aware_slot_pressure_threshold",
     "arrival_process",
     "model",
     "max_concurrency",
@@ -205,8 +205,8 @@ class RunMetadata:
     hard_deadline_ms: float | None
     ttft_deadline_ms: float | None
     # 两个阈值显式写入汇总，区分计算预算与序列名额的敏感性实验。
-    adaptive_token_pressure_threshold: float | None = None
-    adaptive_slot_pressure_threshold: float | None = None
+    load_aware_token_pressure_threshold: float | None = None
+    load_aware_slot_pressure_threshold: float | None = None
 
     def as_dict(self) -> dict[str, Any]:
         """返回可直接写入 CSV/JSON 的元数据字典。"""
@@ -801,11 +801,11 @@ def _load_run(run_dir: Path, config: dict[str, Any]) -> LoadedRun:
         soft_window_ms=config_float("soft_window_ms"),
         hard_deadline_ms=config_float("hard_deadline_ms"),
         ttft_deadline_ms=config_float("ttft_deadline_ms"),
-        adaptive_token_pressure_threshold=config_float(
-            "adaptive_token_pressure_threshold"
+        load_aware_token_pressure_threshold=config_float(
+            "load_aware_token_pressure_threshold"
         ),
-        adaptive_slot_pressure_threshold=config_float(
-            "adaptive_slot_pressure_threshold"
+        load_aware_slot_pressure_threshold=config_float(
+            "load_aware_slot_pressure_threshold"
         ),
     )
     return LoadedRun(
@@ -1067,11 +1067,11 @@ def _configuration_summaries(
                 "soft_window_ms": metadata.soft_window_ms,
                 "hard_deadline_ms": metadata.hard_deadline_ms,
                 "ttft_deadline_ms": metadata.ttft_deadline_ms,
-                "adaptive_token_pressure_threshold": (
-                    metadata.adaptive_token_pressure_threshold
+                "load_aware_token_pressure_threshold": (
+                    metadata.load_aware_token_pressure_threshold
                 ),
-                "adaptive_slot_pressure_threshold": (
-                    metadata.adaptive_slot_pressure_threshold
+                "load_aware_slot_pressure_threshold": (
+                    metadata.load_aware_slot_pressure_threshold
                 ),
                 "arrival_process": metadata.arrival_process,
                 "model": metadata.model,

@@ -81,19 +81,19 @@ class PromptStreamUpdateCoalescingController:
         self.config = config
         self._deadline_heap: list[tuple[float, str, int]] = []
         self._registered_deadlines: dict[str, tuple[float, int]] = {}
-        # dict 保留首次窗口登记顺序；只有 adaptive 未放行窗口进入此集合。
-        self.adaptive_request_ids: dict[str, None] = {}
-        # 普通与流式请求的在途 token 都占用计算余量；仅 adaptive 开启时维护。
+        # dict 保留首次窗口登记顺序；只有 load_aware 未放行窗口进入此集合。
+        self.load_aware_request_ids: dict[str, None] = {}
+        # 普通与流式请求的在途 token 都占用计算余量；仅 load_aware 开启时维护。
         self.inflight_tokens: dict[str, int] = {}
 
     def remove_request(self, request_id: str) -> None:
         """移除请求的有效 deadline；堆中旧条目由 generation 校验丢弃。"""
         self._registered_deadlines.pop(request_id, None)
-        self.adaptive_request_ids.pop(request_id, None)
+        self.load_aware_request_ids.pop(request_id, None)
         # 在途 token 由对应回包释放，abort/recovery 不能提前声称 GPU 空闲。
 
     def refresh_deadline(self, request: Request) -> None:
-        """刷新时间/调度反馈索引，不把无 deadline 的 adaptive 窗口遗漏。"""
+        """刷新时间/调度反馈索引，不把无 deadline 的 load_aware 窗口遗漏。"""
         state = request.prompt_stream_update_coalescing_state
         if (
             state is not None
@@ -101,9 +101,9 @@ class PromptStreamUpdateCoalescingController:
             and state.latest_pending_token_ids is not None
             and not request.is_finished()
         ):
-            self.adaptive_request_ids.setdefault(request.request_id, None)
+            self.load_aware_request_ids.setdefault(request.request_id, None)
         else:
-            self.adaptive_request_ids.pop(request.request_id, None)
+            self.load_aware_request_ids.pop(request.request_id, None)
         deadline = request.get_prompt_stream_update_deadline()
         if state is None or deadline is None:
             self._registered_deadlines.pop(request.request_id, None)
@@ -543,13 +543,13 @@ class Scheduler(SchedulerInterface):
     ) -> UpdateCoalescingContext:
         """为策略构建只读反馈，分别估计 token 与运行名额的竞争。
 
-        adaptive 的需求仅来自已准入 work 和尚未回包的批次，不把合并窗口
+        load_aware 的需求仅来自已准入 work 和尚未回包的批次，不把合并窗口
         计入积压。以每请求下一 work 为粒度，避免把历史快照长度重复累加。
         此处不读取 KV 使用率，不根据抢占决定是否合并。
         """
         controller = self._prompt_stream_update_coalescer
         assert controller is not None
-        if controller.config.update_policy != "adaptive":
+        if controller.config.update_policy != "load_aware":
             return UpdateCoalescingContext(now=now)
         if self._pause_state != PauseState.UNPAUSED:
             # 暂停期间仅 terminal flush 可建立最终 work，普通候选继续覆盖。
@@ -850,9 +850,9 @@ class Scheduler(SchedulerInterface):
         return controller.get_next_deadline(self.requests)
 
     def flush_due_update_coalescing(self, now: float | None = None) -> int:
-        """释放到期窗口或已有计算机会的 adaptive 候选，返回放行数。
+        """释放到期窗口或已有计算机会的 load_aware 候选，返回放行数。
 
-        沿用 EngineCore 的同线程轮询入口；adaptive 没有 deadline，也不新增
+        沿用 EngineCore 的同线程轮询入口；load_aware 没有 deadline，也不新增
         定时线程。每放行一个候选即重新评估当前需求，避免同时唤醒整个集合。
         """
         controller = self._prompt_stream_update_coalescer
@@ -868,7 +868,7 @@ class Scheduler(SchedulerInterface):
 
         # 只遍历未放行候选；失败不会改变负载，同一压力快照可供其余候选复用。
         pressure_context: UpdateCoalescingContext | None = None
-        for request_id in tuple(controller.adaptive_request_ids):
+        for request_id in tuple(controller.load_aware_request_ids):
             request = self.requests.get(request_id)
             if request is None or request.is_finished():
                 controller.remove_request(request_id)
@@ -955,9 +955,12 @@ class Scheduler(SchedulerInterface):
 
         now = time.monotonic()
         if self._prompt_stream_update_coalescer is not None:
-            # 定时策略先兑现越过的边界；adaptive 应先覆盖本次新快照再判断，
+            # 定时策略先兑现越过的边界；load_aware 应先覆盖本次新快照再判断，
             # 避免新版本已到达却在事件处理前抢先放行旧快照。
-            if self._prompt_stream_update_coalescer.config.update_policy != "adaptive":
+            if (
+                self._prompt_stream_update_coalescer.config.update_policy
+                != "load_aware"
+            ):
                 self.flush_due_update_coalescing(now)
             self._enable_prompt_stream_update_coalescing(existing, now)
         existing.apply_prompt_stream_event(event)
@@ -1951,7 +1954,10 @@ class Scheduler(SchedulerInterface):
         controller = self._prompt_stream_update_coalescer
         for req_id, num_scheduled_token in num_scheduled_tokens.items():
             request = self.requests[req_id]
-            if controller is not None and controller.config.update_policy == "adaptive":
+            if (
+                controller is not None
+                and controller.config.update_policy == "load_aware"
+            ):
                 controller.inflight_tokens[req_id] = (
                     controller.inflight_tokens.get(req_id, 0) + num_scheduled_token
                 )
@@ -2387,7 +2393,10 @@ class Scheduler(SchedulerInterface):
         for req_id, num_tokens_scheduled in num_scheduled_tokens.items():
             assert num_tokens_scheduled > 0
             controller = self._prompt_stream_update_coalescer
-            if controller is not None and controller.config.update_policy == "adaptive":
+            if (
+                controller is not None
+                and controller.config.update_policy == "load_aware"
+            ):
                 remaining = (
                     controller.inflight_tokens.get(req_id, 0) - num_tokens_scheduled
                 )

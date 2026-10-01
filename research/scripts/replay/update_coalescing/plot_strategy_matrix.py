@@ -42,7 +42,7 @@ DEFAULT_PROFILE_ORDER = (
     "immediate-controller",
     "fixed-window",
     "quiet-debounce",
-    "adaptive",
+    "load-aware",
     "full-merge",
 )
 

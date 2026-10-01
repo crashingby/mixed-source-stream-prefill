@@ -124,7 +124,7 @@ sbatch --nodelist=<D_HOST> research/scripts/server/start_d_node.sbatch
 | `GPU_MEMORY_UTILIZATION` | `0.65` | vLLM GPU 显存使用比例 |
 | `MAX_MODEL_LEN` | `4096` | 最大上下文长度 |
 | `TENSOR_PARALLEL_SIZE` | `1` | 仅 P 节点：同一 Slurm 节点内的 vLLM TP rank 数；值为 `2` 时提交命令还必须申请两张 GPU。 |
-| `MAX_NUM_SEQS` | `16` | 最大并发序列数 |
+| `MAX_NUM_SEQS` | `64` | 最大并发序列数 |
 | `ATTENTION_BACKEND` | 空，自动选择 | 显式指定 vLLM attention backend，例如 `TRITON_ATTN` 或 `FLASH_ATTN`。P/D 对照实验应使用相同值。 |
 | `PROMPT_STREAM_MASKED_PADDING` | `0` | `1` 时传入 `--prompt-stream-masked-padding`，屏蔽分段 KV 中间 padding 并修正 RoPE；未指定后端时自动选择 `TRITON_ATTN`。完整 PD 模式的 P/D 均需开启。 |
 | `GENERATION_CONFIG` | 空；masked 模式为 `vllm` | 传给 `--generation-config`。masked 模式默认覆盖 Qwen 的模型 generation config，避免其 `repetition_penalty=1.05` 将物理 padding 计入词频。 |
@@ -142,7 +142,7 @@ MODEL_PATH="${HOME}/Models/Qwen2.5-3B" \
 SERVED_MODEL_NAME=qwen2.5-3b \
 GPU_MEMORY_UTILIZATION=0.6 \
 MAX_MODEL_LEN=4096 \
-MAX_NUM_SEQS=16 \
+MAX_NUM_SEQS=64 \
 sbatch --nodelist=g2c9 research/scripts/server/start_p_node.sbatch
 ```
 
@@ -254,7 +254,7 @@ MODEL_PATH=/workplace/home/huangxinying/Models/Qwen2.5-3B/ \
 SERVED_MODEL_NAME=qwen2.5-3b \
 GPU_MEMORY_UTILIZATION=0.6 \
 MAX_MODEL_LEN=4096 \
-MAX_NUM_SEQS=16 \
+MAX_NUM_SEQS=64 \
 sbatch --nodelist=g2c9 research/scripts/server/start_p_node.sbatch
 ```
 
@@ -265,7 +265,7 @@ MODEL_PATH=/workplace/home/huangxinying/Models/Qwen2.5-3B/ \
 SERVED_MODEL_NAME=qwen2.5-3b \
 GPU_MEMORY_UTILIZATION=0.6 \
 MAX_MODEL_LEN=4096 \
-MAX_NUM_SEQS=16 \
+MAX_NUM_SEQS=64 \
 sbatch --nodelist=g2c9 research/scripts/server/start_p_node.sbatch
 ```
 
@@ -275,7 +275,7 @@ MODEL_PATH=/workplace/home/huangxinying/Models/Qwen2.5-3B/ \
 SERVED_MODEL_NAME=qwen2.5-3b \
 GPU_MEMORY_UTILIZATION=0.6 \
 MAX_MODEL_LEN=4096 \
-MAX_NUM_SEQS=16 \
+MAX_NUM_SEQS=64 \
 sbatch --nodelist=g2c14 research/scripts/server/start_d_node.sbatch
 ```
 

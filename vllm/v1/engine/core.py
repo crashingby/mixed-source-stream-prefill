@@ -552,7 +552,7 @@ class EngineCore:
 
         model_executed = False
         deferred_scheduler_output = None
-        # 无时间 deadline 的 adaptive 也要在检查空闲前利用新的计算机会。
+        # 无时间 deadline 的 load_aware 也要在检查空闲前利用新的计算机会。
         if self.prompt_stream_update_coalescer_enabled:
             self.scheduler.flush_due_update_coalescing(time.monotonic())
         # 仅有 dormant 时不再提交空 batch；下方仍会消费已提交的结果。

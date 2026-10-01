@@ -340,10 +340,10 @@ def test_dormant_eviction_waits_for_recovery(scheduler: Scheduler) -> None:
     )
 
 
-def _make_adaptive_scheduler() -> Scheduler:
+def _make_load_aware_scheduler() -> Scheduler:
     """创建无定时兜底的执行背压策略，使用较小预算显式触发压力。"""
     return _make_scheduler(
-        PromptStreamUpdateCoalescingConfig(update_policy="adaptive")
+        PromptStreamUpdateCoalescingConfig(update_policy="load_aware")
     )
 
 
@@ -379,9 +379,9 @@ def _return_step(scheduler: Scheduler, output: SchedulerOutput) -> None:
     )
 
 
-def test_adaptive_backpressure_tracks_pending_active_and_gpu_completion() -> None:
+def test_load_aware_backpressure_tracks_pending_active_and_gpu_completion() -> None:
     """Update 提前清空 active 后仍须等待所有 GPU 回包才能放行下一代。"""
-    scheduler = _make_adaptive_scheduler()
+    scheduler = _make_load_aware_scheduler()
     request = _add_dormant_request(scheduler)
     _send_event(scheduler, request, PromptStreamEventType.UPDATE, [10, 11, 12, 13])
     stream = request.prompt_stream
@@ -428,11 +428,11 @@ def test_adaptive_backpressure_tracks_pending_active_and_gpu_completion() -> Non
     assert stream.pending_work_items[0].update_common_prefix_len == 1
 
 
-def test_adaptive_window_has_no_time_based_flush() -> None:
+def test_load_aware_window_has_no_time_based_flush() -> None:
     """即使配置了旧定时参数且经过很久，执行背压也不能被时间绕过。"""
     scheduler = _make_scheduler(
         PromptStreamUpdateCoalescingConfig(
-            update_policy="adaptive",
+            update_policy="load_aware",
             soft_window_ms=1.0,
             hard_deadline_ms=2.0,
             ttft_deadline_ms=3.0,
@@ -456,11 +456,11 @@ def test_adaptive_window_has_no_time_based_flush() -> None:
 
 
 @pytest.mark.parametrize("pressure_kind", ["tokens", "slots"])
-def test_adaptive_token_and_slot_pressure_independently_hold_updates(
+def test_load_aware_token_and_slot_pressure_independently_hold_updates(
     pressure_kind: str,
 ) -> None:
     """预算和运行名额任一用满都可暂缓，解除后无需新事件即可唤醒。"""
-    scheduler = _make_adaptive_scheduler()
+    scheduler = _make_load_aware_scheduler()
     scheduler.max_num_scheduled_tokens = 4 if pressure_kind == "tokens" else 64
     scheduler.max_num_running_reqs = 16 if pressure_kind == "tokens" else 1
     blocker = _add_running_request(scheduler, "busy-template")
@@ -495,11 +495,11 @@ def test_adaptive_token_and_slot_pressure_independently_hold_updates(
         RequestStatus.WAITING_FOR_STREAMING_REQ,
     ],
 )
-def test_adaptive_pressure_excludes_dormant_and_external_waiters(
+def test_load_aware_pressure_excludes_dormant_and_external_waiters(
     blocked_status: RequestStatus,
 ) -> None:
     """保留 KV 的空闲请求与等待外部条件的请求不构成可执行积压。"""
-    scheduler = _make_adaptive_scheduler()
+    scheduler = _make_load_aware_scheduler()
     request = _add_dormant_request(scheduler)
     _add_dormant_request(scheduler, "idle-stream")
     blocked = _make_request([10] * 32)
@@ -517,9 +517,9 @@ def test_adaptive_pressure_excludes_dormant_and_external_waiters(
     assert list(scheduler.waiting) == [request]
 
 
-def test_adaptive_admissions_recompute_pressure_between_candidates() -> None:
+def test_load_aware_admissions_recompute_pressure_between_candidates() -> None:
     """一轮只剩一个 slot 时不能把所有 dormant 候选同时放行。"""
-    scheduler = _make_adaptive_scheduler()
+    scheduler = _make_load_aware_scheduler()
     blocker = _add_running_request(scheduler, "busy-template")
     requests = [
         _add_dormant_request(scheduler, f"candidate-{index}") for index in range(3)
@@ -528,21 +528,21 @@ def test_adaptive_admissions_recompute_pressure_between_candidates() -> None:
         _send_event(scheduler, request, PromptStreamEventType.UPDATE, [10, 11])
     controller = scheduler._prompt_stream_update_coalescer
     assert controller is not None
-    assert list(controller.adaptive_request_ids) == [r.request_id for r in requests]
+    assert list(controller.load_aware_request_ids) == [r.request_id for r in requests]
 
     _finish_active_view(blocker)
     scheduler._reconcile_prompt_stream_request(blocker)
     assert scheduler.flush_due_update_coalescing(now=10.1) == 1
     assert list(scheduler.waiting) == [requests[0]]
-    assert list(controller.adaptive_request_ids) == [
+    assert list(controller.load_aware_request_ids) == [
         request.request_id for request in requests[1:]
     ]
     assert scheduler.flush_due_update_coalescing(now=10.2) == 0
 
 
-def test_adaptive_idle_engine_check_admits_pending_window() -> None:
+def test_load_aware_idle_engine_check_admits_pending_window() -> None:
     """全局只剩窗口时，EngineCore 的空闲检查必须主动形成可执行 work。"""
-    scheduler = _make_adaptive_scheduler()
+    scheduler = _make_load_aware_scheduler()
     blocker = _add_running_request(scheduler, "busy-template")
     request = _add_dormant_request(scheduler)
     _send_event(scheduler, request, PromptStreamEventType.UPDATE, [10, 11])
@@ -572,11 +572,11 @@ def test_adaptive_idle_engine_check_admits_pending_window() -> None:
 
 
 @pytest.mark.parametrize("terminal_kind", ["source_finished", "question"])
-def test_adaptive_terminal_event_bypasses_backpressure_preserves_fifo(
+def test_load_aware_terminal_event_bypasses_backpressure_preserves_fifo(
     terminal_kind: str,
 ) -> None:
     """最终快照不再值得覆盖，即使旧 Update 未完成也要排入其后。"""
-    scheduler = _make_adaptive_scheduler()
+    scheduler = _make_load_aware_scheduler()
     request = _add_dormant_request(scheduler)
     _send_event(scheduler, request, PromptStreamEventType.UPDATE, [10, 11])
     _send_event(
@@ -610,9 +610,9 @@ def test_adaptive_terminal_event_bypasses_backpressure_preserves_fifo(
     assert not request.can_decode_from_prompt_stream()
 
 
-def test_adaptive_zero_forward_work_releases_backpressure() -> None:
+def test_load_aware_zero_forward_work_releases_backpressure() -> None:
     """严格前缀截断无需 GPU 回包，消费后应正常放行最新 Update。"""
-    scheduler = _make_adaptive_scheduler()
+    scheduler = _make_load_aware_scheduler()
     request = _add_dormant_request(scheduler)
     _send_event(scheduler, request, PromptStreamEventType.UPDATE, [10, 11])
     scheduler._prepare_prompt_stream_execution(request)
@@ -633,9 +633,9 @@ def test_adaptive_zero_forward_work_releases_backpressure() -> None:
     assert request.has_outstanding_prompt_stream_update()
 
 
-def test_adaptive_abort_removes_candidate_and_wakes_other_request() -> None:
+def test_load_aware_abort_removes_candidate_and_wakes_other_request() -> None:
     """取消阻挡请求释放压力，且取消候选不能遗留待检查的幽灵窗口。"""
-    scheduler = _make_adaptive_scheduler()
+    scheduler = _make_load_aware_scheduler()
     blocker = _add_running_request(scheduler, "busy-template")
     cancelled = _add_dormant_request(scheduler, "cancelled-candidate")
     request = _add_dormant_request(scheduler)
@@ -644,17 +644,17 @@ def test_adaptive_abort_removes_candidate_and_wakes_other_request() -> None:
     controller = scheduler._prompt_stream_update_coalescer
     assert controller is not None
     scheduler.finish_requests(cancelled.request_id, RequestStatus.FINISHED_ABORTED)
-    assert cancelled.request_id not in controller.adaptive_request_ids
+    assert cancelled.request_id not in controller.load_aware_request_ids
     scheduler.finish_requests(blocker.request_id, RequestStatus.FINISHED_ABORTED)
     # abort 后由 EngineCore 下一轮/空闲检查统一评估可执行机会。
     assert scheduler.flush_due_update_coalescing(now=10.1) == 1
-    assert request.request_id not in controller.adaptive_request_ids
+    assert request.request_id not in controller.load_aware_request_ids
     assert list(scheduler.waiting) == [request]
 
 
-def test_adaptive_pressure_counts_inflight_normal_prefill_until_reply() -> None:
+def test_load_aware_pressure_counts_inflight_normal_prefill_until_reply() -> None:
     """普通请求已乐观推进到末尾时仍占用真实在途预算，回包后才解除。"""
-    scheduler = _make_adaptive_scheduler()
+    scheduler = _make_load_aware_scheduler()
     scheduler.max_num_scheduled_tokens = 4
     scheduler.max_num_running_reqs = 8
     ordinary = _make_request([20, 21, 22, 23])
@@ -676,9 +676,9 @@ def test_adaptive_pressure_counts_inflight_normal_prefill_until_reply() -> None:
     assert list(scheduler.waiting) == [request]
 
 
-def test_adaptive_append_source_finished_does_not_bypass_pressure() -> None:
+def test_load_aware_append_source_finished_does_not_bypass_pressure() -> None:
     """Append 封闭不是最终 Update 出口，不得使用默认空负载上下文放行。"""
-    scheduler = _make_adaptive_scheduler()
+    scheduler = _make_load_aware_scheduler()
     _add_running_request(scheduler, "busy-template")
     request = _add_dormant_request(scheduler)
     _send_event(scheduler, request, PromptStreamEventType.APPEND, [])
@@ -698,9 +698,9 @@ def test_adaptive_append_source_finished_does_not_bypass_pressure() -> None:
     assert request.request_id in scheduler._prompt_stream_dormant_reasons
 
 
-def test_adaptive_recovery_preserves_window_and_candidate_registration() -> None:
+def test_load_aware_recovery_preserves_window_and_candidate_registration() -> None:
     """抢占保留未放行窗口，并允许旧 admission 按原恢复规则取消。"""
-    scheduler = _make_adaptive_scheduler()
+    scheduler = _make_load_aware_scheduler()
     request = _add_dormant_request(scheduler)
     _send_event(scheduler, request, PromptStreamEventType.UPDATE, [10, 11])
     _send_event(
@@ -714,7 +714,7 @@ def test_adaptive_recovery_preserves_window_and_candidate_registration() -> None
     state = request.prompt_stream_update_coalescing_state
     assert controller is not None and state is not None
     assert state.latest_pending_token_ids == (10, 12)
-    assert request.request_id in controller.adaptive_request_ids
+    assert request.request_id in controller.load_aware_request_ids
     assert request.get_prompt_stream_update_deadline() is None
     # 原恢复语义取消尚未完成的旧 admission，只保留最新窗口与 PA 恢复。
     assert not request.has_outstanding_prompt_stream_update()
@@ -726,5 +726,5 @@ def test_adaptive_recovery_preserves_window_and_candidate_registration() -> None
     _finish_active_view(request)
     scheduler._reconcile_prompt_stream_request(request)
     assert state.latest_pending_token_ids is None
-    assert request.request_id not in controller.adaptive_request_ids
+    assert request.request_id not in controller.load_aware_request_ids
     assert request.has_outstanding_prompt_stream_update()

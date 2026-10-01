@@ -11,10 +11,10 @@ from vllm.config.prompt_stream import (
     PromptStreamUpdatePolicy,
 )
 from vllm.v1.core.sched.update_coalescing import (
-    AdaptiveUpdateCoalescingPolicy,
     FixedWindowUpdateCoalescingPolicy,
     FullMergeUpdateCoalescingPolicy,
     ImmediateUpdateCoalescingPolicy,
+    LoadAwareUpdateCoalescingPolicy,
     QuietDebounceUpdateCoalescingPolicy,
     UpdateCoalescingContext,
     UpdateCoalescingPolicy,
@@ -40,19 +40,19 @@ def _window(config: PromptStreamUpdateCoalescingConfig) -> UpdateCoalescingState
         ("immediate", ImmediateUpdateCoalescingPolicy),
         ("fixed_window", FixedWindowUpdateCoalescingPolicy),
         ("quiet_debounce", QuietDebounceUpdateCoalescingPolicy),
-        ("adaptive", AdaptiveUpdateCoalescingPolicy),
+        ("load_aware", LoadAwareUpdateCoalescingPolicy),
         ("full_merge", FullMergeUpdateCoalescingPolicy),
     ],
 )
 def test_factory_selects_distinct_policy(
     name: PromptStreamUpdatePolicy, expected_type: type[UpdateCoalescingPolicy]
 ) -> None:
-    """配置直接选择各自的实现类；只有 adaptive 依赖执行反馈。"""
+    """配置直接选择各自的实现类；只有 load_aware 依赖执行反馈。"""
     policy = create_update_coalescing_policy(
         PromptStreamUpdateCoalescingConfig(update_policy=name)
     )
     assert type(policy) is expected_type
-    assert policy.requires_scheduler_feedback == (name == "adaptive")
+    assert policy.requires_scheduler_feedback == (name == "load_aware")
 
 
 @pytest.mark.parametrize(
@@ -65,14 +65,14 @@ def test_factory_selects_distinct_policy(
         (False, 0.999, 0.999, True),
     ],
 )
-def test_adaptive_waits_for_execution_and_both_resources(
+def test_load_aware_waits_for_execution_and_both_resources(
     outstanding: bool,
     token_pressure: float,
     slot_pressure: float,
     expected: bool,
 ) -> None:
     """分别覆盖执行背压、token 满额和 running 名额满额三种阻挡。"""
-    config = PromptStreamUpdateCoalescingConfig(update_policy="adaptive")
+    config = PromptStreamUpdateCoalescingConfig(update_policy="load_aware")
     state = _window(config)
     policy = create_update_coalescing_policy(config)
     policy.on_snapshot(state, now=10.0)
@@ -87,10 +87,10 @@ def test_adaptive_waits_for_execution_and_both_resources(
     ) is expected
 
 
-def test_adaptive_never_registers_a_time_deadline() -> None:
+def test_load_aware_never_registers_a_time_deadline() -> None:
     """即使配置带时间参数，也不能绕过持续的执行背压。"""
     config = PromptStreamUpdateCoalescingConfig(
-        update_policy="adaptive",
+        update_policy="load_aware",
         soft_window_ms=0.0,
         hard_deadline_ms=1.0,
         ttft_deadline_ms=1.0,
@@ -109,12 +109,12 @@ def test_adaptive_never_registers_a_time_deadline() -> None:
     assert policy.should_flush(state, UpdateCoalescingContext(now=10000.0))
 
 
-def test_adaptive_uses_configured_pressure_thresholds() -> None:
+def test_load_aware_uses_configured_pressure_thresholds() -> None:
     """两个无量纲阈值独立生效，不把 token budget 当作唯一限制。"""
     config = PromptStreamUpdateCoalescingConfig(
-        update_policy="adaptive",
-        adaptive_token_pressure_threshold=0.75,
-        adaptive_slot_pressure_threshold=0.5,
+        update_policy="load_aware",
+        load_aware_token_pressure_threshold=0.75,
+        load_aware_slot_pressure_threshold=0.5,
     )
     state = _window(config)
     policy = create_update_coalescing_policy(config)
@@ -130,10 +130,10 @@ def test_adaptive_uses_configured_pressure_thresholds() -> None:
 
 @pytest.mark.parametrize(
     "field",
-    ["adaptive_token_pressure_threshold", "adaptive_slot_pressure_threshold"],
+    ["load_aware_token_pressure_threshold", "load_aware_slot_pressure_threshold"],
 )
 @pytest.mark.parametrize("invalid", [0.0, -1.0, float("inf"), float("nan")])
-def test_adaptive_rejects_invalid_pressure_thresholds(
+def test_load_aware_rejects_invalid_pressure_thresholds(
     field: str, invalid: float
 ) -> None:
     """非法阈值不能让所有窗口永久挂起或无条件放行。"""

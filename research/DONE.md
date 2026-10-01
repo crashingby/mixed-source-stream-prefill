@@ -434,7 +434,7 @@ Update policy 决定“窗口是否已经应该 flush”，达到条件便创建
 | `immediate` | 每条有效 Update 都立即 flush。 |
 | `fixed_window` | soft deadline 固定锚定窗口第一条 Update，不随新事件刷新。 |
 | `quiet_debounce` | 每条有效新 Update 将 soft deadline 刷新为“最近事件时间 + 窗口”。 |
-| `adaptive` | 无固定 deadline；本请求没有未完成 Update 且全局 token / slot 压力低于阈值时放行。 |
+| `load_aware` | 无固定 deadline；本请求没有未完成 Update 且全局 token / slot 压力低于阈值时放行。 |
 | `full_merge` | 仅在 Update source 结束或 `PROMPT_FINISHED` 时 flush。 |
 
 `disabled` 表示启动配置为 `None`：每个 Update 直接走原来的即时 admission 路径。
@@ -460,9 +460,9 @@ source id、封闭状态和 epoch 继续服务协议与执行依赖。固定模�
 barrier 都保留。启用 controller 后，跨 epoch 的下一代 Update 仍按零 LCP 重算；已完成 Update
 不会只因 Append 后续增长而自动重放。
 
-### Adaptive 的执行背压决策
+### 负载感知 的执行背压决策
 
-`adaptive` 通过独立策略类判断：本请求 pending / active 中没有 Update work，且没有
+`load_aware` 通过独立策略类判断：本请求 pending / active 中没有 Update work，且没有
 UPDATE 阶段 GPU 在途批次，同时整体 token 需求和运行名额需求低于各自阈值时才放行。
 默认两个阈值均为 1.0；不使用固定等待时间，不把 KV 容量或抢占次数作为策略信号。
 
@@ -554,8 +554,8 @@ Update 合并是启动级选项，通过一个 JSON 配置传入 P 节点：
 
 以下是移除 Append 来源完成约束之前的历史矩阵结果，其中部分实验额外等待 Append 封闭。
 这些数值保留作历史探索记录，不能作为当前五种 policy 的新结果。当前实验入口保留
-`disabled`、`immediate-controller`、`fixed-window`、`quiet-debounce`、`adaptive` 和
-`full-merge`；新背压自适应尚未进入已报告的最终策略对比。
+`disabled`、`immediate-controller`、`fixed-window`、`quiet-debounce`、`load-aware` 和
+`full-merge`；新的负载感知策略尚未进入已报告的最终策略对比。
 
 已观察到的主规律是：
 
@@ -564,7 +564,7 @@ Update 合并是启动级选项，通过一个 JSON 配置传入 P 节点：
 - 最清晰的收益区域是 Update interval=0.01 s、QPS=1/2。以 p95 为例：QPS=1 时 disabled 为 276.9 ms、full-merge 为 259.7 ms；QPS=2 时 disabled 为 410.6 ms、fixed-window 为 367.5 ms、full-merge 为 313.4 ms。
 - 更高压力下虽然某些配置仍显示数值收益，但 preemption、dormant eviction 和 recovery token 占比明显上升，不能只用一条 TTFT 线归因于 coalescing policy。
 
-因此 Update 合并目前可以作为一个**条件性优化与可解释 tradeoff**：事件越密、Update 快照越长、P 队列越拥塞，跳过中间版本越有价值；事件较稀时应接近 immediate，避免人为等待。Adaptive 的下一步目标不是证明“合并总是更好”，而是在线识别这个收益区域。
+因此 Update 合并目前可以作为一个**条件性优化与可解释 tradeoff**：事件越密、Update 快照越长、P 队列越拥塞，跳过中间版本越有价值；事件较稀时应接近 immediate，避免人为等待。负载感知 的下一步目标不是证明“合并总是更好”，而是在线识别这个收益区域。
 
 ## 输出质量与近似正确性实验
 
@@ -734,7 +734,7 @@ manifest 经 proxy 传给 D；P-only 也返回语义描述但不申请传输租�
 
 当前项目已经完成第一项创新的核心工程闭环：把混合来源 Prompt Stream 从 `EngineCoreRequest` 隔离到长期 `Request` 后，以显式事件、FIFO work 和双 segment KV 管理贯通 Scheduler、worker、NIXL 与 REST proxy；性能实验验证了中低负载下提前分段 prefill 的 TTFT 收益，质量实验也给出了近似影响的可量化边界。
 
-第二项 Update coalescing 已经从设计进入可运行实现，并证明“减少 Update token”与“降低 TTFT”之间存在可研究的条件性权衡。其下一步重点不是继续堆固定参数，而是验证基于执行背压和调度需求的 Adaptive policy。当前不把抢占/recovery 成本纳入
+第二项 Update coalescing 已经从设计进入可运行实现，并证明“减少 Update token”与“降低 TTFT”之间存在可研究的条件性权衡。其下一步重点不是继续堆固定参数，而是验证基于执行背压和调度需求的 负载感知 policy。当前不把抢占/recovery 成本纳入
 放行决策，实验单独记录恢复指标以识别干扰。
 
 当前的正确性改进 Masked Padding 已进入源码：保留双 segment block 拓扑，在 Triton 路径增加中间 key range mask 与模型位置修正，下一步是完整模型和 P/D 的验证。Append-after-Update 的时序近似仍独立存在，应继续与普通完整 Prefill 做性能和质量对照。

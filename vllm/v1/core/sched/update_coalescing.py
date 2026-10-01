@@ -48,7 +48,7 @@ class UpdateCoalescingPolicy(ABC):
         Request 已设置 first_pending_time、last_update_time 与最新快照。
         此方法只更新策略状态，不改变已放行的 work。
         """
-        # immediate/full_merge/adaptive 都不能遗留旧窗口的定时器。
+        # immediate/full_merge/load_aware 都不能遗留旧窗口的定时器。
         state.soft_deadline = None
         state.hard_deadline = None
         state.ttft_deadline = None
@@ -81,9 +81,10 @@ class FullMergeUpdateCoalescingPolicy(UpdateCoalescingPolicy):
         return False
 
 
-class AdaptiveUpdateCoalescingPolicy(UpdateCoalescingPolicy):
-    """使用请求执行背压与全局计算余量，不设置任何时间 deadline。
+class LoadAwareUpdateCoalescingPolicy(UpdateCoalescingPolicy):
+    """按请求执行背压与全局计算余量实施负载感知放行。
 
+    此策略不设置时间 deadline。
     结束事件由 Request 提前处理，因此最终快照不会被本请求的旧 work
     或全局压力拦住。普通窗口只有在两个压力都低于阈值时才能放行。
     """
@@ -99,8 +100,8 @@ class AdaptiveUpdateCoalescingPolicy(UpdateCoalescingPolicy):
             return False
         # token 和名额是两种独立限制；任意一项饱和都继续保留可覆盖快照。
         return (
-            context.token_pressure < self.config.adaptive_token_pressure_threshold
-            and context.slot_pressure < self.config.adaptive_slot_pressure_threshold
+            context.token_pressure < self.config.load_aware_token_pressure_threshold
+            and context.slot_pressure < self.config.load_aware_slot_pressure_threshold
         )
 
 
@@ -163,7 +164,7 @@ def create_update_coalescing_policy(
         "immediate": ImmediateUpdateCoalescingPolicy,
         "fixed_window": FixedWindowUpdateCoalescingPolicy,
         "quiet_debounce": QuietDebounceUpdateCoalescingPolicy,
-        "adaptive": AdaptiveUpdateCoalescingPolicy,
+        "load_aware": LoadAwareUpdateCoalescingPolicy,
         "full_merge": FullMergeUpdateCoalescingPolicy,
     }
     policy_type = policy_types.get(config.update_policy)

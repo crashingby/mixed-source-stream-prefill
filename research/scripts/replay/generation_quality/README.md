@@ -112,7 +112,7 @@ MODEL_PATH=<MODEL_PATH> \
 SERVED_MODEL_NAME=<SERVED_MODEL_NAME> \
 GPU_MEMORY_UTILIZATION=0.9 \
 MAX_MODEL_LEN=16384 \
-MAX_NUM_SEQS=4 \
+MAX_NUM_SEQS=64 \
 PROMPT_STREAM_UPDATE_COALESCING_CONFIG='' \
 sbatch --nodelist=<P_NODE> research/scripts/server/start_p_node.sbatch
 ```
@@ -127,7 +127,7 @@ MODEL_PATH=<MODEL_PATH> \
 SERVED_MODEL_NAME=<SERVED_MODEL_NAME> \
 GPU_MEMORY_UTILIZATION=0.9 \
 MAX_MODEL_LEN=16384 \
-MAX_NUM_SEQS=4 \
+MAX_NUM_SEQS=64 \
 sbatch --nodelist=<D_NODE> research/scripts/server/start_d_node.sbatch
 ```
 
@@ -142,7 +142,8 @@ tail -f research/scripts/logs/vllm-p-<P_JOB_ID>.out
 tail -f research/scripts/logs/vllm-d-<D_JOB_ID>.out
 ```
 
-`MAX_NUM_SEQS=4` 足以覆盖严格串行的质量回放。它不是最大序列长度；单请求长度
+`MAX_NUM_SEQS=64` 与通用服务启动默认值一致；质量回放仍严格串行，
+不会因为提高服务上限而增加回放并发。它不是最大序列长度；单请求长度
 仍受 `MAX_MODEL_LEN` 限制。当前 mixed-source 数据建议使用 16384；超长请求仍会
 按错误记录落盘，需要提高 P、D 的 `MAX_MODEL_LEN` 或重新裁剪数据。
 
@@ -163,13 +164,13 @@ mkdir -p research/scripts/logs
 
 GPU_MEMORY_UTILIZATION=0.9 \
 MAX_MODEL_LEN=16384 \
-MAX_NUM_SEQS=4 \
+MAX_NUM_SEQS=64 \
 PROMPT_STREAM_UPDATE_COALESCING_CONFIG="" \
 sbatch --nodelist="${P_NODE}" research/scripts/server/start_p_node.sbatch
 
 GPU_MEMORY_UTILIZATION=0.9 \
 MAX_MODEL_LEN=16384 \
-MAX_NUM_SEQS=4 \
+MAX_NUM_SEQS=64 \
 sbatch --nodelist="${D_NODE}" research/scripts/server/start_d_node.sbatch
 ```
 

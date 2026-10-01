@@ -9,10 +9,11 @@ RESTFUL API 回放同一批 mixed-source 请求，同时测量：
 - 不同策略、窗口、Update 到达频率和 QPS 下的成功率与尾延迟。
 
 合并策略是 **P 节点 Engine 启动级配置**。P 节点存活期间不能由 replay 请求切换
-策略。每次修改 profile、window 或 adaptive 压力阈值，都必须重启 P。
+策略。每次修改 profile、window 或负载感知压力阈值，都必须重启 P。
 
-当前主自适应策略为 **`COALESCING_PROFILE=adaptive`**：按本请求执行背压与全局计算
-积压放行，不设置固定等待上限。历史结果必须按生成时的代码版本与配置区分，
+负载感知策略使用 **`COALESCING_PROFILE=load-aware`**：按本请求执行背压与全局计算
+积压放行，不设置固定等待上限。它面向执行积压场景，收益取决于工作负载，
+应与即时、时间窗口和完全合并策略分别比较。历史结果必须按生成时的代码版本与配置区分，
 不能仅凭目录中的策略名称与当前结果混合分析。
 
 ## 目录与脚本
@@ -81,7 +82,7 @@ MODEL_PATH="${MODEL_PATH}" \
 SERVED_MODEL_NAME="${SERVED_MODEL_NAME}" \
 GPU_MEMORY_UTILIZATION=0.6 \
 MAX_MODEL_LEN=4096 \
-MAX_NUM_SEQS=16 \
+MAX_NUM_SEQS=64 \
 sbatch --nodelist="${P_NODE}" \
   research/scripts/replay/update_coalescing/start_p_node_coalescing.sbatch
 ```
@@ -123,7 +124,7 @@ Slurm 会设置当前 job 可见的 GPU。通常不要再手写 `CUDA_VISIBLE_DE
 | `PORT` | `8100` | 端口冲突时设置 | P 节点 REST 端口，proxy 的 prefiller port 必须与它一致。 |
 | `GPU_MEMORY_UTILIZATION` | `0.65` | **建议设置** | vLLM 可使用的 GPU 显存比例。过高可能因其它进程占用而 OOM。 |
 | `MAX_MODEL_LEN` | `4096` | **建议设置** | 最大序列长度；超过它的实验请求会失败。 |
-| `MAX_NUM_SEQS` | `16` | **建议固定并记录** | Scheduler 同时容纳的序列上限，不是数据集请求总数。增大后并发能力和 KV 显存占用都会增加。 |
+| `MAX_NUM_SEQS` | `64` | **建议固定并记录** | Scheduler 同时容纳的序列上限，不是数据集请求总数。增大后并发能力和 KV 显存占用都会增加。 |
 | `NIXL_SIDE_CHANNEL_PORT` | `5600` | 同节点多实例时设置 | NIXL P 侧 side-channel 端口。 |
 | `VLLM_NIXL_SIDE_CHANNEL_HOST` | 实际 Slurm hostname | 特殊网络环境时设置 | 发布给 D 节点的 NIXL 可达地址，不能错误写成跨节点不可达的 localhost。 |
 | `UCX_NET_DEVICES` | `all` | 特殊网卡绑定时设置 | NIXL/UCX 使用的网络设备。 |
@@ -140,8 +141,8 @@ Append/Update 事件。提高它可能缓解并发请求 admission 限制，但�
 | `SOFT_WINDOW_MS` | fixed、debounce | soft window，默认 `20` ms。 |
 | `HARD_DEADLINE_MS` | fixed、debounce | hard deadline，默认 `80` ms。 |
 | `TTFT_DEADLINE_MS` | fixed、debounce | 可选请求级 deadline；不启用时不传或设为 `null`。 |
-| `ADAPTIVE_TOKEN_PRESSURE_THRESHOLD` | adaptive | token 需求压力阈值，默认 `1.0`，必须大于 0。 |
-| `ADAPTIVE_SLOT_PRESSURE_THRESHOLD` | adaptive | 可执行请求数 / 序列名额阈值，默认 `1.0`，必须大于 0。 |
+| `LOAD_AWARE_TOKEN_PRESSURE_THRESHOLD` | `load-aware` | token 需求压力阈值，默认 `1.0`，必须大于 0。 |
+| `LOAD_AWARE_SLOT_PRESSURE_THRESHOLD` | `load-aware` | 可执行请求数 / 序列名额阈值，默认 `1.0`，必须大于 0。 |
 | `PROMPT_STREAM_UPDATE_COALESCING_CONFIG` | custom | 完整 JSON；其它 profile 会由 helper 自动生成，不要手动同时设置。 |
 
 **同一个 P job 的 Engine 配置不会随 replay 改变。** 修改上述任意合并参数后，都要
@@ -203,8 +204,8 @@ sbatch research/scripts/replay/update_coalescing/run_policy_sweep.sbatch
 | `SOFT_WINDOW_MS` | P 的 `soft_window_ms` | fixed、debounce 必须相同。 |
 | `HARD_DEADLINE_MS` | P 的 `hard_deadline_ms` | fixed、debounce 必须相同。 |
 | `TTFT_DEADLINE_MS` | P 的 `ttft_deadline_ms` | P 设置时 replay 也必须设置。 |
-| `ADAPTIVE_TOKEN_PRESSURE_THRESHOLD` | P 的同名 JSON 字段（小写） | adaptive 必须相同。 |
-| `ADAPTIVE_SLOT_PRESSURE_THRESHOLD` | P 的同名 JSON 字段（小写） | adaptive 必须相同。 |
+| `LOAD_AWARE_TOKEN_PRESSURE_THRESHOLD` | P 的同名 JSON 字段（小写） | `load-aware` 必须相同。 |
+| `LOAD_AWARE_SLOT_PRESSURE_THRESHOLD` | P 的同名 JSON 字段（小写） | `load-aware` 必须相同。 |
 | `PROMPT_STREAM_UPDATE_COALESCING_CONFIG` | custom JSON | `custom` profile 下必须完全相同。 |
 
 `MODEL` 还必须等于 P 的 `SERVED_MODEL_NAME`，但它不是 coalescing JSON 的一部分。
@@ -219,7 +220,7 @@ sbatch research/scripts/replay/update_coalescing/run_policy_sweep.sbatch
 | `NUM_REPEATS` | `3` | 每个 `(QPS, Update interval)` 点独立重复多少次。 |
 | `BASE_RANDOM_SEED` | `2026` | 第一次重复的到达过程 seed；第 $i$ 次重复使用 `base+i-1`。 |
 | `ARRIVAL_PROCESS` | `poisson` | 请求到达过程，当前常用 `poisson`；也支持 `fixed`。 |
-| `MAX_CONCURRENCY` | `8` | 客户端最多同时保留多少个未完成逻辑请求。 |
+| `MAX_CONCURRENCY` | `32` | 客户端最多同时保留多少个未完成逻辑请求。 |
 
 正式 run 数为：
 
@@ -286,18 +287,18 @@ Slurm replay 通常运行在其它节点，应使用 proxy 所在节点 hostname
 
 - 使用 `UPDATE_INTERVAL_LIST` 的第一个值。
 - 使用 `BASE_RANDOM_SEED`。
-- 使用 QPS `0` 和当前 `MAX_CONCURRENCY`，因此是突发式 warmup。
+- 使用 QPS `0`，共享回放器逐请求完成后再启动下一个，因此是串行 warmup。
 - 写入 `${OUTPUT_DIR}/warmup`，汇总脚本默认跳过。
 
-它不是每个 QPS 点或每次重复前都重新 warmup。若需要严格顺序 warmup，可以同时把
-`MAX_CONCURRENCY=1`，但正式采集时仍恢复统一的并发配置。
+它不是每个 QPS 点或每次重复前都重新 warmup。QPS `0` 的串行行为不受
+`MAX_CONCURRENCY` 上限影响；正式采集仍使用统一的并发配置，默认值为 `32`。
 
 ### 汇总与绘图
 
 `summarize_coalescing.py` 生成：
 
 - `run_summary.csv`：每次独立 run 的指标。
-- `configuration_summary.csv`：相同 workload 和完整配置 JSON 的重复实验汇总，包含两个 adaptive 压力阈值列。
+- `configuration_summary.csv`：相同 workload 和完整配置 JSON 的重复实验汇总，包含两个负载感知压力阈值列。
 - `combined_request_metrics.csv`：全部请求级记录与实验元数据。
 - `summary.json`：结构化汇总。
 
@@ -322,7 +323,7 @@ Slurm replay 通常运行在其它节点，应使用 proxy 所在节点 hostname
 | `immediate-controller` | `immediate` | 每条 Update 立即 admission，是 controller 内的无等待基线；跨 Append epoch 时会从 LCP=0 重算。 |
 | `fixed-window` | `fixed_window` | 从窗口第一条 Update 开始等待固定 soft window。 |
 | `quiet-debounce` | `quiet_debounce` | 每条有效 Update 刷新 soft deadline。 |
-| `adaptive` | `adaptive` | 本请求无未完成 Update 且全局有计算余量时放行，没有时间 deadline。 |
+| `load-aware` | `load_aware` | 本请求无未完成 Update 且全局有计算余量时放行，没有时间 deadline。 |
 | `full-merge` | `full_merge` | 等待 Update source finished 或最终 Prompt barrier。 |
 | `custom` | 由 JSON 决定 | 使用完整手写 JSON。 |
 
@@ -342,14 +343,14 @@ Slurm replay 通常运行在其它节点，应使用 proxy 所在节点 hostname
 - `TTFT_DEADLINE_MS`：可选请求级 TTFT deadline，默认 `null`。
 
 实验脚本要求 `SOFT_WINDOW_MS <= HARD_DEADLINE_MS`。`full-merge` 不使用这些
-window deadline。`adaptive` 同样不使用时间窗口、hard deadline 或 TTFT deadline。
+window deadline。`load_aware` 同样不使用时间窗口、hard deadline 或 TTFT deadline。
 
-### Adaptive：执行背压与全局压力
+### 负载感知：执行背压与全局压力
 
 | 环境变量 | 默认值 | 含义 |
 | --- | ---: | --- |
-| `ADAPTIVE_TOKEN_PRESSURE_THRESHOLD` | `1.0` | 已可执行工作的下一轮 token 需求 / 单轮 token budget 的放行阈值。 |
-| `ADAPTIVE_SLOT_PRESSURE_THRESHOLD` | `1.0` | 已可执行请求数 / `MAX_NUM_SEQS` 的放行阈值。 |
+| `LOAD_AWARE_TOKEN_PRESSURE_THRESHOLD` | `1.0` | 已可执行工作的下一轮 token 需求 / 单轮 token budget 的放行阈值。 |
+| `LOAD_AWARE_SLOT_PRESSURE_THRESHOLD` | `1.0` | 已可执行请求数 / `MAX_NUM_SEQS` 的放行阈值。 |
 
 两个阈值均须为有限正数。只有两类压力都低于各自阈值，且本请求不存在未完成 Update，
 才进行普通放行。默认 `1.0` 表示已有工作达到一轮计算预算或序列容量时继续合并。
@@ -381,7 +382,7 @@ Update 合并不是简单地让所有 Update 等待更久，而是按执行机�
   是否下降。
 - **节省是否转化为性能收益**：不同 QPS 下，TTFT 和尾延迟是否改善。
 - **等待代价是否可控**：window 和 deadline 是否造成额外等待。
-- **Adaptive 是否值得**：执行背压和全局压力是否比 fixed/debounce 更稳健。
+- **负载感知策略的适用范围**：执行背压和全局压力在什么负载下能减少排队，等待最终计算的代价有多大。
 - **终止后的剩余工作**：延后计算是否把成本转移到了 Question 到达后，抵消少算 token 的收益。
 
 当前实验边界是一个真实 Append source 和一个 Update source。
@@ -398,7 +399,7 @@ Update 合并不是简单地让所有 Update 等待更久，而是按执行机�
   最优。
 
 controller 内的主策略比较 `immediate`、`fixed_window`、`quiet_debounce`、
-`adaptive` 和 `full_merge`。这些策略保留相同的跨 Append epoch 复用规则，只改变
+`load_aware` 和 `full_merge`。这些策略保留相同的跨 Append epoch 复用规则，只改变
 Update 的放行时机与合并程度；`disabled` 单独作为原始分段近似计算基线。
 
 ### Workload 维度
@@ -526,7 +527,7 @@ $$
 
 #### 阶段 B：策略初筛
 
-固定 QPS `1`、Update interval `0.2 0.01`；时间策略用 `20/80 ms` 窗口，adaptive 用 `1.0/1.0` 压力阈值，
+固定 QPS `1`、Update interval `0.2 0.01`；时间策略用 `20/80 ms` 窗口，负载感知策略用 `1.0/1.0` 压力阈值，
 依次比较：
 
 ```text
@@ -534,7 +535,7 @@ disabled
 immediate-controller
 fixed-window
 quiet-debounce
-adaptive
+load-aware
 full-merge
 ```
 
@@ -555,9 +556,9 @@ full-merge
 每一行都是新的 Engine 配置，都要重启 P。选出合理 soft window 后，再单独改变 hard
 或 `TTFT_DEADLINE_MS`。
 
-#### 阶段 D：Adaptive 压力敏感性
+#### 阶段 D：负载感知压力敏感性
 
-- 先固定两个压力阈值为 `1.0`，比较 immediate、fixed/debounce、adaptive、full-merge。
+- 先固定两个压力阈值为 `1.0`，比较 immediate、fixed/debounce、load-aware、full-merge。
 - 一次只改变一个压力阈值，例如 `0.5 / 1.0 / 2.0`；每次重启 P，并同步 replay 审计值。
 - 固定 `MAX_NUM_SEQS` 与 token budget；它们同时影响调度能力与压力归一化。
 - 结合 TTFT、admitted work、实际 scheduled token 判断：少算是否抵消终止阶段的补算成本。
@@ -565,7 +566,7 @@ full-merge
 
 #### 阶段 E：主负载实验
 
-选出 `disabled`、最佳 fixed/debounce、adaptive 和 `full-merge`，再运行完整
+选出 `disabled`、最佳 fixed/debounce、`load-aware` 和 `full-merge`，再运行完整
 QPS 和 Update interval sweep，用于论文主表与主图。
 
 ## 实验执行流程
@@ -615,7 +616,7 @@ NIXL pull producer。通用 P 启动脚本已传入 `--no-async-scheduling`。D 
 ```shell
 COALESCING_PROFILE=disabled \
 MODEL_PATH="${MODEL_PATH}" SERVED_MODEL_NAME="${SERVED_MODEL_NAME}" \
-GPU_MEMORY_UTILIZATION=0.6 MAX_MODEL_LEN=4096 MAX_NUM_SEQS=16 \
+GPU_MEMORY_UTILIZATION=0.6 MAX_MODEL_LEN=4096 MAX_NUM_SEQS=64 \
 sbatch --nodelist="${P_NODE}" \
   research/scripts/replay/update_coalescing/start_p_node_coalescing.sbatch
 ```
@@ -630,7 +631,7 @@ MAX_REQUESTS=512 \
 QPS_LIST="0.5 1 2 4" \
 UPDATE_INTERVAL_LIST="0.5 0.2 0.01" \
 NUM_REPEATS=3 BASE_RANDOM_SEED=2026 \
-MAX_CONCURRENCY=8 APPEND_CHUNK_INTERVAL=0.5 \
+MAX_CONCURRENCY=32 APPEND_CHUNK_INTERVAL=0.5 \
 SOURCE_FINISH_DELAY=0 WARMUP_REQUESTS=8 \
 sbatch research/scripts/replay/update_coalescing/run_policy_sweep.sbatch
 ```
@@ -640,7 +641,7 @@ sbatch research/scripts/replay/update_coalescing/run_policy_sweep.sbatch
 ```shell
 COALESCING_PROFILE=immediate-controller \
 MODEL_PATH="${MODEL_PATH}" SERVED_MODEL_NAME="${SERVED_MODEL_NAME}" \
-GPU_MEMORY_UTILIZATION=0.6 MAX_MODEL_LEN=4096 MAX_NUM_SEQS=16 \
+GPU_MEMORY_UTILIZATION=0.6 MAX_MODEL_LEN=4096 MAX_NUM_SEQS=64 \
 sbatch --nodelist="${P_NODE}" \
   research/scripts/replay/update_coalescing/start_p_node_coalescing.sbatch
 ```
@@ -655,7 +656,7 @@ MAX_REQUESTS=512 \
 QPS_LIST="0.5 1 2 4" \
 UPDATE_INTERVAL_LIST="0.5 0.2 0.01" \
 NUM_REPEATS=3 BASE_RANDOM_SEED=2026 \
-MAX_CONCURRENCY=8 APPEND_CHUNK_INTERVAL=0.5 \
+MAX_CONCURRENCY=32 APPEND_CHUNK_INTERVAL=0.5 \
 SOURCE_FINISH_DELAY=0 WARMUP_REQUESTS=8 \
 sbatch research/scripts/replay/update_coalescing/run_policy_sweep.sbatch
 ```
@@ -666,7 +667,7 @@ sbatch research/scripts/replay/update_coalescing/run_policy_sweep.sbatch
 COALESCING_PROFILE=fixed-window \
 SOFT_WINDOW_MS=20 HARD_DEADLINE_MS=80 \
 MODEL_PATH="${MODEL_PATH}" SERVED_MODEL_NAME="${SERVED_MODEL_NAME}" \
-GPU_MEMORY_UTILIZATION=0.6 MAX_MODEL_LEN=4096 MAX_NUM_SEQS=16 \
+GPU_MEMORY_UTILIZATION=0.6 MAX_MODEL_LEN=4096 MAX_NUM_SEQS=64 \
 sbatch --nodelist="${P_NODE}" \
   research/scripts/replay/update_coalescing/start_p_node_coalescing.sbatch
 ```
@@ -682,7 +683,7 @@ MAX_REQUESTS=512 \
 QPS_LIST="0.5 1 2 4" \
 UPDATE_INTERVAL_LIST="0.5 0.2 0.01" \
 NUM_REPEATS=3 BASE_RANDOM_SEED=2026 \
-MAX_CONCURRENCY=8 APPEND_CHUNK_INTERVAL=0.5 \
+MAX_CONCURRENCY=32 APPEND_CHUNK_INTERVAL=0.5 \
 SOURCE_FINISH_DELAY=0 WARMUP_REQUESTS=8 \
 sbatch research/scripts/replay/update_coalescing/run_policy_sweep.sbatch
 ```
@@ -693,7 +694,7 @@ sbatch research/scripts/replay/update_coalescing/run_policy_sweep.sbatch
 COALESCING_PROFILE=quiet-debounce \
 SOFT_WINDOW_MS=20 HARD_DEADLINE_MS=80 \
 MODEL_PATH="${MODEL_PATH}" SERVED_MODEL_NAME="${SERVED_MODEL_NAME}" \
-GPU_MEMORY_UTILIZATION=0.6 MAX_MODEL_LEN=4096 MAX_NUM_SEQS=16 \
+GPU_MEMORY_UTILIZATION=0.6 MAX_MODEL_LEN=4096 MAX_NUM_SEQS=64 \
 sbatch --nodelist="${P_NODE}" \
   research/scripts/replay/update_coalescing/start_p_node_coalescing.sbatch
 ```
@@ -709,21 +710,21 @@ MAX_REQUESTS=512 \
 QPS_LIST="0.5 1 2 4" \
 UPDATE_INTERVAL_LIST="0.5 0.2 0.01" \
 NUM_REPEATS=3 BASE_RANDOM_SEED=2026 \
-MAX_CONCURRENCY=8 APPEND_CHUNK_INTERVAL=0.5 \
+MAX_CONCURRENCY=32 APPEND_CHUNK_INTERVAL=0.5 \
 SOURCE_FINISH_DELAY=0 WARMUP_REQUESTS=8 \
 sbatch research/scripts/replay/update_coalescing/run_policy_sweep.sbatch
 ```
 
-#### `adaptive`：当前推荐的自适应实验
+#### `load-aware`：执行积压场景的负载感知实验
 
 下面是成对的 P 启动与 replay 命令；不传任何时间窗口。
 
 ```shell
-COALESCING_PROFILE=adaptive \
-ADAPTIVE_TOKEN_PRESSURE_THRESHOLD=1.0 \
-ADAPTIVE_SLOT_PRESSURE_THRESHOLD=1.0 \
+COALESCING_PROFILE=load-aware \
+LOAD_AWARE_TOKEN_PRESSURE_THRESHOLD=1.0 \
+LOAD_AWARE_SLOT_PRESSURE_THRESHOLD=1.0 \
 MODEL_PATH="${MODEL_PATH}" SERVED_MODEL_NAME="${SERVED_MODEL_NAME}" \
-GPU_MEMORY_UTILIZATION=0.6 MAX_MODEL_LEN=4096 MAX_NUM_SEQS=16 \
+GPU_MEMORY_UTILIZATION=0.6 MAX_MODEL_LEN=4096 MAX_NUM_SEQS=64 \
 sbatch --nodelist="${P_NODE}" \
   research/scripts/replay/update_coalescing/start_p_node_coalescing.sbatch
 ```
@@ -732,15 +733,15 @@ P ready、proxy 指向该 P 后，提交相同配置的 sweep：
 
 ```shell
 PROXY_URL="${PROXY_URL}" \
-COALESCING_PROFILE=adaptive \
-ADAPTIVE_TOKEN_PRESSURE_THRESHOLD=1.0 \
-ADAPTIVE_SLOT_PRESSURE_THRESHOLD=1.0 \
+COALESCING_PROFILE=load-aware \
+LOAD_AWARE_TOKEN_PRESSURE_THRESHOLD=1.0 \
+LOAD_AWARE_SLOT_PRESSURE_THRESHOLD=1.0 \
 MODEL="${SERVED_MODEL_NAME}" \
 MAX_REQUESTS=512 \
 QPS_LIST="0.5 1 2 4" \
 UPDATE_INTERVAL_LIST="0.5 0.2 0.01" \
 NUM_REPEATS=3 BASE_RANDOM_SEED=2026 \
-MAX_CONCURRENCY=8 APPEND_CHUNK_INTERVAL=0.5 \
+MAX_CONCURRENCY=32 APPEND_CHUNK_INTERVAL=0.5 \
 SOURCE_FINISH_DELAY=0 WARMUP_REQUESTS=8 \
 sbatch research/scripts/replay/update_coalescing/run_policy_sweep.sbatch
 ```
@@ -754,7 +755,7 @@ sbatch research/scripts/replay/update_coalescing/run_policy_sweep.sbatch
 ```shell
 COALESCING_PROFILE=full-merge \
 MODEL_PATH="${MODEL_PATH}" SERVED_MODEL_NAME="${SERVED_MODEL_NAME}" \
-GPU_MEMORY_UTILIZATION=0.6 MAX_MODEL_LEN=4096 MAX_NUM_SEQS=16 \
+GPU_MEMORY_UTILIZATION=0.6 MAX_MODEL_LEN=4096 MAX_NUM_SEQS=64 \
 sbatch --nodelist="${P_NODE}" \
   research/scripts/replay/update_coalescing/start_p_node_coalescing.sbatch
 ```
@@ -769,7 +770,7 @@ MAX_REQUESTS=512 \
 QPS_LIST="0.5 1 2 4" \
 UPDATE_INTERVAL_LIST="0.5 0.2 0.01" \
 NUM_REPEATS=3 BASE_RANDOM_SEED=2026 \
-MAX_CONCURRENCY=8 APPEND_CHUNK_INTERVAL=0.5 \
+MAX_CONCURRENCY=32 APPEND_CHUNK_INTERVAL=0.5 \
 SOURCE_FINISH_DELAY=0 WARMUP_REQUESTS=8 \
 sbatch research/scripts/replay/update_coalescing/run_policy_sweep.sbatch
 ```
@@ -780,7 +781,7 @@ sbatch research/scripts/replay/update_coalescing/run_policy_sweep.sbatch
 COALESCING_PROFILE=custom \
 PROMPT_STREAM_UPDATE_COALESCING_CONFIG='{"update_policy":"fixed_window","soft_window_ms":10,"hard_deadline_ms":40}' \
 MODEL_PATH="${MODEL_PATH}" SERVED_MODEL_NAME="${SERVED_MODEL_NAME}" \
-GPU_MEMORY_UTILIZATION=0.6 MAX_MODEL_LEN=4096 MAX_NUM_SEQS=16 \
+GPU_MEMORY_UTILIZATION=0.6 MAX_MODEL_LEN=4096 MAX_NUM_SEQS=64 \
 sbatch --nodelist="${P_NODE}" \
   research/scripts/replay/update_coalescing/start_p_node_coalescing.sbatch
 ```
@@ -797,7 +798,7 @@ MAX_REQUESTS=512 \
 QPS_LIST="0.5 1 2 4" \
 UPDATE_INTERVAL_LIST="0.5 0.2 0.01" \
 NUM_REPEATS=3 BASE_RANDOM_SEED=2026 \
-MAX_CONCURRENCY=8 APPEND_CHUNK_INTERVAL=0.5 \
+MAX_CONCURRENCY=32 APPEND_CHUNK_INTERVAL=0.5 \
 SOURCE_FINISH_DELAY=0 WARMUP_REQUESTS=8 \
 sbatch research/scripts/replay/update_coalescing/run_policy_sweep.sbatch
 ```
@@ -861,7 +862,7 @@ MODEL=qwen2.5-3b MAX_REQUESTS=512 \
 QPS_LIST="0.5 1 2 4" \
 UPDATE_INTERVAL_LIST="0.5 0.2 0.01" \
 NUM_REPEATS=3 BASE_RANDOM_SEED=2026 \
-MAX_CONCURRENCY=8 APPEND_CHUNK_INTERVAL=0.5 \
+MAX_CONCURRENCY=32 APPEND_CHUNK_INTERVAL=0.5 \
 SOURCE_FINISH_DELAY=0 WARMUP_REQUESTS=8 \
 sbatch research/scripts/replay/update_coalescing/run_policy_sweep.sbatch
 ```
@@ -895,7 +896,7 @@ scancel "${P_JOB_ID}"
 | `UPDATE_INTERVAL_LIST` | `0.2 0.01` | Update source 内事件间隔，单位秒。 |
 | `NUM_REPEATS` | `3` | 每个 QPS/interval 点的重复次数。 |
 | `BASE_RANDOM_SEED` | `2026` | 第一次 Poisson seed；后续依次加 1。 |
-| `MAX_CONCURRENCY` | `8` | 客户端同时在途的请求上限。 |
+| `MAX_CONCURRENCY` | `32` | 客户端同时在途的请求上限。 |
 | `APPEND_INITIAL_DELAY` | `0` | Append 首事件延迟。 |
 | `UPDATE_INITIAL_DELAY` | `0` | Update 首事件延迟。 |
 | `APPEND_CHUNK_INTERVAL` | `0.5` | Append source 内 chunk 间隔。 |
@@ -970,7 +971,7 @@ trade-off。若要同时比较不同 Update interval 和 QPS 下的策略表现�
 可靠性阈值。策略矩阵要求输入中只包含一个 `workload_id`；若汇总结果含有多个
 workload，必须通过 `--workload-id <WORKLOAD_ID>` 选择一个。
 
-同一 adaptive profile 的不同压力配置会按完整 JSON 独立汇总；trade-off 图例会显示
+同一 load-aware profile 的不同压力配置会按完整 JSON 独立汇总；trade-off 图例会显示
 `tokens=...` 与 `slots=...`。策略矩阵一个 profile 在同一 `(interval, QPS)` 单元格
 只允许一个配置，因此先选定一组压力阈值，或把不同敏感性实验写入独立结果根目录后分别汇总。
 已有历史结果不改写；分析时核对代码版本和完整配置，不能只改目录名来充当新策略结果。
@@ -992,8 +993,8 @@ load 不会互相计算支配关系。`disabled` 的 eager/saved 字段为空，
 1. 用 `MAX_REQUESTS=64`、QPS `1`、Update interval `0.01` 验证每个 profile。
 2. 用 QPS `1`、Update interval `0.2 0.01`、每点 3 次进行策略初筛。
 3. 对 `fixed-window` 和 `quiet-debounce` 筛选窗口，每个窗口重启一次 P。
-4. 对 adaptive 做少量 token / slot 压力阈值敏感性实验。
-5. 选出 `disabled`、最佳 fixed/debounce、adaptive 和 `full-merge`，运行
+4. 对 `load-aware` 做少量 token / slot 压力阈值敏感性实验。
+5. 选出 `disabled`、最佳 fixed/debounce、`load-aware` 和 `full-merge`，运行
    `QPS_LIST="0.5 1 2 4"` 的正式负载实验。
 6. 汇总结果，检查成功率后绘制四联图。
 

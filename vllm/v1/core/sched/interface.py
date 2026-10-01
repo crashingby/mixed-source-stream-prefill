@@ -195,7 +195,7 @@ class SchedulerInterface(ABC):
         return None
 
     def flush_due_update_coalescing(self, now: float | None = None) -> int:
-        """放行到期窗口，并按执行进度重新评估 adaptive 候选。
+        """放行到期窗口，并按执行进度重新评估 load_aware 候选。
 
         不支持合并的 scheduler 使用 no-op 默认实现，确保 EngineCore 的
         可选唤醒 hook 不会改变普通请求行为。

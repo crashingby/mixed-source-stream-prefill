@@ -62,9 +62,9 @@ class ConfigurationPoint:
     mean_saved_tokens: float | None
     mean_invalidated_tokens: float | None
     token_saving_ratio: float | None
-    # 压力参数只影响 adaptive；旧结果缺少字段时仍可按原配置绘图。
-    adaptive_token_pressure_threshold: float | None = None
-    adaptive_slot_pressure_threshold: float | None = None
+    # 压力参数只影响 load_aware；旧结果缺少字段时仍可按原配置绘图。
+    load_aware_token_pressure_threshold: float | None = None
+    load_aware_slot_pressure_threshold: float | None = None
 
     @property
     def series_key(self) -> tuple[str, float | None, str, str]:
@@ -289,13 +289,13 @@ def _point_from_row(
             row.get("hard_deadline_ms"),
             context=f"{context_prefix}:hard_deadline_ms",
         ),
-        adaptive_token_pressure_threshold=_optional_float(
-            row.get("adaptive_token_pressure_threshold"),
-            context=f"{context_prefix}:adaptive_token_pressure_threshold",
+        load_aware_token_pressure_threshold=_optional_float(
+            row.get("load_aware_token_pressure_threshold"),
+            context=f"{context_prefix}:load_aware_token_pressure_threshold",
         ),
-        adaptive_slot_pressure_threshold=_optional_float(
-            row.get("adaptive_slot_pressure_threshold"),
-            context=f"{context_prefix}:adaptive_slot_pressure_threshold",
+        load_aware_slot_pressure_threshold=_optional_float(
+            row.get("load_aware_slot_pressure_threshold"),
+            context=f"{context_prefix}:load_aware_slot_pressure_threshold",
         ),
         num_requests=_required_int(
             row.get("num_requests"),
@@ -424,10 +424,10 @@ def _format_interval(interval_s: float | None) -> str:
 def _format_config_suffix(point: ConfigurationPoint) -> str:
     """在 profile 标签不唯一时生成简短的策略参数后缀。"""
     fields = [point.update_policy]
-    if point.update_policy == "adaptive":
+    if point.update_policy == "load_aware":
         # 新策略不使用 window/deadline，避免把配置默认值画成实际计时规则。
-        token_threshold = point.adaptive_token_pressure_threshold
-        slot_threshold = point.adaptive_slot_pressure_threshold
+        token_threshold = point.load_aware_token_pressure_threshold
+        slot_threshold = point.load_aware_slot_pressure_threshold
         if token_threshold is not None:
             fields.append(f"tokens={token_threshold:g}")
         if slot_threshold is not None:

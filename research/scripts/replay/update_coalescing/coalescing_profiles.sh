@@ -30,11 +30,11 @@ build_coalescing_config() {
     quiet-debounce)
       echo "{\"update_policy\":\"quiet_debounce\",\"soft_window_ms\":${soft_window_ms},\"hard_deadline_ms\":${hard_deadline_ms},\"ttft_deadline_ms\":${ttft_deadline_ms}}"
       ;;
-    adaptive)
+    load-aware)
       # 执行背压策略没有时间窗口，只使用两个资源压力阈值。
-      local token_pressure="${ADAPTIVE_TOKEN_PRESSURE_THRESHOLD:-1.0}"
-      local slot_pressure="${ADAPTIVE_SLOT_PRESSURE_THRESHOLD:-1.0}"
-      echo "{\"update_policy\":\"adaptive\",\"adaptive_token_pressure_threshold\":${token_pressure},\"adaptive_slot_pressure_threshold\":${slot_pressure}}"
+      local token_pressure="${LOAD_AWARE_TOKEN_PRESSURE_THRESHOLD:-1.0}"
+      local slot_pressure="${LOAD_AWARE_SLOT_PRESSURE_THRESHOLD:-1.0}"
+      echo "{\"update_policy\":\"load_aware\",\"load_aware_token_pressure_threshold\":${token_pressure},\"load_aware_slot_pressure_threshold\":${slot_pressure}}"
       ;;
     full-merge)
       echo "{\"update_policy\":\"full_merge\"}"

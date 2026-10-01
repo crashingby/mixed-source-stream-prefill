@@ -838,7 +838,7 @@ def parse_args(mode: ReplayMode) -> argparse.Namespace:
     parser.add_argument(
         "--max-concurrency",
         type=int,
-        default=1,
+        default=32,  # 与批量回放 sbatch 统一默认在途请求上限。
         help="Maximum in-flight logical requests within one replay mode.",
     )
     if mode in STREAM_TIMING_MODES:

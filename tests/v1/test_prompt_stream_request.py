@@ -662,7 +662,7 @@ def test_coalescing_config_rejects_removed_append_gate() -> None:
 
 @pytest.mark.parametrize(
     "policy",
-    ["immediate", "fixed_window", "quiet_debounce", "adaptive"],
+    ["immediate", "fixed_window", "quiet_debounce", "load_aware"],
 )
 def test_coalescing_policy_flushes_before_append_source_finishes(policy: str) -> None:
     """各策略正常满足放行条件时均无需等待 Append 结束。"""

@@ -184,7 +184,7 @@ chunk，并通过 `--max-anns-document-tokens` 和
   --qps 1.0 \
   --arrival-process poisson \
   --random-seed 2026 \
-  --max-concurrency 8 \
+  --max-concurrency 32 \
   --append-initial-delay 0.0 \
   --update-initial-delay 0.0 \
   --append-chunk-interval 0.05 \
@@ -210,7 +210,7 @@ chunk，并通过 `--max-anns-document-tokens` 和
   --qps 1.0 \
   --arrival-process poisson \
   --random-seed 2026 \
-  --max-concurrency 8 \
+  --max-concurrency 32 \
   --append-initial-delay 0.0 \
   --update-initial-delay 0.0 \
   --append-chunk-interval 0.05 \
@@ -235,7 +235,7 @@ chunk，并通过 `--max-anns-document-tokens` 和
   --qps 1.0 \
   --arrival-process poisson \
   --random-seed 2026 \
-  --max-concurrency 8 \
+  --max-concurrency 32 \
   --max-tokens 64 \
   --temperature 0 \
   --ttft-only \
@@ -260,7 +260,7 @@ for qps in 0.5 1 2 4; do
     --qps "${qps}" \
     --arrival-process poisson \
     --random-seed 2026 \
-    --max-concurrency 8 \
+    --max-concurrency 32 \
     --max-tokens 64 \
     --temperature 0 \
     --ttft-only \
@@ -322,7 +322,7 @@ MAX_REQUESTS=512 \
 QPS_LIST="0.5 1 2 4" \
 ARRIVAL_PROCESS=poisson \
 RANDOM_SEED=2026 \
-MAX_CONCURRENCY=8 \
+MAX_CONCURRENCY=32 \
 APPEND_INITIAL_DELAY=0.0 \
 UPDATE_INITIAL_DELAY=0.0 \
 APPEND_CHUNK_INTERVAL=0.5 \
@@ -346,7 +346,7 @@ MODEL_PATH=<MODEL_PATH> \
 SERVED_MODEL_NAME=<SERVED_MODEL_NAME> \
 GPU_MEMORY_UTILIZATION=<GPU_UTIL> \
 MAX_MODEL_LEN=4096 \
-MAX_NUM_SEQS=16 \
+MAX_NUM_SEQS=64 \
 sbatch --nodelist=<P_HOST> research/scripts/server/start_p_node.sbatch
 ```
 
@@ -362,7 +362,7 @@ MAX_REQUESTS=512 \
 QPS_LIST="0.5 1 2 4" \
 ARRIVAL_PROCESS=poisson \
 RANDOM_SEED=2026 \
-MAX_CONCURRENCY=8 \
+MAX_CONCURRENCY=32 \
 APPEND_INITIAL_DELAY=0.0 \
 UPDATE_INITIAL_DELAY=0.0 \
 APPEND_CHUNK_INTERVAL=0.5 \
@@ -403,7 +403,7 @@ MAX_REQUESTS=512 \
 QPS_LIST="0.5 1 2 4" \
 ARRIVAL_PROCESS=poisson \
 RANDOM_SEED=2026 \
-MAX_CONCURRENCY=8 \
+MAX_CONCURRENCY=32 \
 APPEND_INITIAL_DELAY=0.0 \
 UPDATE_INITIAL_DELAY=0.0 \
 APPEND_CHUNK_INTERVAL=1 \
@@ -466,7 +466,7 @@ done
 | `--tokenizer-model` | 必填 | 本地模型/tokenizer 目录；必须与 `--model` 对应的 P 模型使用同一 chat template。 |
 | `--qps` | `1.0` | 逻辑请求启动速率；`0` 表示闭环串行。 |
 | `--arrival-process` | `fixed` | 使用固定间隔或 `poisson` 泊松到达。 |
-| `--max-concurrency` | `1` | 同时在飞的逻辑请求上限。 |
+| `--max-concurrency` | `32` | 同时在飞的逻辑请求上限。 |
 | `--max-tokens` | 不覆盖 | 覆盖数据中的最大生成 token 数。 |
 | `--temperature` | 不覆盖 | 覆盖数据中的采样温度。 |
 | `--seed` | 无 | 发送给 vLLM 的采样 seed。 |

@@ -86,8 +86,8 @@ worker row removal 不等于释放 KV。它只移除暂时不需要参与 batch 
 | 有效 Append delta | 新的 `PREFIX_APPEND` work。 | 唤醒进入 `waiting`。 |
 | 关闭合并时的有效 Update | 按原即时路径创建 Update work。 | 唤醒进入 `waiting`。 |
 | `immediate` Update | controller 立即放行的 Update work。 | 唤醒进入 `waiting`。 |
-| 尚未达到策略条件的 Update | 只修改合并窗口，尚无 work。 | 继续停放；定时策略维护 deadline，adaptive 登记执行反馈候选。 |
-| adaptive 背压解除且 token / slot 压力都低于阈值 | 冻结并放行最新 Update work。 | 经 waiting 重新准入，不需要新事件或定时器。 |
+| 尚未达到策略条件的 Update | 只修改合并窗口，尚无 work。 | 继续停放；定时策略维护 deadline，load_aware 登记执行反馈候选。 |
+| load_aware 背压解除且 token / slot 压力都低于阈值 | 冻结并放行最新 Update work。 | 经 waiting 重新准入，不需要新事件或定时器。 |
 | 有界窗口 deadline 到达 | 冻结并放行 Update work。 | 唤醒进入 `waiting`。 |
 | Update source-finished 或 `PROMPT_FINISHED` | 按既有规则放行最后窗口，并在依赖满足时准备 Question。 | 有可执行工作则唤醒。 |
 | 重复事件、无变化快照或仅记录来源结束 | 可能不产生 work。 | 不因收到 HTTP 请求本身而唤醒。 |
@@ -152,7 +152,7 @@ EngineCore 区分“逻辑上还有请求”和“现在有事可做”：
   或其他控制消息。
 - 开启有界合并时，controller 的最小堆提供最近 deadline；输入队列最多阻塞到该时刻，随后
   同一主线程放行 work。`full_merge` 没有时间 deadline，等待来源或请求结束事件。
-- `adaptive` 不设置时间 deadline。Scheduler 在事件、回包与调度机会变化时重新判断，
+- `load_aware` 不设置时间 deadline。Scheduler 在事件、回包与调度机会变化时重新判断，
   EngineCore 在阻塞输入前也检查候选，避免纯 dormant 时永远等不到下一条事件。
   已放行 Update 的 pending/active 状态与 `num_update_inflight_steps` 共同构成执行背压。
 - DP 协调同样区分逻辑未完成与当前 runnable work；纯 dormant 请求不会单独维持计算波次。
@@ -165,7 +165,7 @@ EngineCore 区分“逻辑上还有请求”和“现在有事可做”：
 `Waiting=0` 时，也可能存在仍持有 KV 的 dormant 请求；应结合
 `get_num_unfinished_requests()` / `get_request_counts()` 理解请求数量。
 
-controller 管理定时策略的 deadline，以及 adaptive 的候选集合和在途 token 需求，不拥有 dormant 集合。
+controller 管理定时策略的 deadline，以及 load_aware 的候选集合和在途 token 需求，不拥有 dormant 集合。
 `Scheduler._prompt_stream_dormant_reasons` 与 `_prompt_stream_inflight_steps` 为所有 PromptStream
 服务。控制状态由 EngineCore/Scheduler 的既有线程顺序修改，不增加定时器线程或队列锁。
 

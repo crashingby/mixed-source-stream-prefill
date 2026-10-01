@@ -37,9 +37,16 @@
 | `<PROXY_PORT>` | proxy 端口 | `8000` |
 | `<GPU_UTIL>` | vLLM 可占用 GPU 显存比例 | `0.6` |
 | `<MAX_MODEL_LEN>` | vLLM 最大上下文长度 | `4096` |
-| `<MAX_NUM_SEQS>` | vLLM 最大并发序列数 | `16` |
+| `<MAX_NUM_SEQS>` | vLLM 最大并发序列数 | `64` |
+| `<MAX_CONCURRENCY>` | 性能回放客户端的最大在途逻辑请求数 | `32` |
 
 注意：前端测试和 replay 脚本里的 `--model` 应该填写 `<SERVED_MODEL_NAME>`，不是 `<MODEL_PATH>`。`<MODEL_PATH>` 只用于启动 vLLM server 或提交 Slurm job。
+
+服务启动脚本默认使用 `MAX_NUM_SEQS=64`，性能回放的 Python CLI 与批量
+回放 sbatch 默认使用 `MAX_CONCURRENCY=32`。两个参数都可显式覆盖；
+`QPS=0` 的闭环串行回放、单请求联调和质量评测仍按原有顺序执行。
+提高上限后，应观察实际请求速率、KV 使用量和抢占次数；比较实验时保持
+这两个参数一致。
 
 ## 当前环境示例
 
@@ -52,5 +59,6 @@ export MODEL_PATH=/workplace/home/huangxinying/Models/Llama-3.1-8B-Instruct
 export SERVED_MODEL_NAME=llama-3.1-8b-instruct
 export GPU_MEMORY_UTILIZATION=0.6
 export MAX_MODEL_LEN=4096
-export MAX_NUM_SEQS=16
+export MAX_NUM_SEQS=64
+export MAX_CONCURRENCY=32
 ```

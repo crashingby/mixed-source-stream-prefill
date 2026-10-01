@@ -1,8 +1,8 @@
-# Update 合并：执行背压自适应与有界时间窗口
+# Update 合并：负载感知放行与有界时间窗口
 
 > **研究定位**：混合来源流式 Prefill 的第二个创新点。
 > **范围**：一个逻辑请求至多包含一个单调 Append 源和一个全量快照语义的 Update 源；暂不处理多 Append / Update 源、跨源 KV 排布与跨源公平性。
-> **状态**：配置、独立策略类、Request、Scheduler、EngineCore 与 schema v2 统计已接入。当前 `adaptive` 使用执行背压与计算压力。新策略的 GPU 端到端性能尚需用户重新实验验证。
+> **状态**：配置、独立策略类、Request、Scheduler、EngineCore 与 schema v2 统计已接入。当前 `load_aware` 使用执行背压与计算压力。新策略的 GPU 端到端性能尚需用户重新实验验证。
 
 ## 当前控制面：只按 Update 合并策略放行
 
@@ -21,28 +21,31 @@ Append 不要求已完成的 Update 自动回滚。**work 准入与 work 可执�
 | `immediate` | 每条有效 Update 都立即 flush。 |
 | `fixed_window` | 从窗口第一条 Update 起等待固定 soft window。 |
 | `quiet_debounce` | 每条有效 Update 刷新 soft deadline，等待一段静默时间。 |
-| `adaptive` | 本请求无未完成 Update，且全局 token 与序列压力都有余量时放行；没有时间 deadline。 |
+| `load_aware` | 本请求无未完成 Update，且全局 token 与序列压力都有余量时放行；没有时间 deadline。 |
 | `full_merge` | 等到 Update source 结束或 `PROMPT_FINISHED` 才 flush 最终快照。 |
 
 两种有界等待策略 `fixed_window`、`quiet_debounce` 继续受 hard deadline 和
 可选 TTFT deadline 约束。`full_merge` 只等待 Update 的终止条件；Update 先结束时无需等待 Append
 结束。它是合并程度的对照，不保证已计算 Update 最终看到后来到达的全部 Append。
 
-`adaptive` 不使用 soft / hard / TTFT deadline。Update source finished / Question 是
+`load_aware` 不使用 soft / hard / TTFT deadline。Update source finished / Question 是
 强制收尾出口；正常阶段根据执行完成和计算余量放行。已有时间策略、FIFO、LCP 与分段 KV
 保持各自语义。所有策略都不设置 Append 来源完成门槛。
 
-## 当前主策略：执行背压自适应
+## 负载感知策略：执行背压与计算余量
 
 ### 优化目标与边界
+
+负载感知是一种面向执行积压场景的启发式放行策略，效果取决于事件频率、快照成本
+和调度负载。实验应与其他策略比较其适用范围。
 
 目标是减少中间 Update 对队列的占用，同时利用 Question 到达前的计算机会。固定毫秒
 窗口不能直接控制这两者：连续 deadline 可能提前承诺一长串旧 work，完全等到结束又可能
 把全部最终 Update 计算推迟到 Question 后。
 
-`adaptive` 依据执行状态与可执行需求决策，不假设 ANNS 快照必然逐渐稳定。重排序的检索
+`load_aware` 依据执行状态与可执行需求决策，不假设 ANNS 快照必然逐渐稳定。重排序的检索
 结果、语音识别修订和其他完整快照来源可使用相同规则。KV 使用率、抢占次数、Question
-来源到达率预测均不参与当前 adaptive 决策。
+来源到达率预测均不参与当前 load_aware 决策。
 
 ### 放行规则
 
@@ -54,7 +57,7 @@ Append 不要求已完成的 Update 自动回滚。**work 准入与 work 可执�
 | Update source finished 或合法 `PROMPT_FINISHED` | 强制放行最后快照，Question 排在最后来源 work 后面。 |
 
 普通阶段通常最多有一个未完成 Update；终止事件可以额外放行最终版本。已放行 work 不再
-覆盖、取消或插队。`adaptive` **没有固定等待上限**：`first_pending_time` 可用于观测，
+覆盖、取消或插队。`load_aware` **没有固定等待上限**：`first_pending_time` 可用于观测，
 不会生成 soft / hard / TTFT deadline。持续拥堵时可能一直合并到终止事件，因此不承诺
 毫秒级 admission 或最优 TTFT，需要分别检验低负载提前计算与高负载少算之间的取舍。
 
@@ -93,8 +96,8 @@ active work 可能已经清空，GPU 却还没有回包。每批 `SchedulerOutpu
 ```python
 should_flush = (
     not has_outstanding_update
-    and token_pressure < config.adaptive_token_pressure_threshold
-    and slot_pressure < config.adaptive_slot_pressure_threshold
+    and token_pressure < config.load_aware_token_pressure_threshold
+    and slot_pressure < config.load_aware_slot_pressure_threshold
 )
 ```
 
@@ -107,7 +110,7 @@ source finished，后续 Append 仍可到达并与 Update 竞争。
 普通请求和流式请求都计入；即使已 abort 或移出队列，只要 GPU 尚未回包，仍保留其在途压力。
 候选自身尚未放行的 work 不预先加入压力，否则一个大于单轮 budget 的快照可能永远无法准入。
 
-Controller 的 `adaptive_request_ids` 是有序候选索引，只保存有未放行窗口的请求。
+Controller 的 `load_aware_request_ids` 是有序候选索引，只保存有未放行窗口的请求。
 本请求有未完成 Update 且非终止事件时直接 hold，无需扫描全局。批量重评期间，失败候选
 复用同一份压力上下文；只有成功放行后才刷新压力，使后续候选看到新增 work。最后一次可能让压力越过
 阈值。这是**软准入阈值**，真正 GPU 调度仍严格受 token budget、序列名额和 KV 分配约束。
@@ -122,7 +125,7 @@ Scheduler 在事件处理、batch / 调度入口和回包后重新评估候选�
 回到 waiting，按普通规则进入 running。
 
 EngineCore 无限阻塞等输入之前也要检查候选。若只有合并快照而没有其他可执行 work，压力
-已为零，应放行符合依赖的候选继续计算。不能因为 adaptive 没有 deadline 就永久等下一条
+已为零，应放行符合依赖的候选继续计算。不能因为 load_aware 没有 deadline 就永久等下一条
 REST 消息；也不需要新建定时器线程或每毫秒空轮询。
 
 ### 策略类与职责边界
@@ -137,7 +140,7 @@ REST 消息；也不需要新建定时器线程或每毫秒空轮询。
 | Scheduler / controller | 计算压力、跟踪在途步骤、重评候选、维护 deadline 及 dormant / waiting。 |
 | EngineCore | 驱动调度、消费输出、在空闲阻塞前兑现可运行机会。 |
 
-时间策略继续复用最小堆；adaptive 与 full-merge 不登记时间 deadline。新增策略无需复制
+时间策略继续复用最小堆；load_aware 与 full-merge 不登记时间 deadline。新增策略无需复制
 REST、source version、KV 分配或 Question barrier，也无需新增客户端协议字段。
 
 ## 已放行 work 的不可变边界
@@ -257,7 +260,7 @@ class UpdateCoalescingState:
     # 已 flush 的逻辑执行链尾部；新 work 以它作为 execution base。
     last_admitted_token_ids: tuple[int, ...] = ()
 
-    # 时间策略从第一条 Update 起计时；adaptive 不创建下列 deadline。
+    # 时间策略从第一条 Update 起计时；load_aware 不创建下列 deadline。
     first_pending_time: float | None = None
     last_update_time: float | None = None
     soft_deadline: float | None = None
@@ -380,7 +383,7 @@ $$
 当新事件、执行进度或调度压力变化、适用的时间 deadline 到期，以及 source-finished /
 `PROMPT_FINISHED` 到达时，检查当前 policy 的 flush 条件：
 
-- 条件尚未满足：保留 $U_p$；adaptive 等执行进度，时间策略等 deadline，full-merge 等终止事件。
+- 条件尚未满足：保留 $U_p$；load_aware 等执行进度，时间策略等 deadline，full-merge 等终止事件。
 - 条件已经满足：以 $U_e$ 为前驱、$U_p$ 为目标立即创建冻结 work，推进 $U_e$ 并清空窗口。
 - Append source-finished 仅更新来源封闭状态，不会重新计时，也不为 Update 增加额外等待。
 
@@ -411,7 +414,7 @@ $U_e\leftarrow U_p$，清空 $U_p$ 与当前窗口状态。
 | `immediate` | 更新 $U_p$。 | 每次有效到达。 |
 | `fixed_window` | 覆盖 $U_p$，不刷新 soft deadline。 | 窗口首事件加 `soft_window_ms`。 |
 | `quiet_debounce` | 覆盖 $U_p$，刷新 `last_update_time` 和 soft deadline。 | 最近事件后静默 `soft_window_ms`。 |
-| `adaptive` | 覆盖 $U_p$，等待 Scheduler 的最新上下文。 | 无未完成 Update 且 token / slot 都有余量；终止事件强制收尾。 |
+| `load_aware` | 覆盖 $U_p$，等待 Scheduler 的最新上下文。 | 无未完成 Update 且 token / slot 都有余量；终止事件强制收尾。 |
 | `full_merge` | 始终覆盖 $U_p$。 | Update source finished 或合法 `PROMPT_FINISHED`。 |
 
 `quiet_debounce` 每次有效 Update 都刷新 `last_update_time` 和 soft deadline，但从不刷新
@@ -421,7 +424,7 @@ $U_e\leftarrow U_p$，清空 $U_p$ 与当前窗口状态。
 
 `fixed_window` 与 `quiet_debounce` 的 hard deadline 固定锚定窗口第一条 Update；
 soft deadline 分别采用固定窗口或最近有效事件的静默窗口规则。`immediate` 与
-`adaptive` 没有 timer；`full_merge` 只在 Update source finished 或合法 `PROMPT_FINISHED` 时 flush。
+`load_aware` 没有 timer；`full_merge` 只在 Update source finished 或合法 `PROMPT_FINISHED` 时 flush。
 
 到达有效 deadline 时直接创建 work。**有界的是合并窗口的等待，不是排队到 GPU 执行或完成的
 时长**；FIFO、已冻结 Append epoch 和 token / KV 资源仍可能产生额外等待。
@@ -465,7 +468,7 @@ $$
 
 - **Append event**：照常单调追加并递增 `append_epoch`，不改写 $U_p$、窗口统计或 deadline。
 - **Append source finished**：验证前序 sequence、记录 `final_append_epoch` 和来源封闭状态。
-  该标记用于后续 Question barrier，不改变 Update 窗口起点或放行规则。adaptive 仍由
+  该标记用于后续 Question barrier，不改变 Update 窗口起点或放行规则。load_aware 仍由
   Scheduler 携带真实压力上下文重评，不能在 Request 中用默认空闲上下文绕过全局条件。
 - **Update source finished**：标记 source sealed，并立即 flush 尚未放行的最新快照；即使 Append
   尚未结束也创建 work，work 只依赖 admission 时已经接受的 Append epoch。
@@ -535,7 +538,7 @@ class PromptStreamUpdateCoalescingConfig:
         "immediate",
         "fixed_window",
         "quiet_debounce",
-        "adaptive",
+        "load_aware",
         "full_merge",
     ] = "fixed_window"
 
@@ -544,19 +547,19 @@ class PromptStreamUpdateCoalescingConfig:
     hard_deadline_ms: float = 80.0
     ttft_deadline_ms: float | None = None
 
-    # 仅 adaptive 使用；是归一化压力阈值，不是毫秒窗口。
-    adaptive_token_pressure_threshold: float = 1.0
-    adaptive_slot_pressure_threshold: float = 1.0
+    # 仅 load_aware 使用；是归一化压力阈值，不是毫秒窗口。
+    load_aware_token_pressure_threshold: float = 1.0
+    load_aware_slot_pressure_threshold: float = 1.0
 
 ~~~
 
 | 字段 | 取值 / 使用范围 | 含义 |
 | --- | --- | --- |
-| `update_policy` | `immediate`、`fixed_window`、`quiet_debounce`、`adaptive`、`full_merge` | 所有 Update 持续采用的窗口 / flush 规则。 |
+| `update_policy` | `immediate`、`fixed_window`、`quiet_debounce`、`load_aware`、`full_merge` | 所有 Update 持续采用的窗口 / flush 规则。 |
 | `soft_window_ms` | fixed、debounce | fixed window 长度、debounce 静默时长；单位 ms。 |
 | `hard_deadline_ms` | fixed、debounce | Update 窗口的最大等待，单位 ms；到期直接创建 work。 |
 | `ttft_deadline_ms` | fixed、debounce | 从 Request start 计的绝对放行 deadline；不保证 GPU 排队后的实际 TTFT。 |
-| `adaptive_token_pressure_threshold`、`adaptive_slot_pressure_threshold` | adaptive | 有限正数，默认均为 1.0；两类压力均低于阈值时普通放行。 |
+| `load_aware_token_pressure_threshold`、`load_aware_slot_pressure_threshold` | load_aware | 有限正数，默认均为 1.0；两类压力均低于阈值时普通放行。 |
 
 `soft_deadline`、`hard_deadline`、token / slot 压力、
 `append_epoch` 和来源封闭状态都是每个请求运行时计算出的状态，不放入 JSON。
@@ -581,7 +584,7 @@ vllm/v1/core/sched/update_coalescing.py
 
 vllm/v1/core/sched/scheduler.py
     config is not None 时创建 PromptStreamUpdateCoalescingController
-    adaptive 读取工作需求与在途状态；时间策略继续维护 deadline
+    load_aware 读取工作需求与在途状态；时间策略继续维护 deadline
 
 vllm/v1/request.py
     保存来源状态、单窗口、冻结 work、显式 QUESTION 与 Append epoch
@@ -607,11 +610,11 @@ vllm/v1/engine/core.py
 --prompt-stream-update-coalescing-config '{"update_policy":"full_merge"}'
 ~~~
 
-当前 adaptive 的配置只需策略名；显式阈值示例如下：
+当前 load_aware 的配置只需策略名；显式阈值示例如下：
 
 ```shell
 --prompt-stream-update-coalescing-config \
-  '{"update_policy":"adaptive","adaptive_token_pressure_threshold":1.0,"adaptive_slot_pressure_threshold":1.0}'
+  '{"update_policy":"load_aware","load_aware_token_pressure_threshold":1.0,"load_aware_slot_pressure_threshold":1.0}'
 ```
 
 参数未传时，`EngineArgs.prompt_stream_update_coalescing_config` 与
@@ -641,7 +644,7 @@ EngineCore 也统一使用 runnable 判定，避免关闭合并时空闲请求�
 使用仓库内 Slurm 脚本时，通过环境变量传入相同 JSON：
 
 ~~~shell
-PROMPT_STREAM_UPDATE_COALESCING_CONFIG='{"update_policy":"adaptive","adaptive_token_pressure_threshold":1.0,"adaptive_slot_pressure_threshold":1.0}' \
+PROMPT_STREAM_UPDATE_COALESCING_CONFIG='{"update_policy":"load_aware","load_aware_token_pressure_threshold":1.0,"load_aware_slot_pressure_threshold":1.0}' \
 MODEL_PATH=<MODEL_PATH> \
 SERVED_MODEL_NAME=<SERVED_MODEL_NAME> \
 sbatch --nodelist=<P_HOST> research/scripts/server/start_p_node.sbatch
@@ -707,7 +710,7 @@ work，当前不能 decode，且 worker 没有该请求的在途步骤。control
 | --- | --- | --- | --- |
 | `stream_input` | bootstrap 已完成，当前没有 Update 窗口或可运行 work。 | 否。 | 新 source event、finish 或 abort。 |
 | `update_deadline` | 有界窗口尚未到期。 | 是。 | 最近 deadline 或新输入。 |
-| `update_policy` | adaptive 等待执行机会，或 full-merge 等待终止事件。 | 否。 | 调度重评、source-finished、finish 或 abort。 |
+| `update_policy` | load_aware 等待执行机会，或 full-merge 等待终止事件。 | 否。 | 调度重评、source-finished、finish 或 abort。 |
 
 等待 Update 合并 **不等于**整个 Request 都 dormant：只要还有 PREFIX_APPEND work，request
 仍是 runnable，Append 会照常占用 scheduler。所有 work 耗尽后，请求可能只等外部输入，
@@ -760,10 +763,10 @@ def flush_due_update_coalescing(self, now: float | None = None) -> int: ...
 ~~~
 
 其中 `get_next_prompt_stream_deadline()` 返回最近的有效有界 Update deadline。
-`adaptive` 和 `full_merge` 均返回 `None`；adaptive 通过调度进度及空闲前重评继续推进。
+`load_aware` 和 `full_merge` 均返回 `None`；load_aware 通过调度进度及空闲前重评继续推进。
 
 `flush_due_update_coalescing()` 同时处理已经到期的有界 Update window，以及已有计算机会的
-adaptive 候选。它返回本次实际放行数；成功时冻结 work，并让因此可运行的 dormant 请求回到 waiting。
+load_aware 候选。它返回本次实际放行数；成功时冻结 work，并让因此可运行的 dormant 请求回到 waiting。
 Update source-finished 与 `PROMPT_FINISHED` 触发最终窗口 flush；Append work 的物理提交
 只解除 `required_append_epoch` 执行 barrier。
 
@@ -772,7 +775,7 @@ EngineCore 将共同停放与可选 deadline 分开处理：
 | 调用点 | `enabled=False` | `enabled=True` |
 | --- | --- | --- |
 | `has_work()` / `step()` / 无模型执行时的 sleep 判定 | 使用 `scheduler.has_runnable_engine_work()`，排除纯 dormant id。 | 使用同一 runnable 判定。 |
-| `_process_input_queue()` | 保持 `input_queue.get(block=block)`。 | 先重评 adaptive；仍没有 runnable work 时才按最近 deadline 设置阻塞 timeout。 |
+| `_process_input_queue()` | 保持 `input_queue.get(block=block)`。 | 先重评 load_aware；仍没有 runnable work 时才按最近 deadline 设置阻塞 timeout。 |
 | 输入处理后、调用 `step()` 前 | 不调用合并逻辑。 | 在 EngineCore 主线程调用 `flush_due_update_coalescing(time.monotonic())`。 |
 
 关闭时不应为了“统一接口”而每轮调用 no-op `flush`，也不应创建 timer thread。只有 controller
@@ -830,7 +833,7 @@ Scheduler.add_request
     → _apply_prompt_stream_request
     → [仅时间策略] 先兑现同一 monotonic 时刻之前已到期的旧窗口
     → Request.apply_prompt_stream_event，先覆盖本次最新快照
-    → [adaptive] 使用真实背压与负载 context 判断新快照
+    → [load_aware] 使用真实背压与负载 context 判断新快照
     → [其他已启用策略] 按策略条件 flush
     → 所有 PromptStream 执行 dormant reconcile
     → Scheduler.schedule
@@ -853,7 +856,7 @@ controller 时，PromptStreamSourceState、UpdateCoalescingState 与 deadline he
 ~~~
 
 - 所有尚未到期的有界 window 都可入堆；到期即 flush，清空该窗口的有效 deadline。
-  `adaptive` 和 `full_merge` 不创建时间 deadline。
+  `load_aware` 和 `full_merge` 不创建时间 deadline。
 - 每个新窗口和每次允许刷新的 soft deadline 刷新都递增 generation。
 - 堆不保存 token；快照始终归 Request 的 UpdateCoalescingState 所有。
 - 每条 PromptStream 事件应用前，先以同一 EngineCore monotonic 时刻兑现已经到期的旧窗口，
@@ -870,8 +873,8 @@ controller 时，PromptStreamSourceState、UpdateCoalescingState 与 deadline he
 等待尚未 flush 的 latest Update。这些请求不应持续留在 running 集合做空 GPU 调度。
 
 - 已有 active 或已放行 Append/Update work 不受影响，继续正常调度。
-- 若 adaptive 暂无执行机会，或 full-merge 等 source 终止事件，则进入无 deadline 的 dormant。
-  adaptive 在工作完成与空闲前主动重评，不依赖固定 timeout。
+- 若 load_aware 暂无执行机会，或 full-merge 等 source 终止事件，则进入无 deadline 的 dormant。
+  load_aware 在工作完成与空闲前主动重评，不依赖固定 timeout。
 - 若仅等待有界 deadline，则标为带 deadline 的 dormant；EngineCore 在最近
   deadline 到达时被唤醒，flush 后再把请求加入普通等待队列。
 - dormant 仍是**逻辑未完成请求**，计入 `get_num_unfinished_requests()`；
@@ -899,14 +902,14 @@ while self._handle_shutdown():
 ~~~
 
 原始循环把 `scheduler.has_requests()` 视为有工作；当前实现已经改用 runnable 判定，
-以排除纯 dormant 请求。先重评 adaptive 候选，仍没有 runnable work 且没有有效合并 deadline 时，
+以排除纯 dormant 请求。先重评 load_aware 候选，仍没有 runnable work 且没有有效合并 deadline 时，
 `_process_input_queue()` 执行 `input_queue.get(block=True)`，无限期阻塞，直到
 IO 线程从 REST/ZMQ 收到新的 ADD、ABORT 或其他控制消息并写入 `input_queue`。
 
 如果所有空闲情况都无限等输入，就无法处理**有界 Update 窗口**：一个 dormant 请求可能
 拥有 `latest_pending_token_ids`，却没有 active work 或已放行 work。没有新的 Update、
 `PROMPT_FINISHED` 或 abort 时，必须依靠 deadline timeout 自行 flush。当前实现已经加入
-这个唤醒机制；`full_merge` 继续等待终止事件。adaptive 也没有 timer，但最后一个竞争者
+这个唤醒机制；`full_merge` 继续等待终止事件。load_aware 也没有 timer，但最后一个竞争者
 完成、系统准备空闲时必须重评候选，不能遗漏可放行的最新快照。
 
 反过来，不能让这种 dormant 请求继续被当作普通 scheduler work。否则
@@ -917,17 +920,17 @@ IO 线程从 REST/ZMQ 收到新的 ADD、ABORT 或其他控制消息并写入 `i
 #### Scheduler 与 EngineCore 的职责边界
 
 Scheduler 独立拥有 dormant 集合与请求在途步骤计数；可选 controller 拥有 deadline
-最小堆，以及 adaptive 候选索引 `adaptive_request_ids` 与全局在途 token 的
+最小堆，以及 load_aware 候选索引 `load_aware_request_ids` 与全局在途 token 的
 `inflight_tokens`。Request 拥有策略和 Update 专用在途计数。
 当前实现通过 `has_prompt_stream_update_coalescer()`、
 `has_runnable_engine_work()` 以及下面的 deadline 查询、统一放行接口与 EngineCore 协作：
 
 ~~~python
 def get_next_prompt_stream_deadline(self) -> float | None:
-    """返回时间策略的最近有效 deadline；adaptive/full-merge 返回 None。"""
+    """返回时间策略的最近有效 deadline；load_aware/full-merge 返回 None。"""
 
 def flush_due_update_coalescing(self, now: float | None = None) -> int:
-    """处理到期窗口和 adaptive 候选，唤醒可运行请求并返回放行数。"""
+    """处理到期窗口和 load_aware 候选，唤醒可运行请求并返回放行数。"""
 ~~~
 
 - dormant 请求不应被当作可运行 GPU work。当前
@@ -945,8 +948,8 @@ def flush_due_update_coalescing(self, now: float | None = None) -> int:
 
 #### 主循环的目标顺序
 
-第一版不创建定时器线程。空闲阻塞前先重评 adaptive，再为时间策略把 queue wait
-设为“最多等待到最近 deadline”。下面展示时间路径，adaptive 重评还在空闲判定与回包后执行：
+第一版不创建定时器线程。空闲阻塞前先重评 load_aware，再为时间策略把 queue wait
+设为“最多等待到最近 deadline”。下面展示时间路径，load_aware 重评还在空闲判定与回包后执行：
 
 ~~~python
 while self._handle_shutdown():
@@ -954,7 +957,7 @@ while self._handle_shutdown():
     self._process_input_queue()
 
     if self.scheduler.has_prompt_stream_update_coalescer():
-        # 同一主线程检查到期窗口及 adaptive 候选，必要时唤醒 dormant。
+        # 同一主线程检查到期窗口及 load_aware 候选，必要时唤醒 dormant。
         self.scheduler.flush_due_update_coalescing(time.monotonic())
 
     # 只调度已经有实际 GPU work 的普通请求。
@@ -965,7 +968,7 @@ while self._handle_shutdown():
 
 ~~~python
 if self.scheduler.has_prompt_stream_update_coalescer():
-    # 输入队列阻塞前检查执行机会；adaptive 即使没有新事件也可以放行。
+    # 输入队列阻塞前检查执行机会；load_aware 即使没有新事件也可以放行。
     self.scheduler.flush_due_update_coalescing(time.monotonic())
     if self.has_work():
         return  # 回到 EngineCore 调度执行，不能继续阻塞等 REST 输入。
@@ -987,7 +990,7 @@ self._handle_client_request(*request)
 ~~~
 
 开启时，`queue.Empty` 返回主循环后，紧随其后的 `flush_due_update_coalescing()` 会把到期的
-Update 放行；adaptive 候选已重评、仍无 runnable work 且无有效 deadline 时，
+Update 放行；load_aware 候选已重评、仍无 runnable work 且无有效 deadline 时，
 `timeout=None`，才允许无限等待。关闭时不会出现
 这个 timeout 路径。因此“EngineCore 因 deadline 醒来”并不是新增一个线程或主动中断 GPU；它只是
 启用 controller 后，原有 EngineCore 主线程从带 timeout 的阻塞 `Queue.get()` 返回。
@@ -996,7 +999,7 @@ Update 放行；adaptive 候选已重评、仍无 runnable work 且无有效 dea
 
 下面的 deadline 先后规则仅适用于时间策略。应用每个 PromptStream 事件前，Scheduler
 先按当前 monotonic 时间兑现已经到期的旧窗口；处理完输入队列后，主循环再检查到期窗口与
-adaptive 候选。adaptive 在单个事件处理中先应用最新快照，再使用真实 context 判断，
+load_aware 候选。load_aware 在单个事件处理中先应用最新快照，再使用真实 context 判断，
 不会在新版本已经到达时先抢着放行旧版本。
 
 - 事件处理时刻仍早于 deadline，它可以刷新 soft deadline 并递增 generation；
@@ -1129,7 +1132,7 @@ preemption 使其物理前驱不存在时，允许清空受影响的 active / pe
 - **KV 截断安全**：event 到达、窗口合并和 deadline 到期不触碰 UPDATE KV；仅在 work active、
   Append dependency 与 FIFO 前驱满足后，才执行延后截断。
 - **时间策略的有界等待范围**：fixed/debounce 的 hard deadline 锚定窗口首事件；到期放行不能被后续事件推迟，但 GPU 排队
-  和恢复耗时不受窗口 deadline 保证。adaptive / full-merge 不承诺时间上限。
+  和恢复耗时不受窗口 deadline 保证。load_aware / full-merge 不承诺时间上限。
 - **Question barrier 完整**：Question 执行前来源已封闭、最终 Append epoch 已提交，窗口和
   active / pending 中不存在尚未完成的最终 Update 状态转换。
 - **单线程控制**：所有 source、window、deadline、work 与 KV 状态仅由 P 节点 EngineCore 主线程
@@ -1208,11 +1211,11 @@ $$
 | `immediate-controller` | `immediate` | controller 开启后的逐事件对照。 |
 | `fixed-window` | `fixed_window`，10 / 20 / 40 / 80 ms | 固定等待。 |
 | `quiet-debounce` | `quiet_debounce` + 同一 hard deadline | 吸收 burst。 |
-| `adaptive` | `adaptive` | 执行背压与双维计算压力，当前主自适应方案。 |
+| `load-aware` | `load_aware` | 执行背压与双维计算压力，当前面向执行积压的负载感知方案。 |
 | `full-merge` | `full_merge` | 只计算终止时最新快照的合并基线。 |
 
 下述 `Offline Oracle` 是有界时间策略的历史参考，沿用真实到达时间、最大窗口等待约束和
-执行 epoch 规则；adaptive 没有时间上限，不能直接当作同约束的比较对象。
+执行 epoch 规则；load_aware 没有时间上限，不能直接当作同约束的比较对象。
 当一个比较区间的 Append epoch 固定时，若 $U_0$ 是执行基准、$U_i$ 是窗口内快照、$D$ 是最大
 等待，令 `DP[i]` 为最终提交 $U_i$ 时的最小累计重算量：
 
@@ -1238,12 +1241,12 @@ goodput 和 recovery 开销。
 
 1. **配置与 Request 状态机已接入**：JSON config、`None` 默认路径、`PromptStreamSourceState`、
    单一 Update 窗口、Append epoch、冻结 Update / QUESTION work 和执行依赖仍保留。
-2. **Scheduler / EngineCore 控制面已接入**：五种策略由工厂创建；adaptive 按执行机会重评，时间策略的 deadline heap 和
+2. **Scheduler / EngineCore 控制面已接入**：五种策略由工厂创建；load_aware 按执行机会重评，时间策略的 deadline heap 和
    deadline-aware `Queue.get(timeout=...)` 由启动开关隔离；达到 policy 条件直接 admission。
    dormant 停放 / waiting 唤醒、在途步骤保护和 shutdown 清理已扩展到所有 PromptStream。
 3. **恢复和协议保护已接入**：preemption / dormant KV 驱逐从 source 权威状态重建，保留未放行
    窗口的原 deadline / token 统计；abort、sequence gap、Append epoch 和 committed 快照检查保留。
-4. **当前自适应机制**：无硬时间上限，使用本请求未完成 Update 与全局 token / slot 压力；
+4. **当前负载感知机制**：无硬时间上限，使用本请求未完成 Update 与全局 token / slot 压力；
    source-finished / Question 强制收尾。不依赖来源更新趋势或到达率预测。
 5. **实验脚本已配套**：profile helper 同时生成 P JSON 与 replay 审计值，汇总保留压力阈值；
    启动和 sweep 命令见 [实验 README](scripts/replay/update_coalescing/README.md)。
@@ -1261,4 +1264,4 @@ token / slot 压力、终止事件收尾、dormant 唤醒、普通与异步 sche
 实验目录的 shell 语法、Python 语法、profile JSON 和 sweep 参数转发也完成本地检查。
 
 没有启动 vLLM 服务、GPU 端到端测试或性能回放。上述检查说明状态机与配套接口通过了
-本地验证，不代表已得到 adaptive 的 TTFT 收益结论；新性能数据仍需用户实际采集。
+本地验证，不代表已得到 load_aware 的 TTFT 收益结论；新性能数据仍需用户实际采集。
