@@ -6,6 +6,21 @@
 - `start_p_node.sbatch`：在 Slurm 上启动 P 节点，即 NIXL producer。
 - `start_d_node.sbatch`：在 Slurm 上启动 D 节点，即 NIXL consumer。
 
+## 稳定 KV 提前 Push 专用服务
+
+新增的 `stable_kv_proxy.py`、`start_stable_kv_pair.sh` 和
+`start_stable_kv_node.sh` 用于稳定 Prefix+Append KV 提前传输实验。它们使用
+`NixlPushConnector` 及 `kv_connector_extra_config.stable_kv_push=true`，与下文
+普通 Pull 服务的启动路径区分。
+
+`bash research/scripts/server/start_stable_kv_pair.sh` 使用一次 `srun`，在
+`g2c9` 申请两张 GPU，启动恰好一个 P 和一个 D；专用 proxy 与 replay 放在
+`g2c14`。默认 Qwen2.5-3B、显存比例 `0.85`、TP=1、Triton 和 Masked Padding。
+
+完整可复制的启动、A/B 开关、回放和指标解释见
+[稳定 KV 提前 Push README](../replay/stable_kv_push/README.md)。该实验需要完整
+D 续写，不能使用只返回 P 首 token 的 TTFT-only 路由。
+
 ## proxy 服务器
 
 `proxy_server.py` 接收 prompt stream RESTFUL 请求，并把请求分发给 P/D 节点。它负责维护一次 prompt stream 会话的 P 节点、D 节点、内部 `request_id` 和 decode prompt 镜像。

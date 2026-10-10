@@ -298,6 +298,25 @@ class KVCacheCoordinator(ABC):
             for manager in self.single_type_managers
         )
 
+    def adopt_reserved_blocks(self, reservation_id: str, request_id: str) -> None:
+        """把接收会话的整张 block table 原子移交给生成请求。
+
+        此操作只改变 CPU 所有权索引，不复制 KV，也不改变 block 引用计数。
+        调用方必须先确认所有远端写入完成，并在 EngineCore 主线程调用。
+        """
+        for manager in self.single_type_managers:
+            if request_id in manager.req_to_blocks:
+                raise ValueError(f"KV owner already exists: {request_id}")
+            if reservation_id not in manager.req_to_blocks:
+                raise ValueError(f"Missing KV reservation: {reservation_id}")
+        # 先完成全部 group 校验，再移交；避免半张表归属新的 Request。
+        for manager in self.single_type_managers:
+            manager.req_to_blocks[request_id] = manager.req_to_blocks.pop(
+                reservation_id
+            )
+            manager.num_cached_block.pop(reservation_id, None)
+            manager.num_cached_block[request_id] = 0
+
     def pop_blocks_for_free(self, request_id: str) -> list[KVCacheBlock]:
         """
         Pop the request's bookkeeping from all single-type managers and

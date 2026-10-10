@@ -920,12 +920,21 @@ class VllmConfig:
                     "with ordinary one-dimensional positions."
                 )
             transfer = self.kv_transfer_config
+            stable_push = (
+                transfer is not None
+                and transfer.kv_connector == "NixlPushConnector"
+                and transfer.kv_connector_extra_config.get("stable_kv_push") is True
+            )
             if transfer is not None and (
-                transfer.kv_connector not in ("NixlConnector", "NixlPullConnector")
+                (
+                    transfer.kv_connector not in ("NixlConnector", "NixlPullConnector")
+                    and not stable_push
+                )
                 or transfer.kv_buffer_device != "cuda"
             ):
                 raise ValueError(
-                    "Masked padding currently requires direct-device NIXL pull."
+                    "Masked padding requires direct-device NIXL pull or "
+                    "NixlPushConnector with stable_kv_push enabled."
                 )
 
         if (
@@ -944,12 +953,18 @@ class VllmConfig:
             and (
                 self.kv_transfer_config.kv_connector
                 not in ("NixlConnector", "NixlPullConnector")
+                and not (
+                    self.kv_transfer_config.kv_connector == "NixlPushConnector"
+                    and self.kv_transfer_config.kv_connector_extra_config.get(
+                        "stable_kv_push"
+                    ) is True
+                )
                 or not self.kv_transfer_config.is_kv_producer
             )
         ):
             raise ValueError(
                 "Prompt stream Update coalescing currently supports only a "
-                "NIXL pull-mode KV producer when KV transfer is configured."
+                "NIXL pull or stable-kv-push producer when KV transfer is configured."
             )
 
         if self.model_config is not None:

@@ -58,6 +58,7 @@ def _make_scheduler(
     scheduler.kv_cache_manager = _make_kv_cache_manager()
     scheduler.encoder_cache_manager = Mock()
     scheduler.connector = None
+    scheduler.stable_kv_push = None
     scheduler.block_size = 4
     scheduler.max_model_len = 64
     scheduler.max_num_running_reqs = 1

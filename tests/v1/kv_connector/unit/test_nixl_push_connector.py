@@ -321,6 +321,7 @@ class _StubWriterWorker(NixlPushConnectorWorker):
         w._push_writer_wake = threading.Event()
         w._push_writer_stop = threading.Event()
         w._push_writer_thread = None
+        w.stable_push = None  # 保持此 fixture 的旧终态 Push 行为。
 
         # Base worker fields touched by start_load_kv / _get_new_notifs.
         w._recving_metadata = {}

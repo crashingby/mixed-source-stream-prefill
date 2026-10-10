@@ -24,6 +24,89 @@
 重新扫描生成后的请求，将问题与 SQuAD v2 官方答案对齐，输出质量评测使用的
 gold-answer manifest。该脚本不会修改请求 JSON。
 
+### build_stable_kv_push_dataset.py
+
+离线构造 **稳定 KV 提前传输的受控性能集**。它不读取或覆盖已有 SQuAD/ANNS
+数据，不需要联网，也没有标准答案；只用于比较提前传输与 finish-only 的性能。
+各场景使用相同的请求编号、问题、模板和随机种子，只调整知识中稳定 Append
+与最终完整 Update 的 token 配比。每个请求的模板开头包含独有标识，减少长
+公共前缀缓存命中对对照实验的影响。
+
+## 稳定 KV 提前传输的受控数据
+
+固定知识总长 2048 tokens，默认生成三种配比：
+
+| 场景目录 | Append 总长 | 最终 Update 长度 | Append 占知识比例 |
+| --- | ---: | ---: | ---: |
+| `append-0256-update-1792` | 256 | 1792 | 12.5% |
+| `append-1024-update-1024` | 1024 | 1024 | 50% |
+| `append-1792-update-0256` | 1792 | 256 | 87.5% |
+
+每个请求默认有两个 Append chunk、五代等长 Update 完整快照。相邻 Update
+快照的实际 source-local LCP 为 `floor(Update长度 × update_lcp_ratio)`，默认
+比例为 0.75。生成器用自然文档语句组成内容并严格验证重新编码的 token 长度；
+如果 tokenizer 无法满足精确切块或 LCP，不会静默改成近似长度。
+
+通用生成命令：
+
+```shell
+.venv/bin/python research/scripts/data_processing/build_stable_kv_push_dataset.py \
+  --tokenizer-model "<本地模型或tokenizer目录>" \
+  --output-dir research/data/stable_kv_push_controlled_qwen \
+  --num-requests 128 \
+  --knowledge-tokens 2048 \
+  --append-tokens 256 1024 1792 \
+  --append-chunks 2 \
+  --update-snapshots 5 \
+  --update-lcp-ratio 0.75 \
+  --seed 2026 \
+  --block-size 16 \
+  --max-model-len 4096 \
+  --max-tokens 64
+```
+
+本地可直接复制的 tokenizer 写法：
+
+```shell
+.venv/bin/python research/scripts/data_processing/build_stable_kv_push_dataset.py \
+  --tokenizer-model /workplace/home/huangxinying/Models/Qwen2.5-3B \
+  --output-dir research/data/stable_kv_push_controlled_qwen \
+  --num-requests 128 \
+  --knowledge-tokens 2048 \
+  --append-tokens 256 1024 1792 \
+  --append-chunks 2 \
+  --update-snapshots 5 \
+  --update-lcp-ratio 0.75 \
+  --seed 2026
+```
+
+| 参数 | 默认值 | 含义 |
+| --- | --- | --- |
+| `--tokenizer-model` | 必填 | 本地 tokenizer，必须与回放一致且具有 chat template；只读本地文件 |
+| `--output-dir` | 必填 | 三种场景的公共父目录，不要指向质量集 |
+| `--num-requests` | 128 | 每种场景的请求数 |
+| `--knowledge-tokens` | 2048 | Append 加最终完整 Update 的 token 总数，不包含模板与问题 |
+| `--append-tokens` | `256 1024 1792` | 多个场景的稳定 Append 总 token 长度，必须不同且小于知识总长 |
+| `--append-chunks` | 2 | 每请求 Append 数据事件数，默认尽量等分，实际切点受 token 边界约束 |
+| `--update-snapshots` | 5 | 每请求 Update 完整快照数；每代长度相同 |
+| `--update-lcp-ratio` | 0.75 | 相邻完整快照的精确 source-local LCP 比例，取值 `[0,1)` |
+| `--seed` | 2026 | 数据内容随机种子，与 replay 的到达过程随机种子独立 |
+| `--block-size` | 16 | P 节点 Prefix+Append 的块对齐粒度，用于物理 padding 预算 |
+| `--max-model-len` | 4096 | 物理 prompt 加完整输出预算的最大长度 |
+| `--max-tokens` | 64 | 生成时预留的完整输出 token 数，不在 P 首 token 之外重复计数 |
+| `--overwrite` | 关闭 | 重建本生成器已有场景，移除旧生成请求；拒绝覆盖其他数据集 |
+
+**长度检查按实际分段传输计算**：模型 chat-template prefix、Append 两个事件
+的 token 总长、最终完整 Update、问题和 assistant header、Prefix+Append
+对齐 padding，以及完整输出预算，都计入上限。知识总长不等于模型输入总长。
+回放改用不同模型、输出长度或 block size 时，应按新配置重新生成。
+
+每个场景都有 `requests/*.json`、`manifest.jsonl` 和 `dataset_summary.json`。
+请求格式继续使用 `prompt_stream_mixed/v2`，事件只保存 `text`；现有回放器
+根据目标 tokenizer 再编码为 `token_ids`。汇总中记录精确长度与 padding
+上下界；单样本的 `controlled_workload` 记录每块长度和实际 LCP，便于审计。
+数据中不保存时间间隔，到达节奏仍通过 replay 的 interval/initial-delay 控制。
+
 ## 数据语义
 
 每个请求包含一个 Append source 和一个 Update source。

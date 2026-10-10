@@ -487,6 +487,11 @@ class EngineCore:
         was executed.
         """
 
+        # 增量接收消息与块分配始终在主线程处理，不由 NIXL writer 修改调度状态。
+        stable_push = getattr(self.scheduler, "stable_kv_push", None)
+        if stable_push is not None:
+            stable_push.poll()
+
         # In-process EngineCore does not pass through run_busy_loop, so it
         # must release due windows before checking whether scheduler work exists.
         if self.prompt_stream_update_coalescer_enabled:
@@ -515,6 +520,17 @@ class EngineCore:
         )
 
         return engine_core_outputs, scheduler_output.total_num_scheduled_tokens > 0
+
+    def stable_kv_control(self, command: dict[str, Any]) -> dict[str, Any]:
+        """在 EngineCore 主线程执行接收会话的 reserve/bind/finalize/abort。
+
+        HTTP 层经 utility RPC 调用；此接口不启动模型生成或创建 output queue。
+        """
+        controller = getattr(self.scheduler, "stable_kv_push", None)
+        if controller is None:
+            raise ValueError("Enable stable_kv_push in kv_connector_extra_config first")
+        controller.poll()
+        return controller.control(command)
 
     def post_step(self, model_executed: bool) -> None:
         # When using async scheduling we can't get draft token ids in advance,
@@ -1345,7 +1361,11 @@ class EngineCoreProc(EngineCore):
         # the GIL briefly to allow background transfer threads to make progress.
         has_scheduler_work = self.scheduler.has_runnable_engine_work()
         if not model_executed and has_scheduler_work:
-            time.sleep(0.001)
+            stable_push = getattr(self.scheduler, "stable_kv_push", None)
+            # 首版以有界轮询接收 worker 通知，不运行 dummy model，不忙转 CPU。
+            time.sleep(
+                stable_push.poll_interval_s if stable_push is not None else 0.001
+            )
 
         return model_executed
 
@@ -1393,9 +1413,7 @@ class EngineCoreProc(EngineCore):
                 # shutdown 后不再接受 ADD，纯等待 source/deadline 的 dormant
                 # 请求无法自然封口；只终止这部分，请求队列中的可运行工作继续
                 # 按原 drain 语义完成。
-                aborted_reqs = (
-                    self.scheduler.abort_dormant_prompt_stream_requests()
-                )
+                aborted_reqs = self.scheduler.abort_dormant_prompt_stream_requests()
                 self._send_abort_outputs(aborted_reqs)
 
             self.shutdown_state = EngineShutdownState.SHUTTING_DOWN
@@ -1432,7 +1450,20 @@ class EngineCoreProc(EngineCore):
             req, request_wave = request
             if self._reject_add_in_shutdown(req):
                 return
-            self.add_request(req, request_wave)
+            try:
+                self.add_request(req, request_wave)
+            except ValueError:
+                # finalize 与取消可能交错；失效接收会话只使本请求失败，
+                # 不能把整个 D EngineCore 一同终止。
+                params = req.kv_transfer_params or {}
+                if not params.get("stable_kv_session_id"):
+                    raise
+                logger.exception("Rejected stable KV adoption for %s", req.request_id)
+                if req.request_id in self.scheduler.requests:
+                    self.scheduler.finish_requests(
+                        req.request_id, RequestStatus.FINISHED_ERROR
+                    )
+                self._send_error_outputs_to_client([req.request_id], req.client_index)
         elif request_type == EngineCoreRequestType.ABORT:
             self.abort_requests(request)
         elif request_type == EngineCoreRequestType.UTILITY:
@@ -1996,8 +2027,8 @@ class DPEngineCoreProc(EngineCoreProc):
             self._maybe_publish_request_counts()
 
             # 未封口的 dormant 不需要 collective；在途 batch 必须先耗尽。
-            local_unfinished_reqs = (
-                self.scheduler.has_runnable_engine_work() or bool(self.batch_queue)
+            local_unfinished_reqs = self.scheduler.has_runnable_engine_work() or bool(
+                self.batch_queue
             )
             if not executed:
                 if not local_unfinished_reqs and not self.engines_running:

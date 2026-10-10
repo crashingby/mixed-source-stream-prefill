@@ -169,9 +169,7 @@ class PromptStreamUpdateCoalescingController:
                 continue
             self._registered_deadlines.pop(request_id, None)
             request = requests[request_id]
-            due_requests.append(
-                (request, self._get_deadline_reason(request, deadline))
-            )
+            due_requests.append((request, self._get_deadline_reason(request, deadline)))
             self._discard_stale_deadlines(requests)
         return due_requests
 
@@ -319,9 +317,7 @@ class Scheduler(SchedulerInterface):
         # number of unfinished requests
         self.num_waiting_for_streaming_input: int = 0
 
-        coalescing_config = (
-            self.scheduler_config.prompt_stream_update_coalescing_config
-        )
+        coalescing_config = self.scheduler_config.prompt_stream_update_coalescing_config
         self._prompt_stream_update_coalescer: (
             PromptStreamUpdateCoalescingController | None
         ) = None
@@ -334,8 +330,7 @@ class Scheduler(SchedulerInterface):
                 )
             if self.parallel_config.data_parallel_size > 1:
                 raise ValueError(
-                    "Prompt stream Update coalescing does not support data "
-                    "parallelism."
+                    "Prompt stream Update coalescing does not support data parallelism."
                 )
             self._prompt_stream_update_coalescer = (
                 PromptStreamUpdateCoalescingController(coalescing_config)
@@ -418,6 +413,17 @@ class Scheduler(SchedulerInterface):
         # kv_cache_manager is constructed so block_pool is available.
         if self.connector is not None:
             self.connector.bind_gpu_block_pool(self.kv_cache_manager.block_pool)
+
+        # 未启用时不构造额外会话表，普通 Pull/Push 保持原调度路径。
+        self.stable_kv_push = None
+        transfer_config = vllm_config.kv_transfer_config
+        if (
+            transfer_config is not None
+            and transfer_config.kv_connector_extra_config.get("stable_kv_push", False)
+        ):
+            from vllm.v1.core.stable_kv_push import StableKVPushController
+
+            self.stable_kv_push = StableKVPushController(self)
 
         self.use_pp = self.parallel_config.pipeline_parallel_size > 1
         self.use_v2_model_runner = vllm_config.use_v2_model_runner
@@ -571,7 +577,8 @@ class Scheduler(SchedulerInterface):
             seen.add(request_id)
             # 外部依赖阻塞只排除尚不能运行的需求；此前提交的批次仍计入负载。
             demand = (
-                0 if self._is_blocked_waiting_status(candidate.status)
+                0
+                if self._is_blocked_waiting_status(candidate.status)
                 else candidate.get_prompt_stream_runnable_token_demand(self.block_size)
             )
             if chunk_limit > 0:
@@ -668,9 +675,7 @@ class Scheduler(SchedulerInterface):
             self.waiting.remove_requests([request])
             self.skipped_waiting.remove_requests([request])
         self._inflight_prefills.discard(request)
-        self._prompt_stream_retained_waiting_req_ids.discard(
-            request.request_id
-        )
+        self._prompt_stream_retained_waiting_req_ids.discard(request.request_id)
         request.status = RequestStatus.WAITING
         self._prompt_stream_worker_removal_req_ids.add(request.request_id)
         self._prompt_stream_dormant_reasons[request.request_id] = (
@@ -687,14 +692,10 @@ class Scheduler(SchedulerInterface):
         request.status = RequestStatus.WAITING
         request.prompt_stream_needs_worker_refresh = True
         if any(
-            self.kv_cache_manager.has_prompt_stream_segment_blocks(
-                request, segment
-            )
+            self.kv_cache_manager.has_prompt_stream_segment_blocks(request, segment)
             for segment in PromptStreamKVSegment
         ):
-            self._prompt_stream_retained_waiting_req_ids.add(
-                request.request_id
-            )
+            self._prompt_stream_retained_waiting_req_ids.add(request.request_id)
         self._enqueue_waiting_request(request)
         return True
 
@@ -734,9 +735,7 @@ class Scheduler(SchedulerInterface):
         if controller is not None:
             controller.remove_request(request.request_id)
         self._prompt_stream_dormant_reasons.pop(request.request_id, None)
-        self._prompt_stream_retained_waiting_req_ids.discard(
-            request.request_id
-        )
+        self._prompt_stream_retained_waiting_req_ids.discard(request.request_id)
         self.waiting.remove_requests([request])
         self.skipped_waiting.remove_requests([request])
         self._free_request_blocks(request)
@@ -812,8 +811,7 @@ class Scheduler(SchedulerInterface):
             if not in_scheduler_queue:
                 continue
             retained_recovery_reason = (
-                recovery_reason
-                or PromptStreamRecoveryReason.RETAINED_WAITING_EVICTION
+                recovery_reason or PromptStreamRecoveryReason.RETAINED_WAITING_EVICTION
             )
             self._evict_prompt_stream_request_kv(
                 request,
@@ -907,12 +905,10 @@ class Scheduler(SchedulerInterface):
             )
         return bool(
             num_runnable_requests > 0
+            or (self.stable_kv_push is not None and self.stable_kv_push.has_work())
             or self._prompt_stream_worker_removal_req_ids
             or self.has_finished_requests()
-            or (
-                self.connector is not None
-                and self.connector.has_pending_push_work()
-            )
+            or (self.connector is not None and self.connector.has_pending_push_work())
         )
 
     def abort_dormant_prompt_stream_requests(self) -> list[tuple[str, int]]:
@@ -1221,9 +1217,7 @@ class Scheduler(SchedulerInterface):
                         request.is_prompt_streaming()
                         and not running_allocation_failure_recorded
                     ):
-                        request.record_prompt_stream_allocation_failure(
-                            is_running=True
-                        )
+                        request.record_prompt_stream_allocation_failure(is_running=True)
                         running_allocation_failure_recorded = True
 
                     if self._evict_one_dormant_prompt_stream_request(
@@ -1665,9 +1659,7 @@ class Scheduler(SchedulerInterface):
                         )
 
                 request = request_queue.pop_request()
-                self._prompt_stream_retained_waiting_req_ids.discard(
-                    request.request_id
-                )
+                self._prompt_stream_retained_waiting_req_ids.discard(request.request_id)
                 if load_kv_async:
                     # If loading async, allocate memory and put request
                     # into the WAITING_FOR_REMOTE_KV state.
@@ -1879,6 +1871,8 @@ class Scheduler(SchedulerInterface):
         if self.defer_block_free and total_num_scheduled_tokens > 0:
             self.sched_step_seq += 1
 
+        if self.stable_kv_push is not None:
+            self.stable_kv_push.capture_scheduled(scheduler_output)
         with record_function_or_nullcontext("schedule: update_after_schedule"):
             self._update_after_schedule(scheduler_output)
         return scheduler_output
@@ -2319,6 +2313,10 @@ class Scheduler(SchedulerInterface):
         kv_connector_output = model_runner_output.kv_connector_output
         cudagraph_stats = model_runner_output.cudagraph_stats
 
+        # 同步 worker 的回包意味着该步 KV 写入完成；先发布不可变的 PA 完整块。
+        if self.stable_kv_push is not None:
+            self.stable_kv_push.complete_scheduled(scheduler_output)
+
         # Every GPU write enqueued by this and earlier steps has completed, so it is
         # safe to return deferred-free blocks to the pool.
         if self.defer_block_free and scheduler_output.total_num_scheduled_tokens > 0:
@@ -2639,6 +2637,9 @@ class Scheduler(SchedulerInterface):
         if kv_connector_output:
             self._update_from_kv_xfer_finished(kv_connector_output)
 
+        if self.stable_kv_push is not None:
+            self.stable_kv_push.poll()
+
         if self._prompt_stream_update_coalescer is not None:
             self.flush_due_update_coalescing()
 
@@ -2920,6 +2921,8 @@ class Scheduler(SchedulerInterface):
                     request.enqueue_question_if_ready()
             if request.resumable:
                 request.streaming_queue = deque()
+            if self.stable_kv_push is not None and not request.is_prompt_streaming():
+                self.stable_kv_push.adopt(request)
             self._enqueue_waiting_request(request)
             self.requests[request.request_id] = request
             if self.connector is not None:
@@ -3044,9 +3047,7 @@ class Scheduler(SchedulerInterface):
         controller = self._prompt_stream_update_coalescer
         if controller is not None:
             controller.remove_request(request.request_id)
-        self._prompt_stream_retained_waiting_req_ids.discard(
-            request.request_id
-        )
+        self._prompt_stream_retained_waiting_req_ids.discard(request.request_id)
         self._prompt_stream_worker_removal_req_ids.discard(request.request_id)
         self._prompt_stream_dormant_reasons.pop(request.request_id, None)
         self._prompt_stream_inflight_steps.pop(request.request_id, None)
@@ -3056,7 +3057,8 @@ class Scheduler(SchedulerInterface):
         if (
             request.is_prompt_streaming()
             and request.prompt_stream_masked_padding
-            and request.status in (
+            and request.status
+            in (
                 RequestStatus.FINISHED_LENGTH_CAPPED,
                 RequestStatus.FINISHED_STOPPED,
             )
@@ -3104,6 +3106,8 @@ class Scheduler(SchedulerInterface):
         """Free the request's KV blocks, deferring the return to the block
         pool when an in-flight GPU step may still write them.
         """
+        if self.stable_kv_push is not None and not request.is_finished():
+            self.stable_kv_push.invalidate_request(request)
         if not self.defer_block_free or (
             # Last scheduled step already processed: no in-flight write remains
             # (always the case for a normal finish), so free now.
@@ -3165,6 +3169,7 @@ class Scheduler(SchedulerInterface):
         return (
             self.has_unfinished_requests()
             or self.has_finished_requests()
+            or (self.stable_kv_push is not None and self.stable_kv_push.has_work())
             or (self.connector is not None and self.connector.has_pending_push_work())
         )
 
@@ -3405,7 +3410,12 @@ class Scheduler(SchedulerInterface):
             )
             block_ids = self.kv_cache_manager.get_block_ids(request.request_id)
 
-        if not isinstance(self.connector, SupportsHMA):
+        if (
+            self.stable_kv_push is not None
+            and request.request_id in self.stable_kv_push.request_sessions
+        ):
+            connector_result = self.stable_kv_push.finish_request(request, block_ids)
+        elif not isinstance(self.connector, SupportsHMA):
             # NOTE(Kuntai): We should deprecate this code path after we enforce
             # all connectors to support HMA.
             # Hybrid memory allocator should be already turned off for this

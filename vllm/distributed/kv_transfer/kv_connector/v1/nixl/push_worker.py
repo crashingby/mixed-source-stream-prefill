@@ -44,11 +44,15 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_worker import (
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
     PUSH_REG_NOTIF_PREFIX,
+    STABLE_KV_NOTIF_PREFIX,
     NixlConnectorMetadata,
     RemoteMeta,
     ReqId,
     ReqMeta,
     TransferHandle,
+)
+from vllm.distributed.kv_transfer.kv_connector.v1.nixl.stable_push import (
+    StableKVPushWorker,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.tp_mapping import ReadSpec
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.utils import get_base_request_id
@@ -113,6 +117,14 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
 
         self._push_writer_stop = threading.Event()
         self._push_writer_thread: threading.Thread | None = None
+        assert vllm_config.kv_transfer_config is not None
+        self.stable_push = (
+            StableKVPushWorker(self)
+            if vllm_config.kv_transfer_config.get_from_extra_config(
+                "stable_kv_push", False
+            )
+            else None
+        )  # 区间协议与旧的终态 Push 分开维护完成状态。
 
     # --- Lifecycle ----------------------------------------------------- #
 
@@ -145,6 +157,17 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
 
     def start_load_kv(self, metadata: NixlConnectorMetadata):
         """Pre-process metadata; defer NIXL ops to the writer thread."""
+        if metadata.stable_kv_commands:
+            if self.stable_push is None:
+                raise RuntimeError("Stable KV commands require stable_kv_push=true")
+            if any(c["kind"] == "write" for c in metadata.stable_kv_commands):
+                import torch
+
+                # Scheduler 的完成水位还必须配合 CUDA 可见性，防止 writer
+                # 在后台读取仍处于 CUDA 计算流中的 KV 写入。
+                torch.cuda.synchronize()
+            self.stable_push.enqueue(metadata.stable_kv_commands)
+            self._push_writer_wake.set()
         # D-side: track reqs waiting for P to push.
         for req_id, meta in metadata.reqs_to_recv.items():
             meta.local_physical_block_ids = self._logical_to_kernel_block_ids(
@@ -194,6 +217,8 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
 
         while not self._push_writer_stop.is_set():
             try:
+                if self.stable_push is not None:
+                    self.stable_push.process_commands()
                 # 1. D registrations to send.
                 while True:
                     try:
@@ -231,15 +256,22 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
                     for notif in notifs:
                         if notif.startswith(PUSH_REG_NOTIF_PREFIX):
                             self._handle_push_reg_notif(notif)
+                        elif notif.startswith(STABLE_KV_NOTIF_PREFIX):
+                            if self.stable_push is not None:
+                                self.stable_push.handle_notification(notif)
                         else:
                             self._pending_completion_notifs.put(notif)
+                if self.stable_push is not None:
+                    self.stable_push.poll_transfers()
             except Exception:
                 logger.exception("nixl-push-writer error; continuing")
 
             # Self-poll only while there is no other wake source: P-side
             # finished blocks waiting for a D PUSH_REG match. All other
             # progress is event-driven (see module docstring).
-            if self._push_finished_blocks:
+            if self._push_finished_blocks or (
+                self.stable_push is not None and self.stable_push.has_work()
+            ):
                 self._push_writer_stop.wait(timeout=sleep_s)
             else:
                 self._push_writer_wake.wait()

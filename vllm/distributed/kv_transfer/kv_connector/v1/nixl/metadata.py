@@ -10,6 +10,7 @@ from vllm.distributed.kv_transfer.kv_connector.utils import BlockIds, EngineId
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorHandshakeMetadata,
     KVConnectorMetadata,
+    KVConnectorWorkerMetadata,
 )
 from vllm.logger import init_logger
 
@@ -24,6 +25,8 @@ GET_META_MSG = b"get_meta_msg"
 # Sent worker-to-worker over NIXL: D worker -> P worker, encoded as
 # PUSH_REG_NOTIF_PREFIX + msgpack(registration_data).
 PUSH_REG_NOTIF_PREFIX = b"PUSH_REG:"
+# 分批 Push 使用独立消息类型，绝不能触发原来的整请求完成通知。
+STABLE_KV_NOTIF_PREFIX = b"STABLE_KV_V1:"
 #
 # NIXL Connector Version
 #
@@ -175,6 +178,20 @@ class ReqMeta:
     prompt_stream_manifest_error: str | None = None
 
 
+@dataclass
+class StableKVWorkerMetadata(KVConnectorWorkerMetadata):
+    """将区间完成与控制消息交回 EngineCore 主线程。"""
+
+    events: list[dict[str, Any]]  # 后台线程只产出事件，不修改 Scheduler。
+
+    def aggregate(self, other: KVConnectorWorkerMetadata) -> "StableKVWorkerMetadata":
+        """汇集 worker 事件；接收端仍必须按区间身份去重。"""
+        if not isinstance(other, StableKVWorkerMetadata):
+            raise TypeError(f"Unexpected stable KV metadata: {type(other)!r}")
+        self.events.extend(other.events)
+        return self
+
+
 class NixlConnectorMetadata(KVConnectorMetadata):
     def __init__(self):
         self.reqs_to_recv: dict[ReqId, ReqMeta] = {}
@@ -190,6 +207,8 @@ class NixlConnectorMetadata(KVConnectorMetadata):
         # Push mode (P side): newly finished request blocks to be matched
         # against pending D registrations on the P worker.
         self.push_finished_blocks: dict[ReqId, BlockIds] = {}
+        # 仅由开启 stable_kv_push 的 Push connector 消费的增量命令。
+        self.stable_kv_commands: list[dict[str, Any]] = []
 
     def _add_new_req(
         self,

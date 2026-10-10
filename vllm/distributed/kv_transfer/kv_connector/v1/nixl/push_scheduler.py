@@ -24,6 +24,7 @@ been registered but not fulfilled within a configurable timeout.
 
 from __future__ import annotations
 
+import copy
 import time
 from typing import TYPE_CHECKING, Any
 
@@ -37,6 +38,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_scheduler import (
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
     NixlConnectorMetadata,
     ReqId,
+    StableKVWorkerMetadata,
 )
 from vllm.logger import init_logger
 
@@ -82,6 +84,10 @@ class NixlPushConnectorScheduler(NixlBaseConnectorScheduler):
         self._finished_request_blocks: dict[ReqId, BlockIds] = {}
         # P-side: newly finished blocks to ship to P workers on next step.
         self._newly_finished_push_blocks: dict[ReqId, BlockIds] = {}
+        # 区间级控制接口只搬运消息；会话与 block 所有权由 Scheduler 管理。
+        self._stable_kv_commands: list[dict[str, Any]] = []
+        self._stable_kv_events: list[dict[str, Any]] = []
+        self._stable_kv_inflight: set[tuple[str, int, str]] = set()
 
         # Soft watchdog timeout (seconds) for D-side registrations that
         # never receive a push completion. Defaults to the existing
@@ -93,6 +99,35 @@ class NixlPushConnectorScheduler(NixlBaseConnectorScheduler):
                 self.decoder_kv_blocks_ttl,
             )
         )
+
+    def stable_kv_peer_info(self) -> dict[str, Any]:
+        """返回容量注册及 worker 握手使用的本端身份。"""
+        return {
+            "engine_id": self.engine_id,
+            "host": self.side_channel_host,
+            "port": self.side_channel_port,
+            "tp_size": self.vllm_config.parallel_config.tensor_parallel_size,
+            "block_sizes": [
+                group.kv_cache_spec.block_size
+                for group in self.kv_cache_config.kv_cache_groups
+            ],
+        }
+
+    def enqueue_stable_kv_command(self, command: dict[str, Any]) -> None:
+        """冻结一个控制或区间命令，下一步传给 worker writer。"""
+        if command.get("kind") not in ("control", "write", "drain"):
+            raise ValueError(f"Unknown stable KV command: {command.get('kind')}")
+        self._stable_kv_commands.append(copy.deepcopy(command))
+        if command["kind"] == "write":
+            self._stable_kv_inflight.add(
+                (command["session_id"], command["generation"], command["range_id"])
+            )
+
+    def pop_stable_kv_events(self) -> list[dict[str, Any]]:
+        """取走 worker 事件，由 EngineCore 主线程推进接收与发送会话。"""
+        events = self._stable_kv_events
+        self._stable_kv_events = []
+        return events
 
     def get_num_new_matched_tokens(
         self, request: Request, num_computed_tokens: int
@@ -328,6 +363,10 @@ class NixlPushConnectorScheduler(NixlBaseConnectorScheduler):
             meta.push_finished_blocks = dict(self._newly_finished_push_blocks)
             self._newly_finished_push_blocks.clear()
 
+        # 每条命令只随一个 SchedulerOutput 下发，不绑定普通模型请求。
+        meta.stable_kv_commands = self._stable_kv_commands
+        self._stable_kv_commands = []
+
         return meta
 
     def has_pending_push_work(self) -> bool:
@@ -335,11 +374,24 @@ class NixlPushConnectorScheduler(NixlBaseConnectorScheduler):
         # - finished P blocks awaiting WRITE completion, or
         # - pending D registrations the worker has not yet shipped, or
         # - newly finished blocks not yet shipped to P workers.
-        return bool(self._finished_request_blocks or self._push_pending_registrations)
+        return bool(
+            self._finished_request_blocks
+            or self._push_pending_registrations
+            or self._stable_kv_commands
+            or self._stable_kv_inflight
+        )
 
     def update_connector_output(self, connector_output: KVConnectorOutput) -> None:
         """Clean up finished request blocks after push completes."""
         super().update_connector_output(connector_output)
+        worker_meta = connector_output.kv_connector_worker_meta
+        if isinstance(worker_meta, StableKVWorkerMetadata):
+            self._stable_kv_events.extend(worker_meta.events)
+            for event in worker_meta.events:
+                if event.get("kind") in ("sent", "error") and "range_id" in event:
+                    self._stable_kv_inflight.discard(
+                        (event["session_id"], event["generation"], event["range_id"])
+                    )
         for req_id in connector_output.finished_sending or ():
             self._finished_request_blocks.pop(req_id, None)
         # On D side, finished_recving means the push completed; clear the

@@ -27,6 +27,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorHandshakeMetadata,
     KVConnectorMetadata,
     KVConnectorRole,
+    KVConnectorWorkerMetadata,
     SupportsHMA,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.metrics import (
@@ -59,7 +60,7 @@ from vllm.logger import init_logger
 from vllm.v1.attention.backend import AttentionBackend, AttentionMetadata
 from vllm.v1.attention.backends.utils import get_kv_cache_layout
 from vllm.v1.core.sched.output import SchedulerOutput
-from vllm.v1.kv_cache_interface import MambaSpec
+from vllm.v1.kv_cache_interface import FullAttentionSpec, MambaSpec
 from vllm.v1.outputs import KVConnectorOutput
 
 if TYPE_CHECKING:
@@ -361,6 +362,38 @@ class NixlPushConnector(NixlBaseConnector):
         kv_cache_config: "KVCacheConfig",
     ):
         super().__init__(vllm_config, role, kv_cache_config)
+        assert vllm_config.kv_transfer_config is not None
+        enabled = vllm_config.kv_transfer_config.get_from_extra_config(
+            "stable_kv_push", False
+        )
+        if type(enabled) is not bool:
+            raise ValueError("stable_kv_push must be a JSON boolean")
+        self.stable_kv_enabled = enabled
+        if enabled:
+            parallel = vllm_config.parallel_config
+            if (
+                parallel.tensor_parallel_size != 1
+                or parallel.pipeline_parallel_size != 1
+                or parallel.data_parallel_size != 1
+            ):
+                raise ValueError("Stable KV Push currently requires TP=PP=DP=1")
+            if vllm_config.kv_transfer_config.kv_buffer_device != "cuda":
+                raise ValueError("Stable KV Push currently requires CUDA KV buffers")
+            if any(
+                not isinstance(group.kv_cache_spec, FullAttentionSpec)
+                for group in kv_cache_config.kv_cache_groups
+            ):
+                raise ValueError("Stable KV Push requires full-attention KV groups")
+            if (
+                len(
+                    {
+                        group.kv_cache_spec.block_size
+                        for group in kv_cache_config.kv_cache_groups
+                    }
+                )
+                > 1
+            ):
+                raise ValueError("Stable KV Push requires a uniform logical block size")
         self.connector_scheduler: NixlPushConnectorScheduler | None = None
         self.connector_worker: NixlPushConnectorWorker | None = None
         if role == KVConnectorRole.SCHEDULER:
@@ -373,6 +406,30 @@ class NixlPushConnector(NixlBaseConnector):
             )
         else:
             raise ValueError(f"Unsupported KVConnectorRole: {role}")
+
+    def stable_kv_peer_info(self) -> dict[str, Any]:
+        """暴露握手身份；只有明确开启功能的 Scheduler 可以调用。"""
+        if not self.stable_kv_enabled or self.connector_scheduler is None:
+            raise RuntimeError("Stable KV Push is not enabled on this scheduler")
+        return self.connector_scheduler.stable_kv_peer_info()
+
+    def enqueue_stable_kv_command(self, command: dict[str, Any]) -> None:
+        """向 worker 提交控制或 WRITE 命令，不改变 block 所有权。"""
+        if not self.stable_kv_enabled or self.connector_scheduler is None:
+            raise RuntimeError("Stable KV Push is not enabled on this scheduler")
+        self.connector_scheduler.enqueue_stable_kv_command(command)
+
+    def pop_stable_kv_events(self) -> list[dict[str, Any]]:
+        """返回 worker 区间事件，供 Scheduler 的主线程消费。"""
+        if self.connector_scheduler is None:
+            return []
+        return self.connector_scheduler.pop_stable_kv_events()
+
+    def build_connector_worker_meta(self) -> KVConnectorWorkerMetadata | None:
+        """通过标准 worker 回包传递事件，保持普通请求完成信号独立。"""
+        if self.connector_worker is None or self.connector_worker.stable_push is None:
+            return None
+        return self.connector_worker.stable_push.drain_events()
 
     def start_load_kv(self, forward_context: "ForwardContext", **kwargs) -> None:
         """Drive push processing on the worker.

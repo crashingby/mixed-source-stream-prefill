@@ -576,6 +576,10 @@ def make_nixl_push_scheduler(
     sched._push_registration_deadlines = {}
     sched._finished_request_blocks = {}
     sched._newly_finished_push_blocks = {}
+    # 旧 Push fixture 不开启分批协议，但仍初始化共用 metadata 容器。
+    sched._stable_kv_commands = []
+    sched._stable_kv_events = []
+    sched._stable_kv_inflight = set()
     sched._push_registration_timeout = (
         push_registration_timeout
         if push_registration_timeout is not None

@@ -132,6 +132,14 @@ class EngineClient(ABC):
         ...
 
     @abstractmethod
+    async def stable_kv_control(self, command: dict[str, Any]) -> dict[str, Any]:
+        """在 EngineCore 主线程执行稳定 KV 接收、绑定与最终交接控制。
+
+        此接口只返回状态 ACK，不创建模型生成请求或输出收集器。
+        """
+        ...
+
+    @abstractmethod
     async def abort(
         self,
         request_id: str | Iterable[str],

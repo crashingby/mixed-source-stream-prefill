@@ -218,6 +218,12 @@ class EngineCoreClient(ABC):
     async def add_request_async(self, request: EngineCoreRequest) -> None:
         raise NotImplementedError
 
+    async def stable_kv_control_async(
+        self, command: dict[str, Any]
+    ) -> dict[str, Any]:
+        """执行稳定 KV 的 ACK 型控制操作，不创建普通 Request。"""
+        raise NotImplementedError
+
     async def profile_async(
         self, is_start: bool = True, profile_prefix: str | None = None
     ) -> None:
@@ -1117,6 +1123,12 @@ class AsyncMPClient(MPClient):
 
     async def get_supported_tasks_async(self) -> tuple[SupportedTask, ...]:
         return await self.call_utility_async("get_supported_tasks")
+
+    async def stable_kv_control_async(
+        self, command: dict[str, Any]
+    ) -> dict[str, Any]:
+        """通过现有 utility 通道唤醒并调用 EngineCore 控制状态机。"""
+        return await self.call_utility_async("stable_kv_control", command)
 
     async def add_request_async(self, request: EngineCoreRequest) -> None:
         request.client_index = self.client_index

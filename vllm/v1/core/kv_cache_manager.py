@@ -205,6 +205,34 @@ class KVCacheManager:
         """
         return self.block_pool.get_usage()
 
+    def reserve_stable_kv_blocks(
+        self, reservation_id: str, num_tokens: int
+    ) -> KVCacheBlocks | None:
+        """为只接收会话扩容，容量不足时不修改任何 group 的分配。
+
+        仅供已验证为同尺寸 full-attention 的 Stable KV Push 使用。
+        分配的槽位尚未有效，不能据此推进 num_computed_tokens。
+        """
+        if not 0 < num_tokens <= self.max_model_len:
+            raise ValueError(f"Invalid stable KV reservation length: {num_tokens}")
+        required = self.coordinator.get_num_blocks_to_allocate(
+            request_id=reservation_id,
+            num_tokens=num_tokens,
+            new_computed_blocks=self.empty_kv_cache_blocks.blocks,
+            num_encoder_tokens=0,
+            total_computed_tokens=0,
+            num_tokens_main_model=num_tokens,
+        )
+        if required + self.watermark_blocks > self.block_pool.get_num_free_blocks():
+            return None
+        self.coordinator.allocate_new_blocks(reservation_id, num_tokens, num_tokens)
+        return self.get_blocks(reservation_id)
+
+    def adopt_stable_kv_blocks(self, reservation_id: str, request: Request) -> None:
+        """将已验证的接收表交给 D Request，保留原有 GPU 地址。"""
+        self.coordinator.adopt_reserved_blocks(reservation_id, request.request_id)
+        request.skip_reading_prefix_cache = True
+
     def make_prefix_cache_stats(self) -> PrefixCacheStats | None:
         """Get (and reset) the prefix cache stats.
 

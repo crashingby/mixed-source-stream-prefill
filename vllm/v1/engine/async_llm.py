@@ -38,16 +38,16 @@ from vllm.usage.usage_lib import UsageContext
 from vllm.utils.async_utils import cancel_task_threadsafe
 from vllm.utils.collection_utils import as_list
 from vllm.v1.engine import EngineCoreRequest, PauseMode
-from vllm.v1.engine.prompt_stream import (
-    PromptSourceType,
-    PromptStreamEvent,
-    PromptStreamEventType,
-)
 from vllm.v1.engine.core_client import EngineCoreClient
 from vllm.v1.engine.exceptions import EngineDeadError, EngineGenerateError
 from vllm.v1.engine.input_processor import InputProcessor
 from vllm.v1.engine.output_processor import OutputProcessor, RequestOutputCollector
 from vllm.v1.engine.parallel_sampling import ParentRequest
+from vllm.v1.engine.prompt_stream import (
+    PromptSourceType,
+    PromptStreamEvent,
+    PromptStreamEventType,
+)
 from vllm.v1.executor import Executor
 from vllm.v1.metrics.loggers import (
     StatLoggerFactory,
@@ -535,6 +535,20 @@ class AsyncLLM(EngineClient):
 
         if self.log_requests:
             logger.info("Added prompt stream event for request %s.", request.request_id)
+
+    async def stable_kv_control(self, command: dict[str, Any]) -> dict[str, Any]:
+        """把稳定 KV 控制操作串行交给 EngineCore，不占模型输出队列。
+
+        EngineCore 是接收会话、目标块分配和最终收养的唯一状态修改者；
+        HTTP handler 不直接操作 scheduler 或 worker。
+        """
+        if self.errored:
+            raise EngineDeadError()
+        # 传输会话只绑定一个 engine，第一版不允许 DP 广播同一个控制操作。
+        if self.vllm_config.parallel_config.data_parallel_size != 1:
+            raise ValueError("Stable KV push requires data_parallel_size=1.")
+        self._run_output_handler()
+        return await self.engine_core.stable_kv_control_async(command)
 
     async def _add_streaming_input_request(
         self,
