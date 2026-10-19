@@ -6,21 +6,35 @@
 from __future__ import annotations
 
 import argparse
+import sys
 import time
+from pathlib import Path
 from typing import Any
 
 import httpx
-from replay_common import (
-    ChatTemplateRenderer,
-    RenderedReplayPrompt,
-    ReplayHttpError,
-    RequestMetric,
-    SampleReplayInput,
-    _get_data_events,
-    _normalize_v1_url,
-    _override_sampling_params,
-    consume_sse_response,
-    main,
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[4]))
+
+from research.scripts.replay.common.dataset import get_data_events as _get_data_events
+from research.scripts.replay.common.metrics import apply_completion_measurement
+from research.scripts.replay.common.models import (
+    RenderedReplayPrompt as RenderedReplayPrompt,
+)
+from research.scripts.replay.common.models import RequestMetric as RequestMetric
+from research.scripts.replay.common.models import SampleReplayInput as SampleReplayInput
+from research.scripts.replay.common.prompt import (
+    ChatTemplateRenderer as ChatTemplateRenderer,
+)
+from research.scripts.replay.common.prompt import (
+    override_sampling_params as _override_sampling_params,
+)
+from research.scripts.replay.common.runner import main as main
+from research.scripts.replay.common.transport import ReplayHttpError as ReplayHttpError
+from research.scripts.replay.common.transport import (
+    consume_sse_response as consume_sse_response,
+)
+from research.scripts.replay.common.transport import (
+    normalize_v1_url as _normalize_v1_url,
 )
 
 
@@ -29,15 +43,22 @@ def _make_normal_payload(
     rendered_prompt: RenderedReplayPrompt,
     args: argparse.Namespace,
 ) -> dict[str, Any]:
-    """构造由分段 chat template token 组成的普通 SSE 请求。"""
+    """构造完整模型模板的普通 SSE 请求，默认提交原始文本。"""
     payload: dict[str, Any] = {
         "model": args.model,
-        "prompt": list(rendered_prompt.logical_prompt_token_ids),
+        "prompt": (
+            rendered_prompt.logical_prompt_text
+            if rendered_prompt.input_transport == "text"
+            else list(rendered_prompt.logical_prompt_token_ids)
+        ),
+        "add_special_tokens": False,
         "stream": True,
         "max_tokens": sample.start_request.get("max_tokens", 64),
         "temperature": sample.start_request.get("temperature", 0.0),
     }
     _override_sampling_params(payload, args)
+    if getattr(args, "return_token_ids", False):
+        payload["return_token_ids"] = True
     return payload
 
 
@@ -135,9 +156,7 @@ async def _replay_normal_sample(
         ) * 1000
         metric.request_to_done_ms = metric.finish_to_done_ms
         metric.ttft_origin = "normal_prefill"
-        metric.completion_chars = sse_measurement.completion_chars
-        metric.completion_chunks = sse_measurement.completion_chunks
-        metric.response_payloads = list(sse_measurement.payloads)
+        apply_completion_measurement(metric, sse_measurement, request_start_time)
         metric.result_status = "ok"
     except Exception as exc:
         metric.transport_status = "error"

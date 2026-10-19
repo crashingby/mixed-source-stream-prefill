@@ -158,6 +158,10 @@ run_replay() {
     --return-token-ids
     --event-progress-log-interval 0
   )
+  args+=(--input-transport "${INPUT_TRANSPORT:-text}")
+  if [[ -n "${REPLAY_CONFIG:-}" ]]; then
+    args+=(--config "${REPLAY_CONFIG}")
+  fi
 
   if [[ "${TOKENIZER_TRUST_REMOTE_CODE}" == "1" ]]; then
     args+=(--tokenizer-trust-remote-code)

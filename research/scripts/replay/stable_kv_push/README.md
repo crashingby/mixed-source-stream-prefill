@@ -6,6 +6,28 @@
 
 本轮部署、固定变量和正式结果记录见 [EXPERIMENTS.md](EXPERIMENTS.md)。
 
+## 共享数据与文本传输
+
+本入口使用 [公共回放实现](../README.md)，支持独立 questions、append_chunks 和
+pipeline_pools，按 `sample_id` 对齐。默认 `--input-transport text`，客户端渲染
+模型模板，P 分词；start 是模板前缀，事件是原始文本，finish 带问题及 assistant
+header。`--input-transport token_ids` 用于历史预分词实验复现。
+
+直接使用 TriviaQA 检查输入：
+
+```shell
+.venv/bin/python research/scripts/replay/stable_kv_push/replay_stable_kv_push.py \
+  --config research/scripts/replay/configs/triviaqa.json \
+  --dry-run --output-dir /tmp/stable-kv-check --run-name triviaqa-check
+```
+
+正式运行去掉 `--dry-run`，设置专用稳定 KV proxy 的 `--proxy-url`。
+同一配置分别用 `--early-push` 与 `--no-early-push` 回放；保留完整 P/D SSE 与
+实际传输计量。`run_stable_kv_sweep.sbatch` 支持 `REPLAY_CONFIG`，受控长度 matrix
+仍使用其专门生成的性能数据。
+
+批量脚本支持 `INPUT_TRANSPORT`，默认 text；脚本显式参数优先于配置。
+
 ## 脚本和职责
 
 | 文件 | 用途 |

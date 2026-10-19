@@ -1,23 +1,38 @@
 # 分段流式 Prefill 回放实验
 
 本目录提供三个相互独立的实验入口。它们读取同一批
-`research/data/mix_source/requests/*.json`，但使用不同的 REST 请求链路：
+独立的 questions、append_chunks、pipeline_pools 数据，也兼容
+`research/data/mix_source/requests/*.json`，使用不同的 REST 请求链路：
 
 - `replay_prompt_stream.py`：使用 mixed-source 流式 prefill API，是我们的优化方案。
 - `replay_merged_update.py`：把已经到达的 Append 与 Update 内容合并成单个 Update 快照，是朴素流式 baseline。
 - `replay_normal.py`：把最终完整 prompt 一次性发送给普通 completions API。
-- `replay_common.py`：三个入口共用的内部实现，不直接运行。
+- `replay_common.py`：历史公共接口兼容入口，实际实现位于 `../common/`。
 
-## 模型模板与分段编码
+## 模型模板与文本输入
 
-所有模式必须传入 `--tokenizer-model`，且它必须与 P 节点实际加载模型的 tokenizer 对应。共享层按下列规则构造请求：
+数据、配置与时序的统一说明见 [回放总说明](../README.md)。`replay_common.py`
+保留历史导入路径；公共实现位于 `../common/`。
 
-- `start_request.prompt` 作为 system message；Append、最终 Update 和 finish 文本按顺序组成一个 user message。
-- 使用目标模型 `apply_chat_template()` 和唯一 marker 拆出固定 template prefix/suffix；start、每个 data event 和 finish 都通过 `token_ids` 发送。
-- normal 也提交同一组分段 token ids 的串接结果。因此 Llama 的 BOS、assistant header 与模板边界在三种模式中一致。
-- generation-quality 专用的“最短答案”指令不会在性能回放层额外注入；性能 prompt 的最终问题仍完全由数据集 finish 文本决定。
+默认 `--input-transport text`：normal 提交完整 prompt 字符串；stream/merged 的
+start 提交模板前缀，数据事件提交 `event.text`，finish 提交问题和模板后缀。
+客户端渲染模型模板，P 对原始文本分词。已渲染的 normal/start 使用
+`add_special_tokens=false`，避免重复 BOS；finish 保留 assistant header。
 
-三个脚本都需要配置 `--proxy-url` 和 `--tokenizer-model`。
+`--tokenizer-model` 默认 `~/Models/Qwen2.5-3B`，必须对应服务模型模板。
+normal 整段分词与 stream 逐块分词的边界差异保留。历史预分词实验可显式传
+`--input-transport token_ids`。质量专用短答案指令仅由质量入口注入。
+
+检查 TriviaQA 输入，不发送 HTTP：
+
+```shell
+.venv/bin/python research/scripts/replay/segmented_prefill/replay_prompt_stream.py \
+  --config research/scripts/replay/configs/triviaqa.json \
+  --dry-run --output-dir /tmp/replay-check --run-name triviaqa-stream-check
+```
+
+配置同样适用于 `replay_normal.py` 和 `replay_merged_update.py`；正式实验去掉
+`--dry-run`，设置 `--proxy-url`，并按需要加 `--ttft-only`。
 
 ## proxy 支持的路径
 
@@ -335,7 +350,6 @@ RUN_PREFIX=ttft \
 sbatch research/scripts/replay/segmented_prefill/run_ttft_qps_sweep.sbatch
 ```
 
-
 ### 使用 Triton backend 重跑
 
 attention backend 由 P/D server 启动时全局决定；replay client 不能按请求切换。两个启动脚本现已接受可选的 `ATTENTION_BACKEND` 环境变量。保留既有 FA 结果目录，并使用独立的 `RUN_PREFIX=triton-ttft`：
@@ -463,7 +477,7 @@ done
 | `--include-partial` | 关闭 | 允许使用 `status != complete` 的样本。 |
 | `--proxy-url` | `http://127.0.0.1:8000` | 三种模式共同使用的 proxy 地址。 |
 | `--model` | `qwen2.5-3b` | 必须匹配服务端的 `--served-model-name`。 |
-| `--tokenizer-model` | 必填 | 本地模型/tokenizer 目录；必须与 `--model` 对应的 P 模型使用同一 chat template。 |
+| `--tokenizer-model` | `~/Models/Qwen2.5-3B` | 本地模型/tokenizer 目录；必须与 `--model` 对应的 P 模型使用同一 chat template。 |
 | `--qps` | `1.0` | 逻辑请求启动速率；`0` 表示闭环串行。 |
 | `--arrival-process` | `fixed` | 使用固定间隔或 `poisson` 泊松到达。 |
 | `--max-concurrency` | `32` | 同时在飞的逻辑请求上限。 |

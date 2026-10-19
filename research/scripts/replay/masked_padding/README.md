@@ -5,6 +5,20 @@
 attention 后端和相同 P/D 资源。唯一主动变量是 P、D 是否启用中间 padding
 的 attention mask 与逻辑位置修正。
 
+## 共享数据与文本传输
+
+本入口使用 [公共回放实现](../README.md)，支持独立 questions、append_chunks 和
+pipeline_pools，按 `sample_id` 对齐。默认 `--input-transport text`，客户端渲染
+模型模板，P 分词；start 是模板前缀，事件是原始文本，finish 带问题及 assistant
+header。`--input-transport token_ids` 用于历史预分词实验复现。
+
+`run_masked_padding_sweep.sbatch` 可设置
+`REPLAY_CONFIG=research/scripts/replay/configs/triviaqa.json`。
+其 Python 入口仍是 stream 回放器；`--return-token-ids` 读取输出计量，与输入
+传输模式独立。保留 padding manifest 校验和完整 P→D 生成。
+
+批量脚本支持 `INPUT_TRANSPORT`，默认 text；脚本显式参数优先于配置。
+
 ## 为什么同时测 TTFT 和 TPS
 
 Masked Padding 同时作用于 P、D 两侧：

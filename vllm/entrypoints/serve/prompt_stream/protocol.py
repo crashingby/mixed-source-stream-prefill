@@ -40,6 +40,7 @@ class PromptStreamStartRequest(OpenAIBaseModel):
 
     model: str | None = None
     prompt: str | list[int]
+    add_special_tokens: bool = True
     request_id: str | None = None
     stream: bool = True
     sampling_params: dict[str, Any] = Field(default_factory=dict)
@@ -50,6 +51,7 @@ class PromptStreamStartRequest(OpenAIBaseModel):
             "api",
             "model",
             "prompt",
+            "add_special_tokens",
             "request_id",
             "stream",
             "sampling_params",

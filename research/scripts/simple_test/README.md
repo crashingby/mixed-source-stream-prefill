@@ -1,146 +1,132 @@
-# Prompt Stream 最小测试脚本
+# Prompt Stream 最小测试
 
-这个目录放的是三个最小前端/RAG mock，用来验证 “前端 -> proxy -> P 节点 -> D 节点”的 RESTFUL 链路。
+三个入口分别测试 Append、Update 和交错来源。现在既可以**直连 P 节点**，也可以
+通过 proxy 测试 P-only 或完整 P→D 流程。默认输入是原始文本；客户端只渲染模型
+chat template，P 负责分词。
 
-这些脚本默认发送原始文本，不在前端侧 tokenizer。P 节点的 prompt stream serving 层会把 `text` 转成实际 `token_ids`，并在响应里打印出来，方便排查。
-
-运行前需要先按照 `research/scripts/server/README.md` 启动 P 节点、D 节点和 proxy。
-
-三个脚本都会从 finish 响应顶层解析 `prompt_stream_stats`；字段缺失、类型非法或
-统计关系不一致时会直接失败。重点输出包括 `saved_update_prefill_tokens`、
-`scheduled_update_prefill_tokens` 和 `update_tokens_invalidated`。
-
-## 参数关系
-
-三个脚本的常用参数基本一致：
-
-| 参数 | 含义 |
+| 文件 | 测试内容 |
 | --- | --- |
-| `--proxy-url` | proxy base URL，不带 `/v1`，例如 `http://127.0.0.1:8000` |
-| `--model` | OpenAI API 中的模型名，应填写 `<SERVED_MODEL_NAME>` |
-| `--request-id` | 可选外部请求 id；P 节点仍会返回后续事件使用的内部 id |
-| `--prefix` | start 请求里的固定模板/prefix |
-| `--final-question` | finish 阶段发送的最终用户问题 |
-| `--max-tokens` | 最终 completion 总生成 token 上限 |
-| `--temperature` | 最终 decode temperature |
-| `--event-delay` | 两个流式事件之间的 sleep 秒数，手动观察日志时有用 |
+| `append_frontend.py` | 同一 Append 来源连续追加正文。 |
+| `update_frontend.py` | 同一 Update 来源多次完整替换快照。 |
+| `mixed_frontend.py` | Append 与 Update 交错到达，最后只保留最新 Update。 |
+| `frontend_common.py` | 公共参数、模板、HTTP、来源结束屏障及响应校验。 |
+| `prompt_stream_stats.py` | schema v1/v2 统计及 recovery-aware 守恒校验。 |
+| `tests/` | 不依赖模型或 GPU 的协议回归测试。 |
 
-`--max-tokens` 是用户希望最终 completion 最多生成多少 token。proxy 内部会把发给 P 节点的请求强制改成 `max_tokens=1`，因为 P 节点只负责 prefill 到最终问题并采样首 token；之后 D 节点最多继续生成剩余 token。
+## 当前 P-only 服务
 
-## append-only 测试
-
-`append_frontend.py` 默认只发送 append 文本事件：
-
-1. 发送 `/v1/prompt_stream/start`，其中 `prompt` 是固定模板。
-2. 连续发送多个 `/v1/prompt_stream/event`，每个事件都是 `event_type=append`。
-3. 发送 `/v1/prompt_stream/finish`，其中 `event_type=prompt_finished`。
-4. 打印 proxy 返回的最终 completion。
-
-运行默认示例：
-
-```shell
-.venv/bin/python research/scripts/simple_test/append_frontend.py \
-  --proxy-url http://<PROXY_HOST>:<PROXY_PORT> \
-  --model <SERVED_MODEL_NAME> \
-  --max-tokens 64 \
-  --temperature 0
-```
-
-自定义 append chunk：
-
-```shell
-.venv/bin/python research/scripts/simple_test/append_frontend.py \
-  --proxy-url http://<PROXY_HOST>:<PROXY_PORT> \
-  --model <SERVED_MODEL_NAME> \
-  --chunk "检索片段 1：vLLM 的 EngineCore 保存请求状态。" \
-  --chunk "检索片段 2：proxy 会先把事件发给 P 节点。" \
-  --final-question "\n用户问题：proxy 在 decode 前做了什么？\n回答："
-```
-
-## update-only 测试
-
-`update_frontend.py` 默认只发送一个 update source 的文本快照。每个 update 事件的 `text` 都表示该 source 的**完整当前快照**，不是增量 patch。
-
-这个脚本用于测试 update 源内 LCP、旧 update 后缀失效，以及 finish 后 update KV 与 prefix/append/question 的组合逻辑。
-
-运行默认示例：
-
-```shell
-.venv/bin/python research/scripts/simple_test/update_frontend.py \
-  --proxy-url http://<PROXY_HOST>:<PROXY_PORT> \
-  --model <SERVED_MODEL_NAME> \
-  --max-tokens 64 \
-  --temperature 0
-```
-
-自定义 update 快照：
-
-```shell
-.venv/bin/python research/scripts/simple_test/update_frontend.py \
-  --proxy-url http://<PROXY_HOST>:<PROXY_PORT> \
-  --model <SERVED_MODEL_NAME> \
-  --snapshot "检索快照 v0：proxy 收到流式事件。" \
-  --snapshot "检索快照 v1：proxy 收到流式 prefill 事件，然后请求 D 节点 decode。" \
-  --final-question "\n用户问题：最新快照里 proxy 在 decode 前做了什么？\n回答："
-```
-
-## mixed append/update 测试
-
-`mixed_frontend.py` 默认发送一组交错事件：
-
-```text
-append -> update -> append -> update -> append -> finish
-```
-
-它用于测试更接近真实 RAG 的事件顺序：稳定上下文持续 append，同时一个可变检索结果以 update 快照形式被刷新。每个 append 事件是新增 chunk；每个 update 事件仍然是同一个 update source 的**完整当前快照**，不是增量 diff。
-
-运行默认示例：
+如果 P 按 `ENABLE_KV_TRANSFER=0` 在 `g2c10:8100` 启动，可直接运行：
 
 ```shell
 .venv/bin/python research/scripts/simple_test/mixed_frontend.py \
-  --proxy-url http://<PROXY_HOST>:<PROXY_PORT> \
-  --model <SERVED_MODEL_NAME> \
-  --max-tokens 64 \
-  --temperature 0
+  --target p --server-url http://g2c10:8100 \
+  --model qwen2.5-3b --expected-masked-padding enabled
 ```
 
-自定义混合事件顺序。`--event` 格式是 `<append|update>:text`，命令行顺序就是发送顺序：
-
-```shell
-.venv/bin/python research/scripts/simple_test/mixed_frontend.py \
-  --proxy-url http://<PROXY_HOST>:<PROXY_PORT> \
-  --model <SERVED_MODEL_NAME> \
-  --event "append:稳定片段 1：EngineCore 保存长期请求状态。" \
-  --event "append:稳定片段 2：Append chunk 单调加入 prefix_append KV 域。" \
-  --event "update:可变快照 v0：proxy 收到流式事件。" \
-  --event "update:可变快照 v1：proxy 收到流式事件，并在 decode 前请求 P 节点 prefill。" \
-  --final-question "\n用户问题：稳定片段和最新快照说明 proxy 在 decode 前做什么？\n回答："
-```
-
-## 当前环境示例
-
-这一节是当前实验环境的可复制命令。对外发布 README 时可以删除。
+测试另外两个入口：
 
 ```shell
 .venv/bin/python research/scripts/simple_test/append_frontend.py \
-  --proxy-url http://127.0.0.1:8000 \
-  --model qwen2.5-3b \
-  --max-tokens 64 \
-  --temperature 0
+  --target p --server-url http://g2c10:8100 \
+  --expected-masked-padding enabled
+
+.venv/bin/python research/scripts/simple_test/update_frontend.py \
+  --target p --server-url http://g2c10:8100 \
+  --expected-masked-padding enabled
 ```
 
-```shell
-.venv/bin/python research/scripts/simple_test/update_frontend.py \
-  --proxy-url http://127.0.0.1:8000 \
-  --model qwen2.5-3b \
-  --max-tokens 64 \
-  --temperature 0
-```
+直连 P 使用 `/v1/prompt_stream/start`、`/event`、`/finish`，不需要 D 或 proxy。
+**P-only 只返回一个输出 token**，用于验证 Prefill 和输入布局；它不会生成完整答案，
+脚本会强制 start 的 `max_tokens=1`。`finish_response_ms` 是客户端从发送 finish
+到消费完响应的耗时，包含网络和响应解析。
+
+## 请求与检查
+
+一次测试按下面顺序执行：
+
+1. start 发送模型模板前缀，包括 system message 和 user header。
+2. 按 CLI 或默认顺序发送 Append 增量、Update 完整快照；每条等待 ACK。
+3. 为每个实际使用的来源发送一次 `source_finished`，使用该来源下一条序号。
+4. 所有来源结束 ACK 后，finish 发送问题及模板后缀，保留 assistant header。
+5. 解析并检查最终统计、masked-padding 清单和可用的实际 prompt token 视图。
+
+请求只携带 `prompt` / `event.text`，没有客户端输入 token IDs。已渲染的 start
+设置 `add_special_tokens=false`；实际 P token IDs 从 ACK 读取。当 P 返回物理
+`prompt_token_ids` 时，脚本去掉清单指定的 padding，检查它等于 start ACK、全部
+Append ACK、最新 Update ACK 和 finish ACK 的串接。该校验不要求服务端逐块分词
+与整段分词相同。
+
+最后的 `test summary` 会输出 `status=ok`、完成来源数、mask 区间及
+`prompt_tokens_checked`。部分 proxy 返回不包含完整物理视图，此时该字段为 false，
+仍会检查统计和可用 mask。异常或 Ctrl+C 会对已创建的会话发送 abort。
+
+## proxy 模式
+
+原有 `--proxy-url` 保留为 `--server-url` 的别名。默认 `--target proxy`，
+默认地址仍是 `http://127.0.0.1:8000`。URL 可以带 `/v1`；HTTP 客户端不继承下载
+模型时设置的外部代理。
+
+P-only proxy 流程使用专门的 TTFT start/finish 路由，并消费完整的首 token SSE：
 
 ```shell
 .venv/bin/python research/scripts/simple_test/mixed_frontend.py \
-  --proxy-url http://127.0.0.1:8000 \
-  --model qwen2.5-3b \
-  --max-tokens 64 \
-  --temperature 0
+  --target proxy --proxy-url http://<PROXY_HOST>:8000 --ttft-only
 ```
+
+完整答案测试需要启用 KV transfer 的 P、同模型 D 和普通 proxy：
+
+```shell
+.venv/bin/python research/scripts/simple_test/mixed_frontend.py \
+  --target proxy --proxy-url http://<PROXY_HOST>:8000 \
+  --max-tokens 64 --temperature 0
+```
+
+服务启动见 [server README](../server/README.md)。完整 masked-padding PD 模式需
+P/D 都使用 Triton、启用 mask，并使用 `GENERATION_CONFIG=vllm`。
+稳定 KV 提前 Push 使用自己的服务与 replay，见
+[稳定 KV 实验说明](../replay/stable_kv_push/README.md)。
+
+## 自定义数据与参数
+
+Append 的 `--chunk`、Update 的 `--snapshot` 可重复指定；mixed 的 `--event` 格式
+为 `append:text` 或 `update:text`，CLI 顺序就是发送顺序。每个 snapshot 都替换
+同来源上一代正文。
+
+```shell
+.venv/bin/python research/scripts/simple_test/mixed_frontend.py \
+  --target p --server-url http://g2c10:8100 \
+  --event $'append:Paris is a city in France.\n' \
+  --event $'update:The venue is London.\n' \
+  --event $'update:The venue is Paris.\n' \
+  --final-question $'\nQuestion: What is the latest venue?\nAnswer:'
+```
+
+| 参数 | 默认值与作用 |
+| --- | --- |
+| `--target` | `proxy`；`p` 表示直连 P。 |
+| `--server-url` / `--proxy-url` | `http://127.0.0.1:8000`；实际调用的服务地址。 |
+| `--ttft-only` | proxy 仅访问 P，不创建 D 请求。 |
+| `--model` | `qwen2.5-3b`，填写 served model name。 |
+| `--tokenizer-model` | `~/Models/Qwen2.5-3B`，提供与服务一致的模型模板；客户端不分词。 |
+| `--prefix` | 该入口默认说明，作为 system message。 |
+| `--final-question` | 默认示例问题，追加模板后缀后发送。 |
+| `--raw-prompt` | 恢复旧原始 prefix/question 拼接方式，跳过模型模板。 |
+| `--max-tokens` | `64`；仅完整 PD 使用，P-only 强制为 1。 |
+| `--temperature` / `--seed` | `0` / `2026`；模型采样参数。 |
+| `--event-delay` | `0`；每条数据 ACK 后等待的秒数，仅用于手动联调。 |
+| `--http-timeout` | `120` 秒；有限超时，避免异常会话一直等待。 |
+| `--expected-masked-padding` | `any`；也可用 `enabled` / `disabled` 校验实际开关。 |
+| `--request-id` | 可选外部 ID，后续事件始终使用 start 返回的内部 ID。 |
+
+手动联调的 `event-delay` 从上一条 ACK 起算；正式 replay 使用绝对时间线，见
+[replay README](../replay/README.md)。最小测试的延迟不能用于代替正式性能实验配置。
+
+## 回归测试
+
+```shell
+PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 .venv/bin/python -m pytest --noconftest \
+  research/scripts/simple_test/tests -q
+```
+
+服务端 start 已补齐 `add_special_tokens` 到实际 engine 分词的传递，使实际输入与
+长度镜像使用同一设置。这部分 Python 服务代码需要重启 P 后加载；原有默认值仍为 true。

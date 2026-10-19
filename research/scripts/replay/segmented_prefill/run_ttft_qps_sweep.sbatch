@@ -95,6 +95,10 @@ run_replay() {
     --output-dir "${OUTPUT_DIR}"
     --run-name "${run_name}"
   )
+  common_args+=(--input-transport "${INPUT_TRANSPORT:-text}")
+  if [[ -n "${REPLAY_CONFIG:-}" ]]; then
+    common_args+=(--config "${REPLAY_CONFIG}")
+  fi
 
   if [[ "${TOKENIZER_TRUST_REMOTE_CODE}" == "1" ]]; then
     common_args+=(--tokenizer-trust-remote-code)

@@ -1,4 +1,4 @@
-# 生成质量与 SQuAD EM/F1 实验
+# 生成质量与答案 EM/F1 实验
 
 本目录比较两种完整生成路径的答案质量：
 
@@ -9,14 +9,15 @@
   的独立来源语义，再由 P→D 链路完成生成。
 
 实验不会使用 `finish_ttft` 或 `completions_ttft`。客户端消费完整 SSE，保存
-最终答案，再按照 SQuAD v2 官方 Exact Match（EM）和 token-level F1 评分。
+最终答案，再按 SQuAD v2、TriviaQA 或 HotpotQA 的官方答案归一化计算 EM/F1。
 
 ## 目录内容
 
 | 文件 | 用途 |
 | --- | --- |
 | `replay_generation_quality.py` | 低压力逐请求回放；使用 `--mode normal` 或 `--mode segmented` 选择链路。 |
-| `evaluate_squad.py` | 计算官方 EM/F1 和逐请求配对退化。 |
+| `evaluate_answers.py` | 按结果的 `evaluation_protocol` 计算答案 EM/F1 和配对退化。 |
+| `evaluate_squad.py` | 保留旧命令，同样支持三种答案协议。 |
 | `run_generation_quality.sbatch` | 顺序运行两种模式，结束后自动评分。 |
 | `results/` | 默认结果目录；运行时创建。 |
 
@@ -57,9 +58,45 @@ Llama 使用不同的 assistant header 与结束 token。
   分段模式退化为错误的比例；
 - `mean_f1_delta_segmented_minus_normal`：逐请求配对的平均 F1 变化。
 
-每条结果同时保存 `logical_prompt_sha256` 和
-`logical_prompt_token_sha256`。若同一样本的两种模式构造了不同文本或 token
-序列，评分脚本会直接报错，不生成不可比的统计。
+每条结果保存最终文本 `logical_prompt_sha256`、评价协议和输入传输方式。
+默认 text 模式的 `logical_prompt_tokens`、`logical_prompt_token_sha256` 为 null，
+客户端不会为输入分词。配对评分校验文本、答案与评价协议一致；两种模式须使用
+同一传输方式。显式 token_ids 模式还校验逻辑 token 哈希。
+
+### TriviaQA 与 HotpotQA
+
+独立数据直接从 questions JSONL 的 `evaluation` 读取参考答案，无需 SQuAD
+`--gold-manifest`。数据选择、空来源、快照和时间定义见 [回放总说明](../README.md)。
+
+- TriviaQA 使用官方 `NormalizedAliases` 与归一化 `HumanAnswers`，下划线和
+  标点替换为空格。实现依据 [TriviaQA 官方评测脚本](https://github.com/mandarjoshi90/triviaqa/blob/master/evaluation/triviaqa_evaluation.py)。
+- HotpotQA 使用官方答案 EM/F1，包括 `yes/no/noanswer` 特殊 F1 规则。
+  实现依据 [HotpotQA 官方评测脚本](https://github.com/hotpotqa/hotpot/blob/master/hotpot_evaluate_v1.py)。
+  本实验只生成答案，**不报告 supporting-fact 或 joint 指标**。
+- `exact_match` / `f1` 保留旧成功请求分母；`exact_match_all_requests` /
+  `f1_all_requests` 以全部结果记录为分母，失败请求记零分。两类指标均为 0–100。
+  中断导致从未写入结果的请求不在这个分母里，应先确认结果数量等于选中数量。
+
+同一配置分别生成，再配对评分：
+
+```shell
+.venv/bin/python research/scripts/replay/generation_quality/replay_generation_quality.py \
+  --config research/scripts/replay/configs/triviaqa.json --mode normal \
+  --proxy-url http://<PROXY_HOST>:8000 --run-name triviaqa-normal
+
+.venv/bin/python research/scripts/replay/generation_quality/replay_generation_quality.py \
+  --config research/scripts/replay/configs/triviaqa.json --mode segmented \
+  --proxy-url http://<PROXY_HOST>:8000 --run-name triviaqa-segmented
+
+.venv/bin/python research/scripts/replay/generation_quality/evaluate_answers.py \
+  --normal-results research/scripts/replay/generation_quality/results/triviaqa-normal \
+  --segmented-results research/scripts/replay/generation_quality/results/triviaqa-segmented \
+  --output-dir research/scripts/replay/generation_quality/results/triviaqa-analysis
+```
+
+两个回放命令加 `--dry-run` 可检查模板与证据，查看 `prompt_preview.jsonl`。
+此时不会生成有效答案，不能用 dry-run 结果做质量评分。
+`REPLAY_CONFIG=...` 可供 sbatch 选用独立数据；批量脚本的显式参数优先于 JSON。
 
 ## Prompt 与事件构造
 
@@ -76,13 +113,12 @@ user = 所有 Append chunk
 
 随后由目标 tokenizer 的 `apply_chat_template()` 加入 BOS、system/user role、
 user 结束标记和 assistant generation header。回放器将渲染后的结构拆成固定
-template prefix、动态来源内容和 finish suffix，并使用 tokenizer 预先生成 token
-IDs。
+template prefix、动态来源内容和 finish suffix，默认直接发送原始文本给 P 分词。
 
 分段模式使用相同逻辑内容，但保留 REST 事件形态：
 
-1. `start` 发送 chat template 的 BOS、system message 和 user header token IDs。
-2. 每个来源按自己的 `sequence_no` 串行发送预分词 token IDs。
+1. `start` 发送 chat template 的 BOS、system message 和 user header 文本。
+2. 每个来源按自己的 `sequence_no` 串行发送原始事件文本。
 3. Append 与 Update 来源按各自 interval 并发竞争。
 4. 所有 `source_finished` 获得 ACK 后，在最终用户问题与 `Answer:` 之间插入
    短答案约束，并追加 user 结束标记与 assistant header，再发送
@@ -90,7 +126,7 @@ IDs。
 5. `/finish` 先返回 P 首 token，proxy 再转发 D 的剩余 decode SSE。
 6. 回放脚本消费到 `[DONE]`，拼接 P 与 D 的输出文本。
 
-实验默认**一次只执行一个逻辑请求**，没有 QPS 或跨请求并发。参数
+实验默认 `--qps 0`，**一次只执行一个逻辑请求**；也可显式设置 QPS 与并发上限。参数
 `--inter-request-delay` 还会在请求之间留出空闲时间。因此这里测输出质量，不测
 高压力吞吐或 TTFT。
 
@@ -280,7 +316,7 @@ sbatch --nodelist=g2c12 \
 
 | 环境变量 | 默认值 | 含义 |
 | --- | ---: | --- |
-| `TOKENIZER_MODEL` | `MODEL_PATH` | 与 P/D 相同的本地模型目录或 Hugging Face tokenizer 标识；两者都未设置时退出。 |
+| `TOKENIZER_MODEL` | `MODEL_PATH` 或 `~/Models/Qwen2.5-3B` | 与 P/D 相同的本地模型目录或 Hugging Face tokenizer 标识。 |
 | `TOKENIZER_TRUST_REMOTE_CODE` | `0` | 为 `1` 时允许 tokenizer 仓库自定义代码。 |
 | `START_INDEX` | `0` | 在数值 `query_id` 排序后的起始位置。 |
 | `MAX_REQUESTS` | `100` | 两种模式共同使用的请求数；`0` 表示全部合格请求。 |
@@ -359,5 +395,5 @@ for row in csv.DictReader(path.open(encoding="utf-8")):
   答案，也不衡量引用忠实性。
 - 网页噪声会影响两种模式的绝对正确率，因此应同时报告模式级 EM/F1 和配对
   回退率，不能只看 `segmented` 单独分数。
-- 未匹配 SQuAD 的问题会在回放前排除，不会被当成错误预测。
+- 旧 SQuAD 输入未匹配 gold manifest 的问题在回放前排除；独立数据使用自己的评价协议。
 - 正式对比建议保持 `temperature=0`、相同 `seed`、相同模型与采样参数。

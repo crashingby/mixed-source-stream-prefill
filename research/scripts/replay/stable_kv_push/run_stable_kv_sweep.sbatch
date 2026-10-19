@@ -31,6 +31,10 @@ SOURCE_FINISH_DELAY="${SOURCE_FINISH_DELAY:-0.0}"
 RANDOM_SEED="${RANDOM_SEED:-2026}"
 RUN_PREFIX="${RUN_PREFIX:-stable-kv-job-${SLURM_JOB_ID:-manual}}"
 SCRIPT_DIR=research/scripts/replay/stable_kv_push
+replay_input_args=(--input-transport "${INPUT_TRANSPORT:-text}")
+if [[ -n "${REPLAY_CONFIG:-}" ]]; then
+  replay_input_args+=(--config "${REPLAY_CONFIG}")
+fi
 echo "HOSTNAME=$(hostname) PROXY_URL=${PROXY_URL} QPS_LIST=${QPS_LIST}"
 echo "DATA_DIR=${DATA_DIR} MAX_REQUESTS=${MAX_REQUESTS} NUM_REPEATS=${NUM_REPEATS}"
 echo "APPEND_INITIAL_DELAY=${APPEND_INITIAL_DELAY} UPDATE_INITIAL_DELAY=${UPDATE_INITIAL_DELAY}"
@@ -50,6 +54,7 @@ for ((repeat=1; repeat<=NUM_REPEATS; repeat++)); do
         push_flag=--early-push
       fi
       "${PYTHON_BIN}" "${SCRIPT_DIR}/replay_stable_kv_push.py" \
+        "${replay_input_args[@]}" \
         --data-dir "${DATA_DIR}" \
         --output-dir "${OUTPUT_DIR}" \
         --proxy-url "${PROXY_URL}" \

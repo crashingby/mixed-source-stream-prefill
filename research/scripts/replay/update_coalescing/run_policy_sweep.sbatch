@@ -128,6 +128,10 @@ run_replay() {
     --expected-coalescing "${EXPECTED_COALESCING}"
     --ttft-only
   )
+  replay_args+=(--input-transport "${INPUT_TRANSPORT:-text}")
+  if [[ -n "${REPLAY_CONFIG:-}" ]]; then
+    replay_args+=(--config "${REPLAY_CONFIG}")
+  fi
 
   if [[ "${TOKENIZER_TRUST_REMOTE_CODE}" == "1" ]]; then
     replay_args+=(--tokenizer-trust-remote-code)

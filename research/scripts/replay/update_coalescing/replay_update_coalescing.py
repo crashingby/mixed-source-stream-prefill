@@ -9,9 +9,7 @@ import os
 import sys
 from pathlib import Path
 
-DEFAULT_OUTPUT_DIR = Path(
-    "research/scripts/replay/update_coalescing/results"
-)
+DEFAULT_OUTPUT_DIR = Path("research/scripts/replay/update_coalescing/results")
 
 
 def main() -> None:

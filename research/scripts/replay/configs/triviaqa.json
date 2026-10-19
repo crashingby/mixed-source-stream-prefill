@@ -1,0 +1,23 @@
+{
+  "dataset": "triviaqa",
+  "questions_file": "../../../data/questions/triviaqa/web_unfiltered_dev_v1.jsonl",
+  "append_dir": "../../../data/append_chunks/triviaqa/web_unfiltered_dev_v1",
+  "pipeline_pools_dir": "../../../data/pipeline_pools/triviaqa/wiki_dev_k5_ef8_v1",
+  "tokenizer_model": "~/Models/Qwen2.5-3B",
+  "model": "qwen2.5-3b",
+  "proxy_url": "http://127.0.0.1:8000",
+  "input_transport": "text",
+  "max_requests": 16,
+  "qps": 0,
+  "arrival_process": "fixed",
+  "random_seed": 2026,
+  "max_concurrency": 8,
+  "append_initial_delay": 0.0,
+  "update_initial_delay": 0.0,
+  "append_chunk_interval": 0.05,
+  "update_chunk_interval": 0.02,
+  "source_finish_delay": 0.0,
+  "max_tokens": 32,
+  "temperature": 0.0,
+  "seed": 2026
+}

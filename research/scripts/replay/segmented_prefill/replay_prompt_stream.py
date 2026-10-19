@@ -8,30 +8,58 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
+import sys
 import time
 import uuid
+from pathlib import Path
 from typing import Any
 
 import httpx
-from replay_common import (
-    ChatTemplateRenderer,
-    EventMetric,
-    RenderedReplayPrompt,
-    ReplayHttpError,
-    RequestMetric,
-    SampleReplayInput,
-    SourceEventStream,
-    SseMeasurement,
-    apply_prompt_stream_stats,
-    _normalize_v1_url,
-    _override_sampling_params,
-    _post_json,
-    _prompt_stream_finish_endpoint,
-    _prompt_stream_start_endpoint,
-    _sleep_until,
-    consume_sse_response,
-    main,
-    should_log_event_progress,
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[4]))
+
+from research.scripts.replay.common.dispatch import (
+    abort_prompt_stream as _abort_prompt_stream,
+)
+from research.scripts.replay.common.dispatch import metric_mode as _metric_mode
+from research.scripts.replay.common.dispatch import (
+    send_source_events as _send_source_events,
+)
+from research.scripts.replay.common.metrics import apply_completion_measurement
+from research.scripts.replay.common.metrics import (
+    apply_prompt_stream_stats as apply_prompt_stream_stats,
+)
+from research.scripts.replay.common.models import EventMetric as EventMetric
+from research.scripts.replay.common.models import (
+    RenderedReplayPrompt as RenderedReplayPrompt,
+)
+from research.scripts.replay.common.models import RequestMetric as RequestMetric
+from research.scripts.replay.common.models import SampleReplayInput as SampleReplayInput
+from research.scripts.replay.common.models import SourceEventStream as SourceEventStream
+from research.scripts.replay.common.models import SseMeasurement as SseMeasurement
+from research.scripts.replay.common.prompt import (
+    ChatTemplateRenderer as ChatTemplateRenderer,
+)
+from research.scripts.replay.common.prompt import (
+    override_sampling_params as _override_sampling_params,
+)
+from research.scripts.replay.common.runner import main as main
+from research.scripts.replay.common.timeline import (
+    should_log_event_progress as should_log_event_progress,
+)
+from research.scripts.replay.common.transport import ReplayHttpError as ReplayHttpError
+from research.scripts.replay.common.transport import (
+    consume_sse_response as consume_sse_response,
+)
+from research.scripts.replay.common.transport import (
+    normalize_v1_url as _normalize_v1_url,
+)
+from research.scripts.replay.common.transport import post_json as _post_json
+from research.scripts.replay.common.transport import (
+    prompt_stream_finish_endpoint as _prompt_stream_finish_endpoint,
+)
+from research.scripts.replay.common.transport import (
+    prompt_stream_start_endpoint as _prompt_stream_start_endpoint,
 )
 
 logger = logging.getLogger(__name__)
@@ -53,8 +81,13 @@ def _make_stream_start_payload(
         {
             "api": "completions",
             "model": args.model,
-            "prompt": list(rendered_prompt.start_token_ids),
+            "prompt": (
+                rendered_prompt.start_text
+                if rendered_prompt.input_transport == "text"
+                else list(rendered_prompt.start_token_ids)
+            ),
             "stream": True,
+            "add_special_tokens": False,
             "request_id": external_request_id,
         }
     )
@@ -64,283 +97,6 @@ def _make_stream_start_payload(
         # 使用真实 token 数，而不是把 chunk 数误当成 token 数。
         payload["return_token_ids"] = True
     return payload
-
-
-def _source_timing(
-    source_type: str,
-    args: argparse.Namespace,
-) -> tuple[float, float]:
-    """返回一个来源的首 chunk 延迟与后续数据 chunk 间隔。"""
-    if source_type == "append":
-        return args.append_initial_delay, args.append_chunk_interval
-    if source_type == "update":
-        return args.update_initial_delay, args.update_chunk_interval
-    raise ValueError(f"Unsupported source_type={source_type!r}.")
-
-
-def _longest_common_prefix_len(
-    previous_token_ids: tuple[int, ...],
-    current_token_ids: tuple[int, ...],
-) -> int:
-    """计算两个 source-local Update 快照的 token LCP 长度。
-
-    Args:
-        previous_token_ids: 同一 Update source 的上一代完整 token 快照。
-        current_token_ids: 本次 ACK 返回的完整 token 快照。
-
-    Returns:
-        两代快照从首 token 开始连续相同的 token 数。
-    """
-    common_prefix_len = 0
-    for previous_token_id, current_token_id in zip(
-        previous_token_ids,
-        current_token_ids,
-    ):
-        if previous_token_id != current_token_id:
-            break
-        common_prefix_len += 1
-    return common_prefix_len
-
-
-def _metric_mode(args: argparse.Namespace) -> str:
-    """按实验套件返回稳定的请求与事件指标标签。"""
-    if args.experiment_suite == "update_coalescing":
-        return "update_coalescing"
-    return "stream"
-
-
-async def _send_source_events(
-    client: httpx.AsyncClient,
-    proxy_url: str,
-    request_id: str,
-    sample: SampleReplayInput,
-    renderer: ChatTemplateRenderer,
-    source_stream: SourceEventStream,
-    source_dispatch_start_time: float,
-    args: argparse.Namespace,
-    run_id: str,
-) -> list[EventMetric]:
-    """按一个来源的 source-local 顺序发送所有事件并等待每次 ack。
-
-    每个来源在独立 asyncio task 内运行。因此 Append 和 Update 可以并发抵达
-    scheduler；同一来源严格串行，保证 Update 版本与 Append 序号不乱序。
-    """
-    initial_delay, chunk_interval = _source_timing(source_stream.source_type, args)
-    event_metrics: list[EventMetric] = []
-    num_data_events_sent = 0
-    last_data_ack_time: float | None = None
-    previous_update_token_ids: tuple[int, ...] | None = None
-
-    for event_index, record in enumerate(source_stream.event_records):
-        stored_event = record["event"]
-        event_type = str(stored_event["event_type"])
-        chunk_id = str(stored_event.get("chunk_id") or "")
-        sequence_no = int(stored_event.get("sequence_no", 0))
-        version = int(stored_event.get("version", 0))
-        text_chars = len(str(stored_event.get("text") or ""))
-        should_log_event = should_log_event_progress(args, event_index)
-
-        if event_type in ("append", "update"):
-            scheduled_offset = initial_delay + num_data_events_sent * chunk_interval
-            scheduled_target_time = source_dispatch_start_time + scheduled_offset
-            num_data_events_sent += 1
-        else:
-            # SOURCE_FINISHED 严格从最后一条数据事件 ACK 完成时开始计时。
-            barrier_base_time = last_data_ack_time
-            if barrier_base_time is None:
-                barrier_base_time = source_dispatch_start_time + initial_delay
-            scheduled_target_time = barrier_base_time + args.source_finish_delay
-            scheduled_offset = scheduled_target_time - source_dispatch_start_time
-        if should_log_event:
-            wait_ms = max(0.0, scheduled_target_time - time.perf_counter()) * 1000
-            logger.info(
-                "Replay stream WAIT event: run_id=%s request_id=%s "
-                "sample_id=%s query_id=%s source_id=%s source_type=%s "
-                "event_index=%d event_type=%s chunk_id=%s sequence_no=%d "
-                "version=%d scheduled_offset_ms=%.3f wait_ms=%.3f "
-                "text_chars=%d",
-                run_id,
-                request_id,
-                sample.sample_id,
-                sample.query_id,
-                source_stream.source_id,
-                source_stream.source_type,
-                event_index,
-                event_type,
-                chunk_id,
-                sequence_no,
-                version,
-                scheduled_offset * 1000,
-                wait_ms,
-                text_chars,
-            )
-
-        await _sleep_until(scheduled_target_time)
-        actual_send_time = time.perf_counter()
-        actual_send_offset_ms = (
-            actual_send_time - source_dispatch_start_time
-        ) * 1000
-        outbound_event = dict(stored_event)
-        if event_type in ("append", "update"):
-            outbound_event["token_ids"] = list(
-                renderer.encode_content(str(outbound_event.get("text") or ""))
-            )
-        # 数据集没有实验时间；每次真正发 REST 请求时才附加 arrival_time。
-        outbound_event["arrival_time"] = time.time()
-        payload = {
-            "request_id": request_id,
-            "event": outbound_event,
-        }
-        if should_log_event:
-            logger.info(
-                "Replay stream SEND event: run_id=%s request_id=%s "
-                "sample_id=%s query_id=%s source_id=%s source_type=%s "
-                "event_index=%d event_type=%s chunk_id=%s sequence_no=%d "
-                "version=%d actual_send_offset_ms=%.3f text_chars=%d",
-                run_id,
-                request_id,
-                sample.sample_id,
-                sample.query_id,
-                source_stream.source_id,
-                source_stream.source_type,
-                event_index,
-                event_type,
-                chunk_id,
-                sequence_no,
-                version,
-                actual_send_offset_ms,
-                text_chars,
-            )
-
-        ack_start_time = time.perf_counter()
-        try:
-            ack_response = await _post_json(
-                client,
-                _normalize_v1_url(proxy_url, "/v1/prompt_stream/event"),
-                payload,
-            )
-        except Exception as exc:
-            if should_log_event:
-                logger.warning(
-                    "Replay stream ERROR event: run_id=%s request_id=%s "
-                    "sample_id=%s query_id=%s source_id=%s source_type=%s "
-                    "event_index=%d event_type=%s chunk_id=%s sequence_no=%d "
-                    "version=%d error=%s",
-                    run_id,
-                    request_id,
-                    sample.sample_id,
-                    sample.query_id,
-                    source_stream.source_id,
-                    source_stream.source_type,
-                    event_index,
-                    event_type,
-                    chunk_id,
-                    sequence_no,
-                    version,
-                    exc,
-                )
-            event_metrics.append(
-                EventMetric(
-                    run_id=run_id,
-                    mode=_metric_mode(args),
-                    sample_id=sample.sample_id,
-                    query_id=sample.query_id,
-                    source_id=source_stream.source_id,
-                    source_type=source_stream.source_type,
-                    event_type=event_type,
-                    chunk_id=chunk_id,
-                    sequence_no=sequence_no,
-                    version=version,
-                    scheduled_offset_ms=scheduled_offset * 1000,
-                    actual_send_offset_ms=actual_send_offset_ms,
-                    ack_latency_ms=None,
-                    result_status="error",
-                    error=str(exc),
-                )
-            )
-            raise
-
-        ack_completed_time = time.perf_counter()
-        if event_type in ("append", "update"):
-            last_data_ack_time = ack_completed_time
-
-        num_event_tokens: int | None = None
-        update_lcp_tokens: int | None = None
-        update_lcp_ratio: float | None = None
-        raw_token_ids = ack_response.get("token_ids")
-        if (
-            event_type == "update"
-            and args.experiment_suite == "update_coalescing"
-            and raw_token_ids is None
-        ):
-            raise ReplayHttpError(
-                "Formal Update coalescing replay requires token_ids in every "
-                "Update event ACK."
-            )
-        if raw_token_ids is not None:
-            if not isinstance(raw_token_ids, list) or not all(
-                type(token_id) is int for token_id in raw_token_ids
-            ):
-                raise ReplayHttpError(
-                    "Prompt-stream event token_ids must be a list of integers."
-                )
-            event_token_ids = tuple(raw_token_ids)
-            num_event_tokens = len(event_token_ids)
-            if event_type == "update":
-                if previous_update_token_ids is not None:
-                    update_lcp_tokens = _longest_common_prefix_len(
-                        previous_update_token_ids,
-                        event_token_ids,
-                    )
-                    update_lcp_ratio = update_lcp_tokens / max(
-                        1, num_event_tokens
-                    )
-                # 下一代只与同一 Update source 的本代完整 token 快照比较。
-                previous_update_token_ids = event_token_ids
-
-        ack_latency_ms = (ack_completed_time - ack_start_time) * 1000
-        if should_log_event:
-            logger.info(
-                "Replay stream ACK event: run_id=%s request_id=%s "
-                "sample_id=%s query_id=%s source_id=%s source_type=%s "
-                "event_index=%d event_type=%s chunk_id=%s sequence_no=%d "
-                "version=%d ack_latency_ms=%.3f",
-                run_id,
-                request_id,
-                sample.sample_id,
-                sample.query_id,
-                source_stream.source_id,
-                source_stream.source_type,
-                event_index,
-                event_type,
-                chunk_id,
-                sequence_no,
-                version,
-                ack_latency_ms,
-            )
-
-        event_metrics.append(
-            EventMetric(
-                run_id=run_id,
-                mode=_metric_mode(args),
-                sample_id=sample.sample_id,
-                query_id=sample.query_id,
-                source_id=source_stream.source_id,
-                source_type=source_stream.source_type,
-                event_type=event_type,
-                chunk_id=chunk_id,
-                sequence_no=sequence_no,
-                version=version,
-                scheduled_offset_ms=scheduled_offset * 1000,
-                actual_send_offset_ms=actual_send_offset_ms,
-                ack_latency_ms=ack_latency_ms,
-                result_status="ok",
-                num_event_tokens=num_event_tokens,
-                update_lcp_tokens=update_lcp_tokens,
-                update_lcp_ratio=update_lcp_ratio,
-            )
-        )
-    return event_metrics
 
 
 def _apply_masked_padding_measurement(
@@ -377,22 +133,6 @@ def _apply_masked_padding_measurement(
             f"expected={expected_mode}, observed={observed_enabled}."
         )
     metric.masked_padding_validation_status = "valid"
-
-
-async def _abort_prompt_stream(
-    client: httpx.AsyncClient,
-    proxy_url: str,
-    request_id: str,
-) -> None:
-    """尽力清理发生中途错误的 P 节点长期请求。"""
-    try:
-        await _post_json(
-            client,
-            _normalize_v1_url(proxy_url, "/v1/prompt_stream/abort"),
-            {"request_id": request_id},
-        )
-    except Exception as exc:  # pragma: no cover - 仅清理路径。
-        logger.warning("Failed to abort prompt-stream request %s: %s", request_id, exc)
 
 
 async def _replay_stream_sample(
@@ -513,7 +253,9 @@ async def _replay_stream_sample(
 
         finish_event = dict(sample.finish_event)
         finish_event["text"] = rendered_prompt.finish_text
-        finish_event["token_ids"] = list(rendered_prompt.finish_token_ids)
+        finish_event.pop("token_ids", None)
+        if rendered_prompt.input_transport == "token_ids":
+            finish_event["token_ids"] = list(rendered_prompt.finish_token_ids)
         finish_event["arrival_time"] = time.time()
         finish_payload = {
             "request_id": request_id,
@@ -575,33 +317,7 @@ async def _replay_stream_sample(
             sse_measurement.completed_time - request_start_time
         ) * 1000
         metric.ttft_origin = sse_measurement.first_token_origin
-        metric.completion_chars = sse_measurement.completion_chars
-        metric.completion_chunks = sse_measurement.completion_chunks
-        metric.completion_tokens = sse_measurement.completion_tokens
-        metric.completion_token_count_exact = (
-            sse_measurement.completion_token_count_exact
-        )
-        metric.time_to_last_token_ms = (
-            sse_measurement.last_token_time - finish_sent_time
-        ) * 1000
-        if (
-            metric.completion_token_count_exact
-            and metric.completion_tokens > 1
-        ):
-            # TPOT 采用首 token 之后 N-1 个生成间隔的平均时长。它包含
-            # P→D handoff、D 调度及 decode，正好覆盖 mask 在 D 侧的代价。
-            decode_duration_ms = (
-                sse_measurement.last_token_time
-                - sse_measurement.first_token_time
-            ) * 1000
-            metric.mean_time_per_output_token_ms = (
-                decode_duration_ms / (metric.completion_tokens - 1)
-            )
-            if metric.mean_time_per_output_token_ms > 0:
-                metric.output_tokens_per_second = (
-                    1000 / metric.mean_time_per_output_token_ms
-                )
-        metric.response_payloads = list(sse_measurement.payloads)
+        apply_completion_measurement(metric, sse_measurement, finish_sent_time)
         apply_prompt_stream_stats(
             metric,
             sse_measurement.prompt_stream_stats,
@@ -651,13 +367,9 @@ async def _replay_stream_sample(
         metric.request_error_stage = request_stage
         metric.error = str(exc)
         error_completed_time = time.perf_counter()
-        metric.request_to_done_ms = (
-            error_completed_time - request_start_time
-        ) * 1000
+        metric.request_to_done_ms = (error_completed_time - request_start_time) * 1000
         if finish_sent_time is not None:
-            metric.finish_to_done_ms = (
-                error_completed_time - finish_sent_time
-            ) * 1000
+            metric.finish_to_done_ms = (error_completed_time - finish_sent_time) * 1000
         if request_id is not None and not metric.first_token_received:
             await _abort_prompt_stream(client, args.proxy_url, request_id)
     return metric

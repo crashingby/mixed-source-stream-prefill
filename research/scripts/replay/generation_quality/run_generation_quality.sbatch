@@ -17,7 +17,7 @@ DATA_DIR="${DATA_DIR:-research/data/mix_source}"
 OUTPUT_DIR="${OUTPUT_DIR:-research/scripts/replay/generation_quality/results}"
 PROXY_URL="${PROXY_URL:-http://127.0.0.1:8000}"
 MODEL="${MODEL:-qwen2.5-3b}"
-TOKENIZER_MODEL="${TOKENIZER_MODEL:-${MODEL_PATH:-}}"
+TOKENIZER_MODEL="${TOKENIZER_MODEL:-${MODEL_PATH:-${HOME}/Models/Qwen2.5-3B}}"
 TOKENIZER_TRUST_REMOTE_CODE="${TOKENIZER_TRUST_REMOTE_CODE:-0}"
 
 if [[ -z "${TOKENIZER_MODEL}" ]]; then
@@ -40,7 +40,7 @@ SOURCE_FINISH_DELAY="${SOURCE_FINISH_DELAY:-0.0}"
 
 HTTP_TIMEOUT="${HTTP_TIMEOUT:-600}"
 SSE_TIMEOUT="${SSE_TIMEOUT:-300}"
-RUN_PREFIX="${RUN_PREFIX:-squad-quality}"
+RUN_PREFIX="${RUN_PREFIX:-answer-quality}"
 MODE_ORDER="${MODE_ORDER:-normal segmented}"
 STOP_AT_NEWLINE="${STOP_AT_NEWLINE:-1}"
 FAIL_FAST="${FAIL_FAST:-0}"
@@ -105,6 +105,10 @@ run_mode() {
     --output-dir "${OUTPUT_DIR}"
     --run-name "${run_name}"
   )
+  replay_args+=(--input-transport "${INPUT_TRANSPORT:-text}")
+  if [[ -n "${REPLAY_CONFIG:-}" ]]; then
+    replay_args+=(--config "${REPLAY_CONFIG}")
+  fi
   if [[ "${STOP_AT_NEWLINE}" != "1" ]]; then
     replay_args+=(--no-stop-at-newline)
   fi
@@ -134,9 +138,9 @@ if [[ ! -f "${OUTPUT_DIR}/${SEGMENTED_RUN_NAME}/generations.jsonl" ]]; then
   exit 2
 fi
 
-echo "=== official SQuAD EM/F1 evaluation ==="
+echo "=== dataset answer EM/F1 evaluation ==="
 "${PYTHON_BIN}" \
-  research/scripts/replay/generation_quality/evaluate_squad.py \
+  research/scripts/replay/generation_quality/evaluate_answers.py \
   --normal-results "${OUTPUT_DIR}/${NORMAL_RUN_NAME}" \
   --segmented-results "${OUTPUT_DIR}/${SEGMENTED_RUN_NAME}" \
   --output-dir "${ANALYSIS_DIR}"

@@ -22,21 +22,37 @@ from typing import Any
 
 import httpx
 
-# 两组实验复用相同的数据解析、模型模板与来源事件时序，避免更换输入语义。
-SEGMENTED_DIR = Path(__file__).resolve().parents[1] / "segmented_prefill"
-sys.path.insert(0, str(SEGMENTED_DIR))
-from replay_common import (  # noqa: E402
-    ChatTemplateRenderer,
-    RenderedReplayPrompt,
-    SampleReplayInput,
-    _normalize_v1_url,
-    _parse_sample,
-    _planned_arrival_offsets,
-    _post_json,
-    _render_sample_prompt,
-    _sleep_until,
+sys.path.insert(0, str(Path(__file__).resolve().parents[4]))
+
+from research.scripts.replay.common.config import (
+    add_shared_arguments,
+    parse_configured_args,
 )
-from replay_prompt_stream import _send_source_events  # noqa: E402
+from research.scripts.replay.common.dataset import select_samples
+from research.scripts.replay.common.dispatch import abort_prompt_stream
+from research.scripts.replay.common.dispatch import (
+    send_source_events as _send_source_events,
+)
+from research.scripts.replay.common.models import (
+    RenderedReplayPrompt as RenderedReplayPrompt,
+)
+from research.scripts.replay.common.models import SampleReplayInput as SampleReplayInput
+from research.scripts.replay.common.prompt import (
+    ChatTemplateRenderer as ChatTemplateRenderer,
+)
+from research.scripts.replay.common.prompt import (
+    render_sample_prompt as _render_sample_prompt,
+)
+from research.scripts.replay.common.results import write_prompt_previews
+from research.scripts.replay.common.runner import execute_workload
+from research.scripts.replay.common.transport import (
+    create_http_client,
+    iter_sse_payloads,
+)
+from research.scripts.replay.common.transport import (
+    normalize_v1_url as _normalize_v1_url,
+)
+from research.scripts.replay.common.transport import post_json as _post_json
 
 logger = logging.getLogger(__name__)
 
@@ -113,23 +129,11 @@ class StreamObservation:
 
 
 async def consume_stable_sse(response: httpx.Response) -> StreamObservation:
-    """读取到 DONE 才完成，支持多行 data，并保留最终传输统计。"""
+    """共享完整 SSE 帧解析，保留本实验 P/D token 与传输指标观察器。"""
     observation = StreamObservation()
-    data_lines: list[str] = []
-    async for line in response.aiter_lines():
-        if line.startswith("data:"):
-            data_lines.append(line[5:].lstrip(" "))
-        elif line == "" and data_lines:
-            data = "\n".join(data_lines)
-            data_lines.clear()
-            if data.strip() == "[DONE]":
-                return observation
-            payload = json.loads(data)
-            if not isinstance(payload, dict):
-                raise ValueError("SSE data must encode a JSON object.")
-            observation.observe(payload, time.perf_counter())
-    # 连接断开和完整输出不同，不能把提前 EOF 误记为成功。
-    raise RuntimeError("SSE connection closed before [DONE].")
+    async for payload in iter_sse_payloads(response):
+        observation.observe(payload, time.perf_counter())
+    return observation
 
 
 def validate_transfer_metrics(
@@ -163,35 +167,8 @@ def validate_transfer_metrics(
 
 
 def _select_samples(args: argparse.Namespace) -> list[SampleReplayInput]:
-    """按文件内 query 顺序选择样本，够数即停止读取后续 JSON。"""
-    directory = args.data_dir / "requests"
-    requested_ids = set(args.query_id or [])
-    samples: list[SampleReplayInput] = []
-    skipped = 0
-    # 当前构建器写入零填充的 anns-query-000000.json，字典序即 query 顺序。
-    for path in sorted(directory.glob("*.json")):
-        if requested_ids:
-            file_id = path.stem.removeprefix("anns-query-").lstrip("0") or "0"
-            if file_id not in requested_ids:
-                continue
-        sample = _parse_sample(path)
-        if sample.status != "complete":
-            continue
-        if not requested_ids and skipped < args.start_index:
-            skipped += 1
-            continue
-        samples.append(sample)
-        if (
-            not requested_ids
-            and args.max_requests
-            and len(samples) >= args.max_requests
-        ):
-            break
-    if requested_ids - {sample.query_id for sample in samples}:
-        raise ValueError("Some --query-id values have no complete dataset sample.")
-    if not samples:
-        raise ValueError(f"No complete samples selected under {directory}.")
-    return samples
+    """复用公共读取器；按 manifest ID 选择，不依赖文件名编号。"""
+    return select_samples(args)
 
 
 async def _replay_sample(
@@ -222,7 +199,12 @@ async def _replay_sample(
         start.update(
             api="completions",
             model=args.model,
-            prompt=list(rendered.start_token_ids),
+            prompt=(
+                rendered.start_text
+                if rendered.input_transport == "text"
+                else list(rendered.start_token_ids)
+            ),
+            add_special_tokens=False,
             stream=True,
             request_id=f"stable-{uuid.uuid4().hex}",
             max_tokens=args.max_tokens,
@@ -269,9 +251,11 @@ async def _replay_sample(
         finish_event = dict(sample.finish_event)
         finish_event.update(
             text=rendered.finish_text,
-            token_ids=list(rendered.finish_token_ids),
             arrival_time=time.time(),
         )
+        finish_event.pop("token_ids", None)
+        if rendered.input_transport == "token_ids":
+            finish_event["token_ids"] = list(rendered.finish_token_ids)
         stage = "finish"
         logger.info("FINISH sample=%s request_id=%s", sample.sample_id, request_id)
         finish_start = time.perf_counter()
@@ -364,6 +348,12 @@ async def _replay_sample(
             row["metrics_status"],
             row.get("p_finish_to_d_first_token_ms"),
         )
+    except asyncio.CancelledError:
+        if request_id is not None:
+            await asyncio.shield(
+                abort_prompt_stream(client, args.proxy_url, request_id)
+            )
+        raise
     except Exception as exc:
         row.update(error=f"{type(exc).__name__}: {exc}", error_stage=stage)
         logger.error("FAILED sample=%s stage=%s: %s", sample.sample_id, stage, exc)
@@ -386,13 +376,16 @@ async def run(args: argparse.Namespace) -> Path:
     renderer = ChatTemplateRenderer.from_pretrained(
         args.tokenizer_model, args.tokenizer_trust_remote_code
     )
-    prompts = [_render_sample_prompt(sample, renderer) for sample in samples]
+    prompts = [
+        _render_sample_prompt(sample, renderer, input_transport=args.input_transport)
+        for sample in samples
+    ]
     output = args.output_dir / args.run_name
     output.mkdir(parents=True, exist_ok=False)  # 防止覆盖另一组对照结果。
     config = dict(vars(args))
     # 保存受控性能集的生成参数，后续移动数据目录也不丢失实验自变量。
     dataset_summary_path = args.data_dir / "dataset_summary.json"
-    if dataset_summary_path.is_file():
+    if not getattr(args, "dataset", None) and dataset_summary_path.is_file():
         dataset_summary = json.loads(dataset_summary_path.read_text(encoding="utf-8"))
         if not isinstance(dataset_summary, dict):
             raise ValueError(f"Invalid dataset summary: {dataset_summary_path}")
@@ -412,44 +405,28 @@ async def run(args: argparse.Namespace) -> Path:
     )
     logger.info("Selected %d samples; results=%s", len(samples), output)
     if args.dry_run:
+        write_prompt_previews(output, samples, prompts)
         return output
-    offsets = _planned_arrival_offsets(
-        len(samples), args.qps, args.arrival_process, args.random_seed
-    )
-    semaphore = asyncio.Semaphore(args.max_concurrency)
-    epoch = time.perf_counter()
     rows: list[dict[str, Any]] = []
-    limits = httpx.Limits(max_connections=max(8, args.max_concurrency * 3))
-    # 集群内请求直接访问实验网关，不继承下载模型时使用的外部 HTTP 代理。
-    async with httpx.AsyncClient(
-        timeout=args.http_timeout, limits=limits, trust_env=False
-    ) as client:
+    epoch = time.perf_counter()
+    async with create_http_client(args) as client:
         with (output / "requests.jsonl").open("w", encoding="utf-8") as stream:
 
-            async def execute(index: int) -> None:
-                """并发名额覆盖 start 至完整输出，等待名额时间单独记账。"""
-                planned = epoch + offsets[index]
-                if args.qps > 0:
-                    await _sleep_until(planned)
-                async with semaphore:
-                    queue_delay = max(0.0, time.perf_counter() - planned) * 1000
-                    row = await _replay_sample(
-                        client,
-                        samples[index],
-                        prompts[index],
-                        renderer,
-                        args,
-                        queue_delay if args.qps > 0 else 0.0,
-                    )
-                    rows.append(row)
-                    stream.write(json.dumps(row, ensure_ascii=False) + "\n")
-                    stream.flush()  # 中途停止仍能保留已经完成的请求。
+            async def execute(
+                index: int, offset: float, queue_delay: float
+            ) -> dict[str, Any]:
+                row = await _replay_sample(
+                    client, samples[index], prompts[index], renderer, args, queue_delay
+                )
+                row["planned_arrival_offset_ms"] = offset
+                return row
 
-            if args.qps == 0:
-                for index in range(len(samples)):
-                    await execute(index)
-            else:
-                await asyncio.gather(*(execute(index) for index in range(len(samples))))
+            def record(row: dict[str, Any]) -> None:
+                rows.append(row)
+                stream.write(json.dumps(row, ensure_ascii=False) + "\n")
+                stream.flush()
+
+            await execute_workload(len(samples), args, execute, on_result=record)
     wall_seconds = time.perf_counter() - epoch
     scalar_keys = sorted(
         {
@@ -529,7 +506,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--run-name")
     parser.add_argument("--save-responses", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
-    args = parser.parse_args()
+    add_shared_arguments(parser)
+    args = parse_configured_args(parser)
     nonnegative = (
         "qps",
         "append_initial_delay",

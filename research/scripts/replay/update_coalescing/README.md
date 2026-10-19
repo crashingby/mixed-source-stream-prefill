@@ -16,6 +16,21 @@ RESTFUL API 回放同一批 mixed-source 请求，同时测量：
 应与即时、时间窗口和完全合并策略分别比较。历史结果必须按生成时的代码版本与配置区分，
 不能仅凭目录中的策略名称与当前结果混合分析。
 
+## 共享数据与文本传输
+
+本入口使用 [公共回放实现](../README.md)，支持独立 questions、append_chunks 和
+pipeline_pools，按 `sample_id` 对齐。默认 `--input-transport text`，客户端渲染
+模型模板，P 分词；start 是模板前缀，事件是原始文本，finish 带问题及 assistant
+header。`--input-transport token_ids` 用于历史预分词实验复现。
+
+从仓库根目录传入 `--config research/scripts/replay/configs/triviaqa.json`
+可选用独立数据。仍需匹配实际 P 配置的 `--expected-coalescing` 与
+`--p-node-coalescing-config-json` 等实验参数。Update 发送完整快照；计量 LCP
+使用 P 的 ACK token IDs，不在客户端预分词。
+`run_policy_sweep.sbatch` 可设置 `REPLAY_CONFIG`。
+
+批量脚本支持 `INPUT_TRANSPORT`，默认 text；脚本显式参数优先于配置。
+
 ## 目录与脚本
 
 ```text
@@ -802,6 +817,7 @@ MAX_CONCURRENCY=32 APPEND_CHUNK_INTERVAL=0.5 \
 SOURCE_FINISH_DELAY=0 WARMUP_REQUESTS=8 \
 sbatch research/scripts/replay/update_coalescing/run_policy_sweep.sbatch
 ```
+
 ### 确认 P 已就绪
 
 ```shell

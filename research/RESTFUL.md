@@ -127,7 +127,8 @@ app.state.prompt_stream_sessions = {
 | --- | --- |
 | `api` | 当前必须是 `completions`。 |
 | `model` | 传给 vLLM 的模型名。 |
-| `prompt` | 固定 prefix/template。Start 阶段可以继续使用普通 prompt 文本，由 P 节点走现有输入处理链路完成 tokenize。 |
+| `prompt` | 固定 prefix/template，支持字符串或 token IDs。默认 replay 发送已渲染的模板前缀字符串，由 P 分词。 |
+| `add_special_tokens` | 默认 `true`，保持原有纯文本 start 行为；已渲染模型模板时设为 `false`，避免重复 BOS。只控制 start 分词，不属于采样参数。 |
 | `stream` | 客户端可使用 `false` 获取 JSON，或使用 `true` 获取 SSE。proxy 发往 P 的内部 start 固定为非流式 collector；该字段只决定 proxy 返回结果及 D decode 的响应模式。 |
 | `max_tokens` | D 节点 decode 的最大 token 数；P 节点 start 阶段不会真正 decode。 |
 | `request_id` | 可选。没有提供时由 proxy 生成稳定 request id。 |
@@ -740,8 +741,8 @@ smoke test；大规模回放依赖数据构建阶段的 chunk/token 预算控制
 - `vllm/entrypoints/serve/prompt_stream/api_router.py`、`protocol.py` 和 `serving.py` 已经提供 P 节点 RESTFUL 入口。
 - `vllm/entrypoints/openai/api_server.py` 已经注册 prompt stream router，因此 P 节点和 D 节点启动同一个 OpenAI-compatible server 后都能看到 `/v1/prompt_stream/*` 路由。
 - `EngineClient` / `AsyncLLM` 已经补了 prompt stream 专用方法：
-  - `add_prompt_stream_request()`：start 阶段创建长期 Request 和 output collector。
-  - `add_prompt_stream_event()`：event / finish 阶段把事件送入 EngineCore，不额外创建普通 output queue。
+    - `add_prompt_stream_request()`：start 阶段创建长期 Request 和 output collector。
+    - `add_prompt_stream_event()`：event / finish 阶段把事件送入 EngineCore，不额外创建普通 output queue。
 - P 节点 start / event / finish 响应会返回 tokenizer 后的 `token_ids`，proxy 用这些 token ids 维护 D 侧最终 prompt 镜像。
 - P 节点 finish 响应会返回 `kv_transfer_params`，同时返回 P 侧 prefill 过程中已经生成的 `output_token_ids`。
 - proxy 在启用 KV transfer 时，会把 P 侧 `output_token_ids` 追加进 D 侧 prompt token ids，并相应减少 D 侧 `max_tokens`。

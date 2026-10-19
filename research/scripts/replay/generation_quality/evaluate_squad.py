@@ -9,16 +9,22 @@ import argparse
 import csv
 import json
 import math
-import re
 import string
+import sys
 from collections import Counter
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+import regex as re
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[4]))
+from research.scripts.replay.generation_quality.evaluators import score_answer
+
 EVALUATION_SCHEMA_VERSION = "generation_quality_squad_eval/v1"
-ARTICLES_RE = re.compile(r"\b(a|an|the)\b", re.UNICODE)
+# 显式限定单词字符，避免 regex 将组合音标和连接符计入冠词边界。
+ARTICLES_RE = re.compile(r"(?<![\p{L}\p{N}_])(a|an|the)(?![\p{L}\p{N}_])")
 
 PER_REQUEST_FIELDS = (
     "sample_id",
@@ -62,9 +68,7 @@ def normalize_answer(text: str) -> str:
 
     def remove_punctuation(value: str) -> str:
         return "".join(
-            character
-            for character in value
-            if character not in string.punctuation
+            character for character in value if character not in string.punctuation
         )
 
     def white_space_fix(value: str) -> str:
@@ -120,10 +124,9 @@ def _load_generation_records(path: Path) -> dict[str, dict[str, Any]]:
     """读取一个模式的 JSONL 结果，并按 sample id 去重。"""
     generations_path = _resolve_generations_path(path)
     records: dict[str, dict[str, Any]] = {}
-    for line_number, line in enumerate(
-        generations_path.read_text(encoding="utf-8").splitlines(),
-        start=1,
-    ):
+    with generations_path.open(encoding="utf-8") as stream:
+        lines = list(stream)
+    for line_number, line in enumerate(lines, start=1):
         if not line.strip():
             continue
         try:
@@ -132,9 +135,7 @@ def _load_generation_records(path: Path) -> dict[str, dict[str, Any]]:
             raise ValueError(
                 f"Invalid JSON at {generations_path}:{line_number}: {exc}"
             ) from exc
-        if not isinstance(record, dict) or not isinstance(
-            record.get("sample_id"), str
-        ):
+        if not isinstance(record, dict) or not isinstance(record.get("sample_id"), str):
             raise ValueError(
                 f"Invalid generation record at {generations_path}:{line_number}."
             )
@@ -185,7 +186,12 @@ def _score_record(record: dict[str, Any] | None) -> ScoredPrediction | None:
         raise ValueError(
             f"Successful record {record.get('sample_id')!r} has no response_text."
         )
-    return _score_prediction(prediction.strip(), _gold_answers(record))
+    exact, f1 = score_answer(
+        prediction.strip(),
+        _gold_answers(record),
+        str(record.get("evaluation_protocol", "squad_v2")),
+    )
+    return ScoredPrediction(prediction.strip(), exact, f1)
 
 
 def _mode_summary(
@@ -205,6 +211,14 @@ def _mode_summary(
         "num_records": num_total,
         "num_evaluated": num_evaluated,
         "num_failed_or_incomplete": num_total - num_evaluated,
+        "evaluation_protocols": sorted(
+            {
+                record.get("evaluation_protocol", "squad_v2")
+                for record in records.values()
+            }
+        ),
+        "exact_match_all_requests": 100 * exact_sum / num_total if num_total else None,
+        "f1_all_requests": 100 * f1_sum / num_total if num_total else None,
         "success_rate": num_evaluated / num_total if num_total else None,
         # SQuAD leaderboard 使用 0--100 的百分数口径。
         "exact_match": 100 * exact_sum / num_evaluated if num_evaluated else None,
@@ -219,8 +233,7 @@ def _mcnemar_exact_p_value(normal_only: int, segmented_only: int) -> float:
         return 1.0
     smaller_count = min(normal_only, segmented_only)
     lower_tail = sum(
-        math.comb(num_disagreements, index)
-        for index in range(smaller_count + 1)
+        math.comb(num_disagreements, index) for index in range(smaller_count + 1)
     ) / (2**num_disagreements)
     return min(1.0, 2 * lower_tail)
 
@@ -252,6 +265,10 @@ def _paired_rows_and_summary(
         assert base_record is not None
 
         if normal_record is not None and segmented_record is not None:
+            if normal_record.get(
+                "evaluation_protocol", "squad_v2"
+            ) != segmented_record.get("evaluation_protocol", "squad_v2"):
+                raise ValueError(f"Modes disagree on evaluation protocol: {sample_id}")
             if _gold_answers(normal_record) != _gold_answers(segmented_record):
                 raise ValueError(
                     f"Modes disagree on gold answers for sample_id={sample_id!r}."
@@ -262,15 +279,14 @@ def _paired_rows_and_summary(
                 raise ValueError(
                     f"Modes used different logical prompts for sample_id={sample_id!r}."
                 )
-            normal_token_hash = normal_record.get(
-                "logical_prompt_token_sha256"
-            )
-            segmented_token_hash = segmented_record.get(
-                "logical_prompt_token_sha256"
-            )
+            if normal_record.get(
+                "input_transport", "token_ids"
+            ) != segmented_record.get("input_transport", "token_ids"):
+                raise ValueError(f"Modes disagree on input transport: {sample_id}")
+            normal_token_hash = normal_record.get("logical_prompt_token_sha256")
+            segmented_token_hash = segmented_record.get("logical_prompt_token_sha256")
             if (
-                normal_token_hash is not None
-                or segmented_token_hash is not None
+                normal_token_hash is not None or segmented_token_hash is not None
             ) and normal_token_hash != segmented_token_hash:
                 raise ValueError(
                     "Modes used different logical prompt token sequences for "
@@ -316,13 +332,9 @@ def _paired_rows_and_summary(
                 ),
                 "normal_f1": normal_score.f1 if normal_score is not None else None,
                 "normal_error": _record_value(normal_record, "error"),
-                "segmented_status": _record_value(
-                    segmented_record, "result_status"
-                ),
+                "segmented_status": _record_value(segmented_record, "result_status"),
                 "segmented_prediction": (
-                    segmented_score.prediction
-                    if segmented_score is not None
-                    else None
+                    segmented_score.prediction if segmented_score is not None else None
                 ),
                 "segmented_exact": (
                     segmented_score.exact if segmented_score is not None else None
@@ -342,9 +354,7 @@ def _paired_rows_and_summary(
         outcome_counts["both_exact"] + outcome_counts["normal_only_exact"]
     )
     f1_delta_mean = (
-        sum(paired_f1_deltas) / len(paired_f1_deltas)
-        if paired_f1_deltas
-        else None
+        sum(paired_f1_deltas) / len(paired_f1_deltas) if paired_f1_deltas else None
     )
     paired_summary = {
         "num_union_samples": len(all_sample_ids),
@@ -393,7 +403,7 @@ def _write_json(path: Path, value: Any) -> None:
 def parse_args() -> argparse.Namespace:
     """解析 SQuAD EM/F1 评测参数。"""
     parser = argparse.ArgumentParser(
-        description="Evaluate normal and segmented generations with SQuAD EM/F1."
+        description="按结果记录的数据集协议计算 normal/segmented 答案 EM/F1。"
     )
     parser.add_argument("--normal-results", type=Path, required=True)
     parser.add_argument("--segmented-results", type=Path, required=True)
@@ -417,8 +427,8 @@ def main() -> None:
         "schema_version": EVALUATION_SCHEMA_VERSION,
         "metric_definition": {
             "normalization": (
-                "SQuAD v2 official lowercase, punctuation removal, article "
-                "removal, and whitespace normalization."
+                "Dataset-specific official normalization selected by "
+                "evaluation_protocol."
             ),
             "multiple_gold_answers": "Maximum EM and F1 over official answers.",
             "score_scale": "Mode-level exact_match and f1 use 0--100.",

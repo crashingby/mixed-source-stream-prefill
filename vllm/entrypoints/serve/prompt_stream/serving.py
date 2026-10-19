@@ -81,7 +81,9 @@ class PromptStreamServing:
 
         # start 阶段使用普通输入处理链路，确保 prefix/template 按模型 tokenizer
         # 和现有 vLLM prompt 规则处理。
-        prefix_token_ids = self._resolve_start_prompt_token_ids(request.prompt)
+        prefix_token_ids = self._resolve_start_prompt_token_ids(
+            request.prompt, add_special_tokens=request.add_special_tokens
+        )
         start_required_len = self._align_to_block_size(len(prefix_token_ids)) + 1
         if start_required_len > self._max_model_len():
             raise ValueError(
@@ -96,6 +98,8 @@ class PromptStreamServing:
             prompt=request.prompt,
             sampling_params=sampling_params,
             arrival_time=time.time(),
+            # 实际 engine 分词必须与长度镜像使用同一标记。
+            tokenization_kwargs={"add_special_tokens": request.add_special_tokens},
         )
 
         # `add_request()` 会把外部 request id 随机化为内部 request id。后续
@@ -376,11 +380,14 @@ class PromptStreamServing:
         block_size = self._block_size()
         return (num_tokens + block_size - 1) // block_size * block_size
 
-    def _resolve_start_prompt_token_ids(self, prompt: str | list[int]) -> list[int]:
+    def _resolve_start_prompt_token_ids(
+        self, prompt: str | list[int], *, add_special_tokens: bool = True
+    ) -> list[int]:
         """把 start 阶段 prefix/template 归一化为 P 节点实际 token ids。
 
         Args:
             prompt: RESTFUL start 请求里的原始 prompt。
+            add_special_tokens: 已渲染模型模板时关闭，避免重复 BOS。
 
         Returns:
             P 节点用于初始化长期 Request 的 prefix token ids。
@@ -390,7 +397,7 @@ class PromptStreamServing:
 
         tokenizer = self.engine_client.input_processor.get_tokenizer()
         try:
-            return list(tokenizer.encode(prompt, add_special_tokens=True))
+            return list(tokenizer.encode(prompt, add_special_tokens=add_special_tokens))
         except TypeError:
             return list(tokenizer.encode(prompt))
 

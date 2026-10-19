@@ -6,6 +6,14 @@
 - `start_p_node.sbatch`：在 Slurm 上启动 P 节点，即 NIXL producer。
 - `start_d_node.sbatch`：在 Slurm 上启动 D 节点，即 NIXL consumer。
 
+## replay 原文输入
+
+当前 replay 默认发送原始文本，由 P 分词；start 支持
+`add_special_tokens=false`，用于已渲染的模型模板，避免重复 BOS。
+更新到当前代码后重启 P，才能使用该字段。默认值仍为 true，原有纯文本 start
+调用保持兼容。D 继续接收 P 实际使用的 token IDs，以保证 KV 对齐。
+数据选择与运行方式见 [replay README](../replay/README.md)。
+
 ## 稳定 KV 提前 Push 专用服务
 
 新增的 `stable_kv_proxy.py`、`start_stable_kv_pair.sh` 和
@@ -111,7 +119,6 @@ sbatch --nodelist=<P_HOST> --gres=gpu:2 \
 本轮 `finish_ttft` 实验只需要 P 使用 TP=2。若之后运行完整 P -> D KV
 transfer 与 decode，应把 D 也改为同样的 TP=2 配置；当前
 `start_d_node.sbatch` 仍是单卡脚本。
-
 
 提交 D 节点：
 

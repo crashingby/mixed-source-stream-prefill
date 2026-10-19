@@ -1,2 +1,8 @@
-# 当前数据生成器完全离线，不需要额外安装网页搜索或抓取依赖。
-# 可选 token 预算使用 vLLM 开发环境已经提供的 transformers。
+# Append 生成器完全离线；Update 采集器使用标准库访问已启动的向量服务。
+# 不需要额外安装网页搜索、网页抓取或 HTTP 客户端依赖。
+# TriviaQA 使用本地 tokenizer 和 regex 计数、分段和匹配，不加载模型。
+# 新 Append 生成器：流式读取 TriviaQA JSON 与 HotpotQA parquet。
+ijson>=3.2
+pyarrow>=14
+tokenizers>=0.20
+regex

@@ -15,29 +15,50 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
+import sys
 import time
 import uuid
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Literal
 
 import httpx
-from replay_common import (
-    ChatTemplateRenderer,
-    EventMetric,
-    RenderedReplayPrompt,
-    ReplayHttpError,
-    RequestMetric,
-    SampleReplayInput,
-    _get_data_events,
-    _normalize_v1_url,
-    _override_sampling_params,
-    _post_json,
-    _prompt_stream_finish_endpoint,
-    _prompt_stream_start_endpoint,
-    _sleep_until,
-    consume_sse_response,
-    main,
-    should_log_event_progress,
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[4]))
+
+from research.scripts.replay.common.dataset import get_data_events as _get_data_events
+from research.scripts.replay.common.metrics import apply_completion_measurement
+from research.scripts.replay.common.models import EventMetric as EventMetric
+from research.scripts.replay.common.models import (
+    RenderedReplayPrompt as RenderedReplayPrompt,
+)
+from research.scripts.replay.common.models import RequestMetric as RequestMetric
+from research.scripts.replay.common.models import SampleReplayInput as SampleReplayInput
+from research.scripts.replay.common.prompt import (
+    ChatTemplateRenderer as ChatTemplateRenderer,
+)
+from research.scripts.replay.common.prompt import (
+    override_sampling_params as _override_sampling_params,
+)
+from research.scripts.replay.common.runner import main as main
+from research.scripts.replay.common.timeline import (
+    should_log_event_progress as should_log_event_progress,
+)
+from research.scripts.replay.common.timeline import sleep_until as _sleep_until
+from research.scripts.replay.common.timeline import source_timing as _source_timing
+from research.scripts.replay.common.transport import ReplayHttpError as ReplayHttpError
+from research.scripts.replay.common.transport import (
+    consume_sse_response as consume_sse_response,
+)
+from research.scripts.replay.common.transport import (
+    normalize_v1_url as _normalize_v1_url,
+)
+from research.scripts.replay.common.transport import post_json as _post_json
+from research.scripts.replay.common.transport import (
+    prompt_stream_finish_endpoint as _prompt_stream_finish_endpoint,
+)
+from research.scripts.replay.common.transport import (
+    prompt_stream_start_endpoint as _prompt_stream_start_endpoint,
 )
 
 logger = logging.getLogger(__name__)
@@ -81,25 +102,18 @@ def _make_merged_update_start_payload(
         {
             "api": "completions",
             "model": args.model,
-            "prompt": list(rendered_prompt.start_token_ids),
+            "prompt": (
+                rendered_prompt.start_text
+                if rendered_prompt.input_transport == "text"
+                else list(rendered_prompt.start_token_ids)
+            ),
             "stream": True,
+            "add_special_tokens": False,
             "request_id": external_request_id,
         }
     )
     _override_sampling_params(payload, args)
     return payload
-
-
-def _source_timing(
-    source_type: str,
-    args: argparse.Namespace,
-) -> tuple[float, float]:
-    """返回一个原始来源的首 chunk 延迟与后续数据 chunk 间隔。"""
-    if source_type == "append":
-        return args.append_initial_delay, args.append_chunk_interval
-    if source_type == "update":
-        return args.update_initial_delay, args.update_chunk_interval
-    raise ValueError(f"Unsupported source_type={source_type!r}.")
 
 
 def _source_priority(source_type: str) -> int:
@@ -167,8 +181,7 @@ def _iter_scheduled_groups(
         if current_offset is None:
             current_offset = scheduled_event.scheduled_offset
         is_same_tick = (
-            abs(scheduled_event.scheduled_offset - current_offset)
-            <= TIME_GROUP_EPSILON
+            abs(scheduled_event.scheduled_offset - current_offset) <= TIME_GROUP_EPSILON
         )
         if not is_same_tick:
             groups.append((current_offset, tuple(current_events)))
@@ -212,7 +225,7 @@ def _merged_context_text(
 
 def _make_merged_update_event(
     text: str,
-    token_ids: tuple[int, ...],
+    token_ids: tuple[int, ...] | None,
     sequence_no: int,
 ) -> dict[str, Any]:
     """把当前完整上下文封装成一个 Update 事件。
@@ -229,7 +242,7 @@ def _make_merged_update_event(
         "version": sequence_no,
         "sequence_no": sequence_no,
         "text": text,
-        "token_ids": list(token_ids),
+        **({"token_ids": list(token_ids)} if token_ids is not None else {}),
         "arrival_time": time.time(),
     }
 
@@ -353,19 +366,18 @@ async def _dispatch_merged_update_events(
                 update_text_by_source[trigger_event.source_id] = event_text
 
         update_text_parts = [
-            update_text_by_source[source_id]
-            for source_id in update_source_order
+            update_text_by_source[source_id] for source_id in update_source_order
         ]
         merged_text = _merged_context_text(append_text_parts, update_text_parts)
         outbound_event = _make_merged_update_event(
             merged_text,
-            renderer.encode_content(merged_text),
+            renderer.encode_content(merged_text)
+            if getattr(args, "input_transport", "text") == "token_ids"
+            else None,
             sequence_no,
         )
         actual_send_time = time.perf_counter()
-        actual_send_offset_ms = (
-            actual_send_time - source_dispatch_start_time
-        ) * 1000
+        actual_send_offset_ms = (actual_send_time - source_dispatch_start_time) * 1000
         if should_log_event:
             logger.info(
                 "Replay merged-update SEND event: run_id=%s request_id=%s "
@@ -489,9 +501,7 @@ async def _dispatch_merged_update_events(
 
     await _sleep_until(finished_target_time)
     actual_send_time = time.perf_counter()
-    actual_send_offset_ms = (
-        actual_send_time - source_dispatch_start_time
-    ) * 1000
+    actual_send_offset_ms = (actual_send_time - source_dispatch_start_time) * 1000
     if should_log_finished:
         logger.info(
             "Replay merged-update SEND source_finished: run_id=%s "
@@ -690,7 +700,9 @@ async def _replay_merged_update_sample(
 
         finish_event = dict(sample.finish_event)
         finish_event["text"] = rendered_prompt.finish_text
-        finish_event["token_ids"] = list(rendered_prompt.finish_token_ids)
+        finish_event.pop("token_ids", None)
+        if rendered_prompt.input_transport == "token_ids":
+            finish_event["token_ids"] = list(rendered_prompt.finish_token_ids)
         finish_event["arrival_time"] = time.time()
         finish_payload = {
             "request_id": request_id,
@@ -744,9 +756,7 @@ async def _replay_merged_update_sample(
             sse_measurement.completed_time - request_start_time
         ) * 1000
         metric.ttft_origin = sse_measurement.first_token_origin
-        metric.completion_chars = sse_measurement.completion_chars
-        metric.completion_chunks = sse_measurement.completion_chunks
-        metric.response_payloads = list(sse_measurement.payloads)
+        apply_completion_measurement(metric, sse_measurement, finish_sent_time)
         metric.result_status = "ok"
         logger.info(
             "Replay merged-update FINISH ack: run_id=%s request_id=%s "
