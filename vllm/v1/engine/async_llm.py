@@ -429,6 +429,8 @@ class AsyncLLM(EngineClient):
         tokenization_kwargs: dict[str, Any] | None = None,
         trace_headers: Mapping[str, str] | None = None,
         priority: int = 0,
+        probe_token_ids: list[int] | None = None,
+        probe_keep_ratio: float = 0.5,
     ) -> RequestOutputCollector:
         """添加流式 prompt 初始请求，并保留输出收集器。
 
@@ -496,6 +498,8 @@ class AsyncLLM(EngineClient):
                 "logprobs or non-default repetition/presence/frequency penalties."
             )
 
+        request.probe_token_ids = probe_token_ids
+        request.probe_keep_ratio = probe_keep_ratio
         self.input_processor.assign_request_id(request)
         request.prompt_stream_event = PromptStreamEvent(
             request_id=request.request_id,

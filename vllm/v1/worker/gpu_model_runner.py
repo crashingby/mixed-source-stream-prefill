@@ -131,12 +131,14 @@ from vllm.v1.attention.backend import (
 )
 from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadataBuilder
 from vllm.v1.attention.backends.mamba2_attn import Mamba2AttentionMetadataBuilder
+from vllm.v1.attention.backends.triton_attn import TritonAttentionMetadata
 from vllm.v1.attention.backends.utils import (
     NULL_BLOCK_ID,
     create_fast_prefill_custom_backend,
     get_dcp_local_seq_lens,
     reorder_batch_to_split_decodes_and_prefills,
 )
+from vllm.v1.attention.ops.query_probe_attention import QueryProbeAttention
 from vllm.v1.core.sched.output import NewRequestData
 from vllm.v1.cudagraph_dispatcher import CudagraphDispatcher
 from vllm.v1.kv_cache_interface import (
@@ -169,6 +171,7 @@ from vllm.v1.outputs import (
     make_empty_encoder_model_runner_output,
 )
 from vllm.v1.pool.metadata import PoolingMetadata, PoolingStates
+from vllm.v1.query_probe import QueryProbeWork
 from vllm.v1.sample.logits_processor import LogitsProcessors, build_logitsprocs
 from vllm.v1.sample.logits_processor.interface import LogitsProcessor
 from vllm.v1.sample.metadata import SamplingMetadata
@@ -498,25 +501,24 @@ class GPUModelRunner(
         self.prompt_stream_masked_padding = (
             scheduler_config.prompt_stream_masked_padding
         )
-        if self.prompt_stream_masked_padding:
-            if (
-                self.is_pooling_model
-                or self.uses_mrope
-                or self.uses_xdrope_dim > 0
-                or self.use_alibi
-                or self.supports_mm_inputs
-                or model_config.is_encoder_decoder
-                or model_config.use_mla
-                or model_config.is_hybrid
-                or self.speculative_config is not None
-                or self.dcp_world_size != 1
-                or parallel_config.prefill_context_parallel_size != 1
-            ):
-                raise ValueError(
-                    "prompt_stream_masked_padding requires a text-only causal "
-                    "decoder with one-dimensional positions, no speculative "
-                    "decoding and no context parallelism."
-                )
+        if self.prompt_stream_masked_padding and (
+            self.is_pooling_model
+            or self.uses_mrope
+            or self.uses_xdrope_dim > 0
+            or self.use_alibi
+            or self.supports_mm_inputs
+            or model_config.is_encoder_decoder
+            or model_config.use_mla
+            or model_config.is_hybrid
+            or self.speculative_config is not None
+            or self.dcp_world_size != 1
+            or parallel_config.prefill_context_parallel_size != 1
+        ):
+            raise ValueError(
+                "prompt_stream_masked_padding requires a text-only causal "
+                "decoder with one-dimensional positions, no speculative "
+                "decoding and no context parallelism."
+            )
 
         if self.model_config.is_encoder_decoder:
             # Maximum length of the encoder input, only for encoder-decoder
@@ -796,6 +798,8 @@ class GPUModelRunner(
             self.max_num_tokens, self.inputs_embeds_size, dtype=self.dtype, numpy=False
         )
         self.is_token_ids = self._make_buffer(self.max_num_tokens, dtype=torch.bool)
+        self._query_probe_work: dict[str, QueryProbeWork] = {}
+        self._query_probe_attention: QueryProbeAttention | None = None
         self.discard_request_mask = self._make_buffer(
             self.max_num_reqs, dtype=torch.bool
         )
@@ -1595,9 +1599,7 @@ class GPUModelRunner(
                     num_reqs,
                 )
 
-    def _validate_prompt_stream_padding_request(
-        self, request: NewRequestData
-    ) -> None:
+    def _validate_prompt_stream_padding_request(self, request: NewRequestData) -> None:
         """校验来自 scheduler 的 padding 区间，禁止静默忽略协议语义。"""
         padding_range = request.prompt_stream_padding_range
         if padding_range is None:
@@ -1641,9 +1643,7 @@ class GPUModelRunner(
         req_state.block_ids = new_req_data.block_ids
         req_state.num_computed_tokens = new_req_data.num_computed_tokens
         # 每次分段切换/恢复都替换区间，不能保留上一轮的 Append 边界。
-        req_state.prompt_stream_padding_range = (
-            new_req_data.prompt_stream_padding_range
-        )
+        req_state.prompt_stream_padding_range = new_req_data.prompt_stream_padding_range
         req_state.num_prompt_tokens = length_from_prompt_token_ids_or_embeds(
             req_state.prompt_token_ids, req_state.prompt_embeds
         )
@@ -2101,6 +2101,11 @@ class GPUModelRunner(
         self.discard_request_mask.np[:num_reqs] = (
             self.optimistic_seq_lens_cpu[:num_reqs].numpy() < num_tokens_np
         )
+        for req_id, work in scheduler_output.query_probe_work.items():
+            if work.suppress_sampling:
+                self.discard_request_mask.np[
+                    self.input_batch.req_id_to_index[req_id]
+                ] = True
         self.discard_request_mask.copy_to_gpu(num_reqs)
 
         # Sync num_accepted_tokens from CPU (set by
@@ -2614,6 +2619,54 @@ class GPUModelRunner(
                 spec_decode_common_attn_metadata.unpadded(num_tokens, num_reqs)
             )
 
+        if (
+            self.vllm_config.attention_config.backend is not None
+            and self.vllm_config.attention_config.backend.name == "CHUNK_SPARSE_ATTN"
+            and not for_cudagraph_capture
+        ):
+            assert isinstance(attn_metadata, dict)
+            works = dict(self._query_probe_work)
+            req_ids = list(self.input_batch.req_ids[:num_reqs])
+            offsets = self.query_start_loc.cpu[: num_reqs + 1].tolist()
+            for index, req_id in enumerate(req_ids):
+                if req_id not in works:
+                    # 同批普通请求完整读取；按当前 batch 顺序提供行范围。
+                    count = offsets[index + 1] - offsets[index]
+                    computed = int(self.input_batch.num_computed_tokens_cpu[index])
+                    pad_start, pad_end = self.input_batch.prompt_stream_padding_ranges[
+                        index
+                    ]
+                    pad = (int(pad_start), int(pad_end))
+                    works[req_id] = QueryProbeWork(
+                        -1,
+                        computed,
+                        count,
+                        pad[0],
+                        -1,
+                        [],
+                        [],
+                        pad,
+                        suppress_sampling=False,
+                    )
+            score_layer = ""
+            if self._query_probe_work:
+                last_layer = self.model_config.hf_text_config.num_hidden_layers - 1
+                score_layer = next(
+                    name for name in attn_metadata if f".layers.{last_layer}." in name
+                )
+            probe = QueryProbeAttention.build(
+                works,
+                req_ids,
+                offsets,
+                score_layer,
+                self.device,
+            )
+            # dense 只共享 attention 元数据，不改变采样或生成评分回包。
+            self._query_probe_attention = probe if self._query_probe_work else None
+            for metadata in attn_metadata.values():
+                # 自定义后端沿用 Triton 的分页布局和 masked-padding 元数据。
+                assert isinstance(metadata, TritonAttentionMetadata)
+                metadata.query_probe = probe
         return attn_metadata, spec_decode_common_attn_metadata
 
     def _compute_cascade_attn_prefix_lens(
@@ -3680,6 +3733,19 @@ class GPUModelRunner(
         logits: torch.Tensor | None,
         spec_decode_metadata: SpecDecodeMetadata | None,
     ) -> SamplerOutput:
+        # 联合 prefill 批次没有正式输出，避免随机采样推进 RNG 状态。
+        if (
+            self._query_probe_attention is not None
+            and self._is_all_reqs_chunked_prefill()
+        ):
+            return SamplerOutput(
+                sampled_token_ids=torch.zeros(
+                    (self.input_batch.num_reqs, 1),
+                    dtype=torch.int64,
+                    device=self.device,
+                ),
+                logprobs_tensors=None,
+            )
         # Sample the next token and get logprobs if needed.
         sampling_metadata = self.input_batch.sampling_metadata
         # Update output token ids with tokens sampled in last step
@@ -3730,9 +3796,14 @@ class GPUModelRunner(
         discard_sampled_tokens_req_indices = np.nonzero(
             self.discard_request_mask.np[:num_reqs]
         )[0]
+        skipped_probe_sampling = (
+            self._query_probe_attention is not None
+            and self._is_all_reqs_chunked_prefill()
+        )
         for i in discard_sampled_tokens_req_indices:
             gen = self.input_batch.generators.get(int(i))
-            if gen is not None:
+            # 整批 probe 已跳过 sampler，此时 RNG 没有推进，不能再回退。
+            if gen is not None and not skipped_probe_sampling:
                 gen.set_offset(gen.get_offset() - 4)
 
         # Copy some objects so they don't get modified after returning.
@@ -4160,6 +4231,8 @@ class GPUModelRunner(
                 "after execute_model() returns None."
             )
 
+        self._query_probe_work = scheduler_output.query_probe_work
+        self._query_probe_attention = None
         if self.routed_experts_initialized:
             self.routed_experts_capturer.clear_buffer()
 
@@ -4728,6 +4801,11 @@ class GPUModelRunner(
                 num_nans_in_logits=num_nans_in_logits,
                 cudagraph_stats=cudagraph_stats,
                 routed_experts=None,
+                query_probe_results=(
+                    self._query_probe_attention.collect_results()
+                    if self._query_probe_attention is not None
+                    else {}
+                ),
             )
 
         if not self.use_async_scheduling:
@@ -6901,7 +6979,7 @@ class GPUModelRunner(
                 if isinstance(layer_kv_cache_spec, UniformTypeKVCacheSpecs):
                     layer_kv_cache_spec = layer_kv_cache_spec.kv_cache_specs[layer_name]
                 if self.prompt_stream_masked_padding and (
-                    attn_backend.get_name() != "TRITON_ATTN"
+                    attn_backend.get_name() not in ("TRITON_ATTN", "CHUNK_SPARSE_ATTN")
                     or type(layer_kv_cache_spec) is not FullAttentionSpec
                     or layer_kv_cache_spec.sliding_window is not None
                     or layer_kv_cache_spec.attention_chunk_size is not None
@@ -6909,6 +6987,7 @@ class GPUModelRunner(
                     # 分层检查防止混合后端、局部窗口或 MLA 只屏蔽部分层。
                     raise ValueError(
                         "prompt_stream_masked_padding requires TRITON_ATTN "
+                        "or CHUNK_SPARSE_ATTN "
                         "with full attention on every layer; "
                         f"layer={layer_name}, backend={attn_backend.get_name()}, "
                         f"kv_cache_spec={layer_kv_cache_spec}."

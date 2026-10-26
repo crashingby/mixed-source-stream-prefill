@@ -15,10 +15,11 @@ from vllm.lora.request import LoRARequest
 from vllm.multimodal.inputs import MultiModalFeatureSpec
 from vllm.pooling_params import PoolingParams
 from vllm.sampling_params import SamplingParams
+from vllm.v1.engine.prompt_stream import PromptStreamEvent
 from vllm.v1.metrics.stats import PrefillStats, SchedulerStats
 from vllm.v1.outputs import LogprobsLists, LogprobsTensors
 from vllm.v1.serial_utils import UtilityResult
-from vllm.v1.engine.prompt_stream import PromptStreamEvent
+
 # Type for pause_generation mode parameter.
 # - "abort": Abort all in-flight requests immediately (default).
 # - "wait": Wait for in-flight requests to complete before pausing.
@@ -136,6 +137,9 @@ class EngineCoreRequest(
 
     # 流式 prefill 的单次事件。普通请求保持为 None。
     prompt_stream_event: PromptStreamEvent | None = None
+    # start 专用控制字段；后续事件不重复携带 Query。
+    probe_token_ids: list[int] | None = None
+    probe_keep_ratio: float = 0.5
 
     @property
     def params(self) -> SamplingParams | PoolingParams:

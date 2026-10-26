@@ -93,7 +93,7 @@ def compute_nixl_compatibility_hash(
     - vLLM version and NIXL connector version
     - Model architecture (name, dtype, KV heads, layers)
     - KV cache format (dtype, sliding window)
-    - Attention backend
+    - Attention backend KV format family
 
     Note: Factors like tensor_parallel_size, block_size, and kv_cache_layout
     are validated at runtime in _validate_remote_agent_handshake and are not
@@ -111,6 +111,11 @@ def compute_nixl_compatibility_hash(
     model_config = vllm_config.model_config
     cache_config = vllm_config.cache_config
     is_hma_enabled = not vllm_config.scheduler_config.disable_hybrid_kv_cache_manager
+    # 自定义后端继承 Triton 的 KV 形状、stride 和写入；仅 attention 读取算子不同。
+    # 只归一化这对已兼容的后端，其他模型、dtype、布局和版本检查仍然保留。
+    kv_backend_name = (
+        "TRITON_ATTN" if attn_backend_name == "CHUNK_SPARSE_ATTN" else attn_backend_name
+    )
 
     factors = {
         # Version compatibility
@@ -123,7 +128,7 @@ def compute_nixl_compatibility_hash(
         "head_size": model_config.get_head_size(),
         "num_hidden_layers": model_config.get_total_num_hidden_layers(),
         # Attention backend and KV cache dtype affect memory layout
-        "attn_backend_name": attn_backend_name,
+        "attn_backend_name": kv_backend_name,
         "cache_dtype": str(cache_config.cache_dtype),
         "cross_layers_blocks": cross_layers_blocks,
         "is_hma_enabled": is_hma_enabled,

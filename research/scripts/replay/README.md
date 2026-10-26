@@ -13,13 +13,16 @@ Update 合并、masked padding 和稳定 KV 提前传输。各实验保留独立
 | `segmented_prefill/` | `replay_normal.py`、`replay_prompt_stream.py`、`replay_merged_update.py`，比较三种 Prefill 路径。 |
 | `update_coalescing/` | `replay_update_coalescing.py`，复用 stream 发送，校验 P 实际合并配置与统计。 |
 | `masked_padding/` | `run_masked_padding_sweep.sbatch`，复用 stream，比较带 mask 的完整 P→D 生成。 |
-| `generation_quality/` | `replay_generation_quality.py` 保存答案，`evaluate_answers.py` 按数据集协议评分。 |
+| `generation_quality/` | `normal/segmented/sparse` 保存完整答案，`evaluate_answers.py` 按 TriviaQA/HotpotQA 协议评分并比较分段与稀疏退化。 |
 | `token_invalidation/` | 三个回放入口比较 Update-first、Append-first 整体建模与分段管理的实际失效 token，使用 P-only TTFT 路由。 |
+| `query_probe/` | `replay.py`，经 P-only TTFT 路由验证联合 Append/Query prefill、块评分、固定比例选择及临时 KV 回收。 |
 | `stable_kv_push/` | `replay_stable_kv_push.py`，分别观察 P/D 首 token 与实际 KV 传输指标。 |
 | `tests/` | CPU 回归测试，使用临时数据和模拟 HTTP 响应。 |
 
 `segmented_prefill/replay_common.py` 和 `prompt_stream_stats_v2.py` 保留旧导入路径，
 实际实现位于公共包。已有汇总、绘图入口和历史结果仍可读取；各实验使用独立结果目录。
+
+Query probe 的启动脚本、数据配置与功能校验见 [query_probe/README.md](query_probe/README.md)。
 
 ## Token 失效实验
 

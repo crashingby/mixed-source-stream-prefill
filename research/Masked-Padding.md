@@ -6,6 +6,10 @@
 “当前不支持”描述的是修改前的通用接口。现在使用显式开关启用：
 
 ```shell
+# P：自定义后端处理 dense / sparse prefill
+--attention-backend CHUNK_SPARSE_ATTN --prompt-stream-masked-padding --no-async-scheduling
+
+# D：unified_attention 完整读取历史 KV，只屏蔽 padding
 --attention-backend TRITON_ATTN --prompt-stream-masked-padding --no-async-scheduling
 ```
 
@@ -31,9 +35,10 @@
 位置寻找 KV slot。普通请求的区间为空；关闭开关时模型位置直接别名到物理
 位置，attention 不接收 padding tensor。
 
-首版限于文本 decoder、全因果 attention、普通一维位置编码和 `TRITON_ATTN`。
-同步调度、PP=1、无 context parallel/speculative decode；同节点 TP 可沿用相同
-区间。自动选择 runner 时使用 V1；显式强制 V2 会报错。MLA、混合状态模型、
+限于文本 decoder、全因果 attention、普通一维位置编码，支持 `TRITON_ATTN`
+和 `CHUNK_SPARSE_ATTN`；当前命令显式选择 P 为后者、D 为前者，decode 不做块稀疏。同步调度、PP=1、无 context
+parallel/speculative decode；旧 `TRITON_ATTN` 允许同节点 TP，自定义后端目前
+要求 TP=1、eager、16-token block。自动选择 runner 时使用 V1；显式强制 V2 会报错。MLA、混合状态模型、
 滑窗、ALiBi、多维 RoPE、多模态及非因果路径明确拒绝。非默认词频惩罚与
 prompt logprobs 暂不支持，因为其输入仍是物理 token 序列。完整 PD 的
 `--disable-kv-transfer` 诊断分支也拒绝 masked 请求，避免丢失坐标语义。

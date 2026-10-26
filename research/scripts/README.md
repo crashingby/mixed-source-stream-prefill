@@ -35,7 +35,7 @@
 | `<P_PORT>` | P 节点 OpenAI server 端口 | `8100` |
 | `<D_PORT>` | D 节点 OpenAI server 端口 | `8200` |
 | `<PROXY_PORT>` | proxy 端口 | `8000` |
-| `<GPU_UTIL>` | vLLM 可占用 GPU 显存比例 | `0.6` |
+| `<GPU_UTIL>` | vLLM 可占用 GPU 显存比例 | `0.8` |
 | `<MAX_MODEL_LEN>` | vLLM 最大上下文长度 | `4096` |
 | `<MAX_NUM_SEQS>` | vLLM 最大并发序列数 | `64` |
 | `<MAX_CONCURRENCY>` | 性能回放客户端的最大在途逻辑请求数 | `32` |
@@ -57,7 +57,7 @@ export MODEL_PATH=/workplace/home/huangxinying/Models/Qwen2.5-3B/
 export SERVED_MODEL_NAME=qwen2.5-3b
 export MODEL_PATH=/workplace/home/huangxinying/Models/Llama-3.1-8B-Instruct
 export SERVED_MODEL_NAME=llama-3.1-8b-instruct
-export GPU_MEMORY_UTILIZATION=0.6
+export GPU_MEMORY_UTILIZATION=0.8
 export MAX_MODEL_LEN=4096
 export MAX_NUM_SEQS=64
 export MAX_CONCURRENCY=32

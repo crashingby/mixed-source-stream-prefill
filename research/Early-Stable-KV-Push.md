@@ -364,8 +364,10 @@ D 使用相同配置，仅将 `kv_role` 换为 `kv_consumer`。除布尔能力�
 | `stable_kv_max_reserved_fraction` | 在 `(0,1]` 内；D 未收养 reservation 的总块数比例上限。 |
 | `stable_kv_session_timeout_s` | 正有限数；无活动会话超时与关闭身份保留窗口。 |
 
-模型启动同时使用 `--no-async-scheduling`；本轮还显式指定
-`--attention-backend TRITON_ATTN --prompt-stream-masked-padding --generation-config vllm`。
+模型启动同时使用 `--no-async-scheduling --prompt-stream-masked-padding --generation-config vllm`。
+P 显式指定 `--attention-backend CHUNK_SPARSE_ATTN`，D 显式指定
+`--attention-backend TRITON_ATTN`。D 的 `unified_attention` 完整读取历史 KV，
+只屏蔽 padding，不做块稀疏；两组对照保持相同的逐角色后端配置。
 不设置 `stable_kv_push` 时没有新增 controller，会继续使用原有 connector 路径。
 
 实验开关是外部 start JSON 的 `early_stable_kv_push`：

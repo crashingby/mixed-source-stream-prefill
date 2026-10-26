@@ -109,6 +109,8 @@ class EngineClient(ABC):
         tokenization_kwargs: dict[str, Any] | None = None,
         trace_headers: Mapping[str, str] | None = None,
         priority: int = 0,
+        probe_token_ids: list[int] | None = None,
+        probe_keep_ratio: float = 0.5,
     ) -> Any:
         """添加流式 prompt 的初始请求，并返回输出收集器。
 

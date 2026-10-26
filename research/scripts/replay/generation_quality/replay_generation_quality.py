@@ -3,7 +3,7 @@
 
 """以低并发方式回放 mixed-source 样本并保存完整生成答案。
 
-该脚本提供 ``normal`` 和 ``segmented`` 两种模式。两种模式使用完全相同的
+该脚本提供 ``normal``、``segmented`` 和 ``sparse`` 三种模式。各模式使用相同的
 质量评测提示词、样本集合与采样参数，区别仅在于 prompt 是一次性提交，还是
 通过 mixed-source prompt-stream RESTFUL API 分阶段提交。
 """
@@ -46,6 +46,7 @@ from research.scripts.replay.common.models import (
     RenderedReplayPrompt as RenderedQualityPrompt,
 )
 from research.scripts.replay.common.models import SourceEventStream
+from research.scripts.replay.common.probe import validate_probe
 from research.scripts.replay.common.prompt import (
     ChatTemplateRenderer,
     render_sample_prompt,
@@ -69,7 +70,7 @@ from research.scripts.replay.generation_quality.evaluators import references
 logger = logging.getLogger(__name__)
 
 MIX_SOURCE_SCHEMA_VERSION = "prompt_stream_mixed/v2"
-QUALITY_REPLAY_SCHEMA_VERSION = "generation_quality_replay/v2"
+QUALITY_REPLAY_SCHEMA_VERSION = "generation_quality_replay/v3"
 DEFAULT_DATA_DIR = Path("research/data/mix_source")
 DEFAULT_OUTPUT_DIR = Path("research/scripts/replay/generation_quality/results")
 DEFAULT_PROXY_URL = "http://127.0.0.1:8000"
@@ -79,13 +80,13 @@ DEFAULT_ANSWER_INSTRUCTION = (
 )
 CHAT_TEMPLATE_CONTENT_MARKER = "VLLM_PROMPT_STREAM_CONTENT_7CDA3F6B"
 
-ReplayMode = Literal["normal", "segmented"]
+ReplayMode = Literal["normal", "segmented", "sparse"]
 SourceType = Literal["append", "update"]
 
 
 @dataclass(frozen=True)
 class GoldAnswerRecord:
-    """一个 mixed-source 样本对应的 SQuAD 官方答案。"""
+    """一个样本对应的官方答案及其数据集评分协议。"""
 
     sample_id: str
     query_id: str
@@ -121,6 +122,10 @@ class SseCompletion:
     finish_reason: str | None
     num_chunks: int
     num_token_ids: int
+    prompt_stream_stats: dict[str, Any] | None = None  # P 的实际执行和 probe 统计。
+    masked_padding: dict[str, Any] | None = None  # P/D 共同使用的物理 padding 区间。
+    num_prefill_token_ids: int = 0  # 区分 P 首 token 和 D 的完整续写。
+    num_decode_token_ids: int = 0
 
 
 @dataclass
@@ -153,6 +158,13 @@ class GenerationResult:
     error: str | None = None
     evaluation_protocol: str = "squad_v2"
     input_transport: str = "text"
+    probe_keep_ratio: float | None = None  # 仅 sparse 模式注册 probe。
+    prompt_stream_stats: dict[str, Any] | None = None
+    masked_padding: dict[str, Any] | None = None
+    num_prefill_token_ids: int = 0
+    num_decode_token_ids: int = 0
+    source_events_sha256: str = ""  # 配对时同时校验历史快照和来源时间配置。
+    generation_settings: dict[str, Any] | None = None  # 固定模型、模板和采样口径。
 
 
 def _load_gold_manifest(path: Path) -> dict[str, GoldAnswerRecord]:
@@ -463,6 +475,7 @@ def _apply_generation_params(
     payload["max_tokens"] = args.max_tokens
     payload["temperature"] = args.temperature
     payload["seed"] = args.seed
+    payload["return_token_ids"] = True  # 完整 SSE 精确统计 P 和 D 的输出 token。
     if args.stop_at_newline:
         # SQuAD 评测期待短答案片段；两种模式必须使用完全相同的停止条件。
         payload["stop"] = ["\n"]
@@ -479,7 +492,14 @@ async def _consume_sse(response: httpx.Response) -> SseCompletion:
     finish_reason: str | None = None
     num_chunks = 0
     num_token_ids = 0
+    num_prefill_token_ids = num_decode_token_ids = 0
+    stats = padding = None
     async for payload in iter_sse_payloads(response):
+        # 元数据通常在 P 首帧；后续 D 帧没有这些字段，不能覆盖已保存值。
+        if "prompt_stream_stats" in payload:
+            stats = payload["prompt_stream_stats"]
+        if "prompt_stream_masked_padding" in payload:
+            padding = payload["prompt_stream_masked_padding"]
         choices = payload.get("choices")
         if not isinstance(choices, list):
             continue
@@ -495,15 +515,35 @@ async def _consume_sse(response: httpx.Response) -> SseCompletion:
                 num_chunks += 1
             token_ids = choice.get("token_ids")
             if isinstance(token_ids, list):
+                # proxy 未标注来源时，首个 token 帧来自 P，后续帧来自 D。
+                origin = payload.get("token_source") or (
+                    "prefill" if num_token_ids == 0 else "decode"
+                )
                 num_token_ids += len(token_ids)
+                if origin == "prefill":
+                    num_prefill_token_ids += len(token_ids)
+                elif origin == "decode":
+                    num_decode_token_ids += len(token_ids)
             if choice.get("finish_reason") is not None:
                 finish_reason = str(choice["finish_reason"])
+                if finish_reason not in ("stop", "length"):
+                    raise RuntimeError(
+                        f"Generation failed: finish_reason={finish_reason}"
+                    )
+
+    # D 加载失败可能只留下 P 的首 token 和 [DONE]，不能作为完整答案评分。
+    if finish_reason is None:
+        raise RuntimeError("Incomplete generation: SSE has no terminal finish_reason.")
 
     return SseCompletion(
         text="".join(text_parts),
         finish_reason=finish_reason,
         num_chunks=num_chunks,
         num_token_ids=num_token_ids,
+        prompt_stream_stats=stats,
+        masked_padding=padding,
+        num_prefill_token_ids=num_prefill_token_ids,
+        num_decode_token_ids=num_decode_token_ids,
     )
 
 
@@ -598,7 +638,81 @@ def _empty_result(
         ),
         evaluation_protocol=sample.gold.evaluation_protocol,
         input_transport=args.input_transport,
+        probe_keep_ratio=args.probe_keep_ratio if args.mode == "sparse" else None,
+        source_events_sha256=hashlib.sha256(
+            json.dumps(
+                {
+                    "sources": [asdict(source) for source in sample.source_streams],
+                    "timing": {
+                        key: getattr(args, key)
+                        for key in (
+                            "append_initial_delay",
+                            "update_initial_delay",
+                            "append_chunk_interval",
+                            "update_chunk_interval",
+                            "source_finish_delay",
+                        )
+                    },
+                },
+                sort_keys=True,
+                ensure_ascii=False,
+            ).encode("utf-8")
+        ).hexdigest(),
+        generation_settings={
+            "model": args.model,
+            "tokenizer_model": args.tokenizer_model,
+            "chat_template_sha256": getattr(args, "chat_template_sha256", None),
+            "max_tokens": args.max_tokens,
+            "temperature": args.temperature,
+            "seed": args.seed,
+            "stop": ["\n"] if args.stop_at_newline else [],
+            "answer_instruction": args.answer_instruction,
+        },
     )
+
+
+def _record_completion(result: GenerationResult, completion: SseCompletion) -> None:
+    """保存完整 P/D 输出及原始统计；执行校验通过后才标记请求成功。"""
+    result.response_text = completion.text
+    result.finish_reason = completion.finish_reason
+    result.num_completion_chunks = completion.num_chunks
+    result.num_completion_token_ids = completion.num_token_ids
+    result.num_prefill_token_ids = completion.num_prefill_token_ids
+    result.num_decode_token_ids = completion.num_decode_token_ids
+    result.prompt_stream_stats = completion.prompt_stream_stats
+    result.masked_padding = completion.masked_padding
+
+
+def _validate_stream_execution(
+    sample: QualitySample, args: argparse.Namespace, completion: SseCompletion
+) -> None:
+    """确认完整回答来自所声明的分段策略，不能把未生效的 sparse 当成实验。"""
+    stats = completion.prompt_stream_stats
+    if stats is None or stats.get("coalescing_enabled") is not False:
+        raise ValueError("质量对照要求 P 返回执行统计，并关闭 Update 合并")
+    if completion.masked_padding is None:
+        raise ValueError("分段质量对照要求 P/D 开启 masked padding")
+    num_update = sum(
+        record["event"]["event_type"] == "update"
+        for source in sample.source_streams
+        for record in source.event_records
+    )
+    if stats.get("update_events_accepted") != num_update:
+        raise ValueError("P 接收的 Update 数与回放输入不一致")
+    if args.mode == "sparse":
+        num_append = sum(
+            record["event"]["event_type"] == "append"
+            and bool(record["event"].get("text") or record["event"].get("token_ids"))
+            for source in sample.source_streams
+            for record in source.event_records
+        )
+        if "query_probe" not in stats:
+            raise ValueError("sparse 请求未返回 Query probe 统计")
+        if not math.isclose(stats["query_probe"]["keep_ratio"], args.probe_keep_ratio):
+            raise ValueError("P 实际稀疏比例与配置不一致")
+        validate_probe(stats, num_append, args.probe_keep_ratio)
+    elif "query_probe" in stats:
+        raise ValueError("segmented dense 基线不应执行 probe")
 
 
 async def _replay_normal_sample(
@@ -630,11 +744,8 @@ async def _replay_normal_sample(
             payload,
             args.sse_timeout,
         )
+        _record_completion(result, completion)
         result.result_status = "ok"
-        result.response_text = completion.text
-        result.finish_reason = completion.finish_reason
-        result.num_completion_chunks = completion.num_chunks
-        result.num_completion_token_ids = completion.num_token_ids
     except Exception as exc:  # noqa: BLE001
         result.result_status = "error"
         result.error_stage = "normal_completion"
@@ -665,6 +776,12 @@ async def _replay_segmented_sample(
     start_payload["add_special_tokens"] = False
     start_payload["request_id"] = external_request_id
     start_payload["api"] = "completions"
+    # 各模式的最终问题和 chat suffix 完全一致；probe 不读取官方答案。
+    start_payload.pop("probe_query", None)
+    start_payload.pop("probe_keep_ratio", None)
+    if args.mode == "sparse":
+        start_payload["probe_query"] = rendered_prompt.finish_text
+        start_payload["probe_keep_ratio"] = args.probe_keep_ratio
     _apply_generation_params(start_payload, args)
 
     request_started_at = time.perf_counter()
@@ -721,11 +838,10 @@ async def _replay_segmented_sample(
             {"request_id": request_id, "event": finish_event},
             args.sse_timeout,
         )
+        _record_completion(result, completion)
+        stage = "validate_execution"
+        _validate_stream_execution(sample, args, completion)
         result.result_status = "ok"
-        result.response_text = completion.text
-        result.finish_reason = completion.finish_reason
-        result.num_completion_chunks = completion.num_chunks
-        result.num_completion_token_ids = completion.num_token_ids
     except asyncio.CancelledError:
         if request_id is not None:
             await asyncio.shield(
@@ -748,6 +864,8 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--start-index and --max-requests must be non-negative.")
     if args.max_tokens <= 0:
         raise ValueError("--max-tokens must be positive.")
+    if not math.isfinite(args.probe_keep_ratio) or not 0 <= args.probe_keep_ratio <= 1:
+        raise ValueError("--probe-keep-ratio 必须在 [0, 1] 内")
     if not math.isfinite(args.temperature) or args.temperature < 0:
         raise ValueError("--temperature must be non-negative.")
     if not args.tokenizer_model.strip():
@@ -774,7 +892,15 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=("回放独立数据或 SQuAD 对齐样本，保存完整生成答案。")
     )
-    parser.add_argument("--mode", choices=("normal", "segmented"), required=True)
+    parser.add_argument(
+        "--mode", choices=("normal", "segmented", "sparse"), default="segmented"
+    )
+    parser.add_argument(
+        "--probe-keep-ratio",
+        type=float,
+        default=0.5,
+        help="sparse 模式保留的完整独占 KV block 比例",
+    )
     parser.add_argument("--data-dir", type=Path, default=DEFAULT_DATA_DIR)
     parser.add_argument(
         "--gold-manifest",
@@ -816,7 +942,7 @@ def parse_args() -> argparse.Namespace:
         default=False,
         help="Allow custom tokenizer code while loading --tokenizer-model.",
     )
-    parser.add_argument("--max-tokens", type=int, default=32)
+    parser.add_argument("--max-tokens", type=int, default=64)
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--seed", type=int, default=2026)
     parser.add_argument(
@@ -839,7 +965,7 @@ def parse_args() -> argparse.Namespace:
         "--inter-request-delay",
         type=float,
         default=0.20,
-        help="Idle seconds after one complete request before the next starts.",
+        help="QPS=0 时每个客户端槽位完成请求后的空闲秒数。",
     )
     parser.add_argument("--http-timeout", type=float, default=600.0)
     parser.add_argument("--sse-timeout", type=float, default=300.0)
@@ -854,6 +980,13 @@ def parse_args() -> argparse.Namespace:
     )
     add_shared_arguments(parser)
     args = parse_configured_args(parser)
+    if (
+        args.dataset is None
+        and args.questions_file is None
+        and args.data_dir == DEFAULT_DATA_DIR
+        and args.gold_manifest is None
+    ):
+        args.dataset = "triviaqa"  # 无显式旧数据输入时，使用当前独立数据集。
     args.experiment_suite = "generation_quality"
     args.replay_mode = args.mode
     args.event_progress_log_interval = 0
@@ -867,13 +1000,14 @@ async def run(args: argparse.Namespace) -> Path:
         args.tokenizer_model,
         args.tokenizer_trust_remote_code,
     )
+    args.chat_template_sha256 = renderer.chat_template_sha256
     logger.info(
         "Loaded chat template: tokenizer_model=%s template_sha256=%s",
         renderer.tokenizer_model,
         renderer.chat_template_sha256,
     )
     gold_manifest = args.gold_manifest
-    if gold_manifest is None:
+    if gold_manifest is None and not (args.dataset or args.questions_file):
         gold_manifest = args.data_dir / "quality_eval" / "squad_gold_answers.jsonl"
     gold_records = (
         {}
@@ -895,6 +1029,9 @@ async def run(args: argparse.Namespace) -> Path:
                     separators=(",", ":"),
                 ).encode("utf-8")
             ).hexdigest(),
+            "question": sample.question,
+            "gold_answers": list(sample.gold.gold_answers),
+            "evaluation_protocol": sample.gold.evaluation_protocol,
         }
         for sample in samples
     ]
@@ -902,7 +1039,10 @@ async def run(args: argparse.Namespace) -> Path:
         run_directory / "config.json",
         {
             "schema_version": QUALITY_REPLAY_SCHEMA_VERSION,
-            "args": {**vars(args), "gold_manifest": str(gold_manifest)},
+            "args": {
+                **vars(args),
+                "gold_manifest": str(gold_manifest) if gold_manifest else None,
+            },
             "prompt_format": {
                 "name": "model_chat_template_system_user/v1",
                 "tokenizer_model": renderer.tokenizer_model,
@@ -969,7 +1109,12 @@ async def run(args: argparse.Namespace) -> Path:
                 )
 
             await execute_workload(
-                len(samples), args, execute, on_result=record, fail_fast_error=failure
+                len(samples),
+                args,
+                execute,
+                on_result=record,
+                fail_fast_error=failure,
+                closed_loop=True,
             )
 
     _write_json(

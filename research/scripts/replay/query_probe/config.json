@@ -1,0 +1,16 @@
+{
+  "dataset": "triviaqa",
+  "proxy_url": "http://127.0.0.1:8001",
+  "model": "qwen2.5-3b",
+  "tokenizer_model": "~/Models/Qwen2.5-3B",
+  "keep_ratio": 0.5,
+  "max_requests": 3,
+  "max_concurrency": 1,
+  "qps": 0,
+  "append_initial_delay": 0,
+  "update_initial_delay": 0.05,
+  "append_chunk_interval": 0.1,
+  "update_chunk_interval": 0.05,
+  "source_finish_delay": 0,
+  "input_transport": "text"
+}

@@ -333,43 +333,66 @@ class KVCacheManager:
                 f"request_id={request.request_id}, num_new_tokens={num_new_tokens}."
             )
 
-        write_segment = request.get_prompt_stream_write_segment()
-        segment_key = request.get_prompt_stream_segment_key(write_segment)
-        # 这里使用 segment-local 进度，而不是 request.num_computed_tokens。
-        # 例如 update 阶段的全局 num_computed_tokens 已经包含 PREFIX_APPEND，
-        # 但 UPDATE 域申请 blocks 时只关心 update/question 物理域内部长度。
-        segment_num_computed_tokens = (
-            request.get_prompt_stream_segment_num_computed_tokens()
+        targets = self.get_prompt_stream_allocation_targets(request, num_new_tokens)
+        empty_blocks = self.empty_kv_cache_blocks.blocks
+        needed = sum(
+            self.coordinator.get_num_blocks_to_allocate(
+                request_id=key,
+                num_tokens=end,
+                new_computed_blocks=empty_blocks,
+                num_encoder_tokens=0,
+                total_computed_tokens=start,
+                num_tokens_main_model=end,
+            )
+            for key, start, end in targets
         )
-        segment_num_tokens = segment_num_computed_tokens + num_new_tokens
-
-        empty_computed_blocks = self.empty_kv_cache_blocks.blocks
-        num_blocks_to_allocate = self.coordinator.get_num_blocks_to_allocate(
-            request_id=segment_key,
-            num_tokens=segment_num_tokens,
-            new_computed_blocks=empty_computed_blocks,
-            num_encoder_tokens=0,
-            total_computed_tokens=segment_num_computed_tokens,
-            num_tokens_main_model=segment_num_tokens,
+        watermark = (
+            self.watermark_blocks
+            if has_scheduled_reqs
+            and request.status in (RequestStatus.WAITING, RequestStatus.PREEMPTED)
+            else 0
         )
-
-        watermark_blocks = 0
-        if has_scheduled_reqs and request.status in (
-            RequestStatus.WAITING,
-            RequestStatus.PREEMPTED,
-        ):
-            watermark_blocks = self.watermark_blocks
-        available_blocks = self.block_pool.get_num_free_blocks() - reserved_blocks
-        if num_blocks_to_allocate + watermark_blocks > available_blocks:
+        # 在修改任何段之前检查总需求；coordinator 同步独占 block pool。
+        if needed + watermark > self.block_pool.get_num_free_blocks() - reserved_blocks:
             return None
+        merged = [list(group) for group in empty_blocks]
+        for key, _, end in targets:
+            blocks = self.coordinator.allocate_new_blocks(
+                request_id=key,
+                num_tokens=end,
+                num_tokens_main_model=end,
+            )
+            for output_group, new_group in zip(merged, blocks):
+                output_group.extend(new_group)
+        return self.create_kv_cache_blocks(tuple(merged))
 
-        new_blocks = self.coordinator.allocate_new_blocks(
-            request_id=segment_key,
-            num_tokens=segment_num_tokens,
-            num_tokens_main_model=segment_num_tokens,
-        )
-        # Prompt stream segment blocks intentionally stay unhashed and unshared。
-        return self.create_kv_cache_blocks(new_blocks)
+    def get_prompt_stream_allocation_targets(
+        self,
+        request: Request,
+        num_new_tokens: int,
+    ) -> list[tuple[str, int, int]]:
+        """按物理写入边界返回各段的 key、已计算长度和目标长度。"""
+        view = request.prompt_stream_execution_view
+        assert view is not None
+        start = request.num_computed_tokens
+        end = start + num_new_tokens
+        if view.probe_start >= 0:
+            targets = []
+            if start < view.probe_start:
+                targets.append((request.request_id, start, min(end, view.probe_start)))
+            if end > view.probe_start:
+                targets.append(
+                    (
+                        request.get_prompt_stream_segment_key(
+                            PromptStreamKVSegment.PROBE
+                        ),
+                        max(0, start - view.probe_start),
+                        end - view.probe_start,
+                    )
+                )
+            return targets
+        key = request.get_prompt_stream_segment_key(view.write_segment)
+        return [(key, max(0, start - view.segment_offset), end - view.segment_offset)]
 
     def allocate_slots(
         self,
@@ -647,7 +670,11 @@ class KVCacheManager:
                 PromptStreamKVSegment.PREFIX_APPEND,
             ),
             self._prompt_stream_segment_key(request, PromptStreamKVSegment.UPDATE),
-        ]
+        ] + (
+            [self._prompt_stream_segment_key(request, PromptStreamKVSegment.PROBE)]
+            if request.query_probe is not None
+            else []
+        )
 
     def has_prompt_stream_segment_blocks(
         self,
@@ -824,7 +851,13 @@ class KVCacheManager:
         UPDATE blocks 在后。PREFIX_APPEND 末尾可能有 padding KV，因此这里
         只能按 block 级拼接，不能表达 token 级无缝 compaction。
         """
-        segment_keys = self.get_prompt_stream_segment_keys(request)
+        segment_keys = [
+            request.get_prompt_stream_segment_key(segment)
+            for segment in (
+                PromptStreamKVSegment.PREFIX_APPEND,
+                PromptStreamKVSegment.UPDATE,
+            )
+        ]
         return self.create_kv_cache_blocks(
             self.coordinator.get_merged_blocks(segment_keys)
         )

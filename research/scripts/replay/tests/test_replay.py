@@ -10,6 +10,7 @@ import ast
 import asyncio
 import hashlib
 import json
+import math
 import sys
 import time
 from collections import defaultdict
@@ -393,10 +394,56 @@ class FakeProxy:
             },
             {
                 "token_source": "decode",
-                "choices": [{"text": " city", "token_ids": [2]}],
+                "choices": [
+                    {"text": " city", "token_ids": [2], "finish_reason": "stop"}
+                ],
             },
             {"choices": [], "stable_kv_metrics": metrics},
         ]
+        if "/finish" in path and body["request_id"].startswith("quality-stream-"):
+            # 质量入口要求使用可观测的 P 执行统计，不能把未启用 probe 当作 sparse。
+            stats = {
+                "coalescing_enabled": False,
+                "update_events_accepted": sum(
+                    endpoint.endswith("/event")
+                    and payload.get("request_id") == body["request_id"]
+                    and payload["event"]["event_type"] == "update"
+                    for endpoint, payload in self.requests
+                ),
+            }
+            if "probe_query" in session["start"]:
+                ratio = session["start"]["probe_keep_ratio"]
+                appends = [
+                    payload["event"]
+                    for endpoint, payload in self.requests
+                    if endpoint.endswith("/event")
+                    and payload.get("request_id") == body["request_id"]
+                    and payload["event"]["event_type"] == "append"
+                    and payload["event"].get("text")
+                ]
+                chunks = []
+                for index, _ in enumerate(appends):
+                    start = index * 32
+                    blocks = [index * 2, index * 2 + 1]
+                    count = math.ceil(ratio * 2)
+                    chunks.append(
+                        {
+                            "start": start,
+                            "end": start + 32,
+                            "block_ids": blocks,
+                            "published": True,
+                            "raw_scores": [0.1, 0.2],
+                            "corrected_scores": [0.2, 0.4],
+                            "kept_blocks": sorted(list(reversed(blocks))[:count]),
+                        }
+                    )
+                stats["query_probe"] = {
+                    "keep_ratio": ratio,
+                    "query_tokens": 5,
+                    "released_probe_blocks": len(chunks),
+                    "chunks": chunks,
+                }
+            frames[0]["prompt_stream_stats"] = stats
         sse = "".join("data: " + json.dumps(frame) + "\n\n" for frame in frames)
         return httpx.Response(
             200,

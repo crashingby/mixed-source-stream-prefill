@@ -182,9 +182,11 @@ def render_sample_prompt(
     )
     user_content = append_text + update_text + question_text
     full_text = prefix + user_content + suffix
-    if full_text != renderer.render_chat_prompt(
+    native_text = renderer.render_chat_prompt(
         str(sample.start_request["prompt"]).strip(), user_content
-    ):
+    )
+    # Llama 模板会 trim 用户内容；流式事件保留边缘空白，三组共用同一拼接文本。
+    if native_text not in (full_text, prefix + user_content.strip() + suffix):
         raise ValueError(f"模板无法无损拆分：{sample.sample_id}")
     # 模板后缀必须随 finish 文本传输，不能仅保存在客户端 token 列表中。
     finish_text = question_text + suffix

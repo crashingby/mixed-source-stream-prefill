@@ -187,6 +187,9 @@ def _build_decode_base_request(req_data: dict[str, Any]) -> dict[str, Any]:
     base_request.pop("api", None)
     base_request.pop("request_id", None)
     base_request.update(sampling_params)
+    # probe 只属于 P 的内部执行，不能作为 D 的生成参数。
+    base_request.pop("probe_query", None)
+    base_request.pop("probe_keep_ratio", None)
     return base_request
 
 
@@ -892,8 +895,7 @@ def _build_normal_pd_decode_request(
             raise HTTPException(
                 status_code=502,
                 detail=(
-                    "P node normal PD response did not include "
-                    "kv_transfer_params."
+                    "P node normal PD response did not include kv_transfer_params."
                 ),
             )
         decode_request["kv_transfer_params"] = kv_transfer_params
@@ -984,9 +986,7 @@ def _merge_normal_pd_prefill_output(
                 prompt_tokens - num_prefill_output_tokens,
             )
         if isinstance(completion_tokens, int):
-            usage["completion_tokens"] = (
-                completion_tokens + num_prefill_output_tokens
-            )
+            usage["completion_tokens"] = completion_tokens + num_prefill_output_tokens
     return decode_response
 
 
@@ -1417,13 +1417,16 @@ async def _handle_normal_pd_completions(
     # 专用 TTFT 路由绝不构造或发送 D 请求。返回完整响应体而非异步 generator，
     # 与 prompt_stream/finish_ttft 一样避免 headers 已发送后 body 被取消。
     if ttft_only:
-        sse_body = _encode_sse_payload(
-            _build_normal_pd_prefill_stream_chunk(
-                prefill_response,
-                prefill_choice,
-                is_final_chunk=True,
+        sse_body = (
+            _encode_sse_payload(
+                _build_normal_pd_prefill_stream_chunk(
+                    prefill_response,
+                    prefill_choice,
+                    is_final_chunk=True,
+                )
             )
-        ) + b"data: [DONE]\n\n"
+            + b"data: [DONE]\n\n"
+        )
         logger.info(
             "Proxy normal PD TTFT-only completed: request_id=%s "
             "prompt_tokens=%s output_tokens=%s kv_transfer_enabled=%s",
@@ -1833,13 +1836,16 @@ async def finish_prompt_stream_ttft(request: Request):
     # TTFT-only 的响应体只有两帧，且两帧均已在此时完全构造完毕。直接写入
     # Response 而不是交给 StreamingResponse 的异步 generator，可避免 HTTP
     # headers 已发出、但 generator 尚未获得调度时，replay 端无限等待 body。
-    sse_body = _encode_sse_payload(
-        _build_prefill_stream_chunk(
-            session,
-            prefill_response,
-            is_final_chunk=True,
+    sse_body = (
+        _encode_sse_payload(
+            _build_prefill_stream_chunk(
+                session,
+                prefill_response,
+                is_final_chunk=True,
+            )
         )
-    ) + b"data: [DONE]\n\n"
+        + b"data: [DONE]\n\n"
+    )
     logger.info(
         "Proxy TTFT-only finish completed: request_id=%s "
         "prompt_stream_blocks=%s output_tokens=%s sse_bytes=%s",

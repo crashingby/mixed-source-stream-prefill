@@ -95,7 +95,7 @@ SOFT_WINDOW_MS=20 \
 HARD_DEADLINE_MS=80 \
 MODEL_PATH="${MODEL_PATH}" \
 SERVED_MODEL_NAME="${SERVED_MODEL_NAME}" \
-GPU_MEMORY_UTILIZATION=0.6 \
+GPU_MEMORY_UTILIZATION=0.8 \
 MAX_MODEL_LEN=4096 \
 MAX_NUM_SEQS=64 \
 sbatch --nodelist="${P_NODE}" \
@@ -137,7 +137,7 @@ Slurm 会设置当前 job 可见的 GPU。通常不要再手写 `CUDA_VISIBLE_DE
 | `SERVED_MODEL_NAME` | `qwen2.5-3b` | **建议设置** | REST 请求中的模型名称，必须与 replay 的 `MODEL` 一致。 |
 | `HOST` | `0.0.0.0` | 通常不需要 | P 节点 OpenAI API 监听地址。 |
 | `PORT` | `8100` | 端口冲突时设置 | P 节点 REST 端口，proxy 的 prefiller port 必须与它一致。 |
-| `GPU_MEMORY_UTILIZATION` | `0.65` | **建议设置** | vLLM 可使用的 GPU 显存比例。过高可能因其它进程占用而 OOM。 |
+| `GPU_MEMORY_UTILIZATION` | `0.8` | **建议设置** | vLLM 可使用的 GPU 显存比例。过高可能因其它进程占用而 OOM。 |
 | `MAX_MODEL_LEN` | `4096` | **建议设置** | 最大序列长度；超过它的实验请求会失败。 |
 | `MAX_NUM_SEQS` | `64` | **建议固定并记录** | Scheduler 同时容纳的序列上限，不是数据集请求总数。增大后并发能力和 KV 显存占用都会增加。 |
 | `NIXL_SIDE_CHANNEL_PORT` | `5600` | 同节点多实例时设置 | NIXL P 侧 side-channel 端口。 |
@@ -631,7 +631,7 @@ NIXL pull producer。通用 P 启动脚本已传入 `--no-async-scheduling`。D 
 ```shell
 COALESCING_PROFILE=disabled \
 MODEL_PATH="${MODEL_PATH}" SERVED_MODEL_NAME="${SERVED_MODEL_NAME}" \
-GPU_MEMORY_UTILIZATION=0.6 MAX_MODEL_LEN=4096 MAX_NUM_SEQS=64 \
+GPU_MEMORY_UTILIZATION=0.8 MAX_MODEL_LEN=4096 MAX_NUM_SEQS=64 \
 sbatch --nodelist="${P_NODE}" \
   research/scripts/replay/update_coalescing/start_p_node_coalescing.sbatch
 ```
@@ -656,7 +656,7 @@ sbatch research/scripts/replay/update_coalescing/run_policy_sweep.sbatch
 ```shell
 COALESCING_PROFILE=immediate-controller \
 MODEL_PATH="${MODEL_PATH}" SERVED_MODEL_NAME="${SERVED_MODEL_NAME}" \
-GPU_MEMORY_UTILIZATION=0.6 MAX_MODEL_LEN=4096 MAX_NUM_SEQS=64 \
+GPU_MEMORY_UTILIZATION=0.8 MAX_MODEL_LEN=4096 MAX_NUM_SEQS=64 \
 sbatch --nodelist="${P_NODE}" \
   research/scripts/replay/update_coalescing/start_p_node_coalescing.sbatch
 ```
@@ -682,7 +682,7 @@ sbatch research/scripts/replay/update_coalescing/run_policy_sweep.sbatch
 COALESCING_PROFILE=fixed-window \
 SOFT_WINDOW_MS=20 HARD_DEADLINE_MS=80 \
 MODEL_PATH="${MODEL_PATH}" SERVED_MODEL_NAME="${SERVED_MODEL_NAME}" \
-GPU_MEMORY_UTILIZATION=0.6 MAX_MODEL_LEN=4096 MAX_NUM_SEQS=64 \
+GPU_MEMORY_UTILIZATION=0.8 MAX_MODEL_LEN=4096 MAX_NUM_SEQS=64 \
 sbatch --nodelist="${P_NODE}" \
   research/scripts/replay/update_coalescing/start_p_node_coalescing.sbatch
 ```
@@ -709,7 +709,7 @@ sbatch research/scripts/replay/update_coalescing/run_policy_sweep.sbatch
 COALESCING_PROFILE=quiet-debounce \
 SOFT_WINDOW_MS=20 HARD_DEADLINE_MS=80 \
 MODEL_PATH="${MODEL_PATH}" SERVED_MODEL_NAME="${SERVED_MODEL_NAME}" \
-GPU_MEMORY_UTILIZATION=0.6 MAX_MODEL_LEN=4096 MAX_NUM_SEQS=64 \
+GPU_MEMORY_UTILIZATION=0.8 MAX_MODEL_LEN=4096 MAX_NUM_SEQS=64 \
 sbatch --nodelist="${P_NODE}" \
   research/scripts/replay/update_coalescing/start_p_node_coalescing.sbatch
 ```
@@ -739,7 +739,7 @@ COALESCING_PROFILE=load-aware \
 LOAD_AWARE_TOKEN_PRESSURE_THRESHOLD=1.0 \
 LOAD_AWARE_SLOT_PRESSURE_THRESHOLD=1.0 \
 MODEL_PATH="${MODEL_PATH}" SERVED_MODEL_NAME="${SERVED_MODEL_NAME}" \
-GPU_MEMORY_UTILIZATION=0.6 MAX_MODEL_LEN=4096 MAX_NUM_SEQS=64 \
+GPU_MEMORY_UTILIZATION=0.8 MAX_MODEL_LEN=4096 MAX_NUM_SEQS=64 \
 sbatch --nodelist="${P_NODE}" \
   research/scripts/replay/update_coalescing/start_p_node_coalescing.sbatch
 ```
@@ -770,7 +770,7 @@ sbatch research/scripts/replay/update_coalescing/run_policy_sweep.sbatch
 ```shell
 COALESCING_PROFILE=full-merge \
 MODEL_PATH="${MODEL_PATH}" SERVED_MODEL_NAME="${SERVED_MODEL_NAME}" \
-GPU_MEMORY_UTILIZATION=0.6 MAX_MODEL_LEN=4096 MAX_NUM_SEQS=64 \
+GPU_MEMORY_UTILIZATION=0.8 MAX_MODEL_LEN=4096 MAX_NUM_SEQS=64 \
 sbatch --nodelist="${P_NODE}" \
   research/scripts/replay/update_coalescing/start_p_node_coalescing.sbatch
 ```
@@ -796,7 +796,7 @@ sbatch research/scripts/replay/update_coalescing/run_policy_sweep.sbatch
 COALESCING_PROFILE=custom \
 PROMPT_STREAM_UPDATE_COALESCING_CONFIG='{"update_policy":"fixed_window","soft_window_ms":10,"hard_deadline_ms":40}' \
 MODEL_PATH="${MODEL_PATH}" SERVED_MODEL_NAME="${SERVED_MODEL_NAME}" \
-GPU_MEMORY_UTILIZATION=0.6 MAX_MODEL_LEN=4096 MAX_NUM_SEQS=64 \
+GPU_MEMORY_UTILIZATION=0.8 MAX_MODEL_LEN=4096 MAX_NUM_SEQS=64 \
 sbatch --nodelist="${P_NODE}" \
   research/scripts/replay/update_coalescing/start_p_node_coalescing.sbatch
 ```

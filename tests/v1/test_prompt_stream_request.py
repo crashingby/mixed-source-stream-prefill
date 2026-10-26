@@ -3,6 +3,7 @@
 
 import json
 from dataclasses import asdict
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -1058,9 +1059,9 @@ def test_latest_only_recovery_carries_only_newest_admission() -> None:
         )
     )
     assert request.prompt_stream is not None
-    pending_admission_id = (
-        request.prompt_stream.pending_work_items[-1].update_admission_id
-    )
+    pending_admission_id = request.prompt_stream.pending_work_items[
+        -1
+    ].update_admission_id
     assert pending_admission_id == 3
 
     first_delta = request.reset_prompt_stream_computed_state(
@@ -1071,10 +1072,7 @@ def test_latest_only_recovery_carries_only_newest_admission() -> None:
     assert first_delta.carried_update_admission_id == pending_admission_id
     recovery_update = request.prompt_stream.pending_work_items[-1]
     assert recovery_update.update_admission_id == pending_admission_id
-    assert (
-        recovery_update.execution_origin
-        == PromptStreamExecutionOrigin.RECOVERY
-    )
+    assert recovery_update.execution_origin == PromptStreamExecutionOrigin.RECOVERY
 
     # 第二次 reset 只能继续携带 U3，不能再次取消已经终结的 U2。
     second_delta = request.reset_prompt_stream_computed_state(
@@ -1128,10 +1126,7 @@ def test_completed_update_kv_loss_creates_recovery_only_attempt() -> None:
     recovery_update = request.prompt_stream.pending_work_items[-1]
     assert recovery_update.phase == PromptStreamExecutionPhase.UPDATE
     assert recovery_update.update_admission_id is None
-    assert (
-        recovery_update.execution_origin
-        == PromptStreamExecutionOrigin.RECOVERY
-    )
+    assert recovery_update.execution_origin == PromptStreamExecutionOrigin.RECOVERY
 
     request.prepare_prompt_stream_execution(4)
     _finish_active_view(request)
@@ -1205,19 +1200,13 @@ def test_recovery_preserves_empty_coalescing_window_state() -> None:
         "pending_event_count",
         "hypothetical_eager_tokens",
     )
-    before = {
-        field_name: getattr(state, field_name)
-        for field_name in preserved_fields
-    }
+    before = {field_name: getattr(state, field_name) for field_name in preserved_fields}
 
     delta = request.reset_prompt_stream_computed_state(
         PromptStreamRecoveryReason.RETAINED_WAITING_EVICTION
     )
     assert delta is not None
-    after = {
-        field_name: getattr(state, field_name)
-        for field_name in preserved_fields
-    }
+    after = {field_name: getattr(state, field_name) for field_name in preserved_fields}
     assert after == before
     assert request.prompt_stream is not None
     assert not any(
@@ -1306,9 +1295,7 @@ def test_question_waits_for_latest_update_recovery() -> None:
     assert delta is not None
     assert delta.question_tokens_discarded == 1
     assert request.prompt_stream is not None
-    assert [
-        work.phase for work in request.prompt_stream.pending_work_items
-    ] == [
+    assert [work.phase for work in request.prompt_stream.pending_work_items] == [
         PromptStreamExecutionPhase.UPDATE,
         PromptStreamExecutionPhase.QUESTION,
     ]
@@ -1569,6 +1556,40 @@ def test_prompt_stream_exact_transfer_uses_manifest_token_boundary() -> None:
 
     assert num_external_tokens == num_remote_tokens
     assert is_async
+
+
+@pytest.mark.parametrize("cached_tokens", [0, 16])
+@pytest.mark.parametrize("remote_tokens", [31, 32, 33])
+def test_normal_pd_excludes_uncomputed_first_token(
+    cached_tokens: int, remote_tokens: int
+) -> None:
+    """普通 PD 在整块边界和部分前缀命中时均只接收 P 已计算的 KV。"""
+    request = _make_request(list(range(remote_tokens + 1)))
+    request.kv_transfer_params = {
+        "do_remote_prefill": True,
+        "remote_num_tokens": remote_tokens,
+        "remote_block_ids": ([100, 101, 102][: (remote_tokens + 15) // 16],),
+        "remote_engine_id": "p",
+        "remote_request_id": "p-request",
+        "remote_host": "localhost",
+        "remote_port": 15600,
+    }
+    scheduler = object.__new__(NixlPullConnectorScheduler)
+    scheduler._has_mamba = scheduler._is_hma_required = False
+    scheduler.is_bidirectional_kv_xfer_enabled = scheduler.use_host_buffer = False
+    scheduler._reqs_need_recv = {}
+    scheduler.kv_cache_config = _make_kv_cache_manager(block_size=16).kv_cache_config
+    external, is_async = scheduler.get_num_new_matched_tokens(request, cached_tokens)
+    assert (external, is_async) == (remote_tokens - cached_tokens, True)
+
+    # 分配范围包含 D 本地 token 所需尾页；缓存命中的整页不在 unhashed 清单内。
+    first_new_page = cached_tokens // 16
+    allocated = list(range(10 + first_new_page, 10 + (remote_tokens + 16) // 16))
+    blocks = SimpleNamespace(get_unhashed_block_ids_all_groups=lambda: (allocated,))
+    scheduler.update_state_after_alloc(request, blocks, external)
+    _, received = scheduler._reqs_need_recv[request.request_id]
+    assert received == (allocated[: (external + 15) // 16],)
+    assert len(received[0]) == (external + 15) // 16
 
 
 def test_token_savings_use_policy_base_after_recovery() -> None:

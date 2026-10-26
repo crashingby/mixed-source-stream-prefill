@@ -17,7 +17,9 @@ class AttentionConfig:
     """Configuration for attention mechanisms in vLLM."""
 
     backend: AttentionBackendEnum | None = None
-    """Attention backend to use. Use "auto" or None for automatic selection."""
+    """Attention backend to use. Use "auto" or None for automatic selection.
+    CHUNK_SPARSE_ATTN explicitly selects the experimental shared dense/sparse
+    kernel; TRITON_ATTN continues to use unified_attention."""
 
     flash_attn_version: Literal[2, 3, 4] | None = None
     """Force vllm to use a specific flash-attention version (2, 3, or 4).

@@ -191,6 +191,11 @@ class NixlPullConnectorScheduler(NixlBaseConnectorScheduler):
             # Remote prefill: get all prompt blocks from remote.
             token_ids = request.prompt_token_ids or []
             actual = self._mamba_prefill_token_count(len(token_ids))
+            remote_num_tokens = params.get("remote_num_tokens")
+            if not self._has_mamba and type(remote_num_tokens) is int:
+                # 普通 PD 也可能把 P 首 token 追加到 D prompt；该 token 的 KV
+                # 必须在 D 本地计算，不能将它计入远端已完成的前缀。
+                actual = min(actual, remote_num_tokens)
             count = actual - num_computed_tokens
             if count > 0:
                 return count, True
@@ -450,16 +455,19 @@ class NixlPullConnectorScheduler(NixlBaseConnectorScheduler):
                     # a full prefix cache hit on the local node. We need to call
                     # send_notif in _read_blocks to free the memory on the remote node.
 
-                    unhashed_local_block_ids: BlockIds = (
+                    unhashed_local_block_ids = (
                         blocks.get_unhashed_block_ids_all_groups()
                         if num_external_tokens > 0
                         else ()
                     )
-                    if (
-                        num_external_tokens > 0
-                        and params.get("prompt_stream_physical_prompt_len") is not None
+                    if num_external_tokens > 0 and (
+                        params.get("prompt_stream_physical_prompt_len") is not None
+                        or (
+                            not self._has_mamba
+                            and type(params.get("remote_num_tokens")) is int
+                        )
                     ):
-                        # Prompt stream proxy 会把 P 采样的首 token 接到 D prompt。
+                        # PD proxy 会把 P 采样的首 token 接到 D prompt。
                         # 当 remote prefix 恰好 block 对齐时，D 会为这个本地
                         # token 多申请一块；NIXL 只能加载覆盖 external tokens 的
                         # 前缀 blocks，尾块留给 D 本地 forward。

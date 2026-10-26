@@ -21,9 +21,10 @@
 `NixlPushConnector` 及 `kv_connector_extra_config.stable_kv_push=true`，与下文
 普通 Pull 服务的启动路径区分。
 
-`bash research/scripts/server/start_stable_kv_pair.sh` 使用一次 `srun`，在
-`g2c9` 申请两张 GPU，启动恰好一个 P 和一个 D；专用 proxy 与 replay 放在
-`g2c14`。默认 Qwen2.5-3B、显存比例 `0.85`、TP=1、Triton 和 Masked Padding。
+联合启动器使用一次 `srun`，在 `g2c9` 申请两张 GPU，启动恰好一个 P 和一个
+D；专用 proxy 与 replay 放在 `g2c14`。脚本默认 Qwen2.5-3B、显存比例
+`0.8`、TP=1、`CHUNK_SPARSE_ATTN` 和 Masked Padding。当前文档采用逐 rank
+指定后端的启动命令，使 P 使用 `CHUNK_SPARSE_ATTN`、D 使用 `TRITON_ATTN`。
 
 完整可复制的启动、A/B 开关、回放和指标解释见
 [稳定 KV 提前 Push README](../replay/stable_kv_push/README.md)。该实验需要完整
@@ -90,6 +91,8 @@ GPU_MEMORY_UTILIZATION=<GPU_UTIL> \
 MAX_MODEL_LEN=<MAX_MODEL_LEN> \
 MAX_NUM_SEQS=<MAX_NUM_SEQS> \
 TENSOR_PARALLEL_SIZE=1 \
+ATTENTION_BACKEND=CHUNK_SPARSE_ATTN \
+PROMPT_STREAM_MASKED_PADDING=1 \
 sbatch --nodelist=<P_HOST> research/scripts/server/start_p_node.sbatch
 ```
 
@@ -128,6 +131,8 @@ SERVED_MODEL_NAME=<SERVED_MODEL_NAME> \
 GPU_MEMORY_UTILIZATION=<GPU_UTIL> \
 MAX_MODEL_LEN=<MAX_MODEL_LEN> \
 MAX_NUM_SEQS=<MAX_NUM_SEQS> \
+ATTENTION_BACKEND=TRITON_ATTN \
+PROMPT_STREAM_MASKED_PADDING=1 \
 sbatch --nodelist=<D_HOST> research/scripts/server/start_d_node.sbatch
 ```
 
@@ -143,26 +148,31 @@ sbatch --nodelist=<D_HOST> research/scripts/server/start_d_node.sbatch
 | `PORT` | P 为 `8100`，D 为 `8200` | OpenAI server 端口 |
 | `VLLM_NIXL_SIDE_CHANNEL_HOST` | 当前 Slurm 节点 `hostname` | NIXL 对外发布地址 |
 | `NIXL_SIDE_CHANNEL_PORT` | P 为 `5600`，D 为 `5601` | NIXL side-channel 端口 |
-| `GPU_MEMORY_UTILIZATION` | `0.65` | vLLM GPU 显存使用比例 |
+| `GPU_MEMORY_UTILIZATION` | `0.8` | vLLM GPU 显存使用比例 |
 | `MAX_MODEL_LEN` | `4096` | 最大上下文长度 |
 | `TENSOR_PARALLEL_SIZE` | `1` | 仅 P 节点：同一 Slurm 节点内的 vLLM TP rank 数；值为 `2` 时提交命令还必须申请两张 GPU。 |
 | `MAX_NUM_SEQS` | `64` | 最大并发序列数 |
-| `ATTENTION_BACKEND` | 空，自动选择 | 显式指定 vLLM attention backend，例如 `TRITON_ATTN` 或 `FLASH_ATTN`。P/D 对照实验应使用相同值。 |
-| `PROMPT_STREAM_MASKED_PADDING` | `0` | `1` 时传入 `--prompt-stream-masked-padding`，屏蔽分段 KV 中间 padding 并修正 RoPE；未指定后端时自动选择 `TRITON_ATTN`。完整 PD 模式的 P/D 均需开启。 |
+| `ATTENTION_BACKEND` | `CHUNK_SPARSE_ATTN`（脚本默认） | 当前命令显式指定 P 为 `CHUNK_SPARSE_ATTN`、D 为 `TRITON_ATTN`，分别使用共享 dense/sparse kernel 与原 `unified_attention`。各实验组保持相同的逐角色配置。 |
+| `PROMPT_STREAM_MASKED_PADDING` | `0` | `1` 时传入 `--prompt-stream-masked-padding`，屏蔽分段 KV 中间 padding 并修正 RoPE；未指定后端时自动选择 `CHUNK_SPARSE_ATTN`。完整 PD 模式的 P/D 均需开启。 |
 | `GENERATION_CONFIG` | 空；masked 模式为 `vllm` | 传给 `--generation-config`。masked 模式默认覆盖 Qwen 的模型 generation config，避免其 `repetition_penalty=1.05` 将物理 padding 计入词频。 |
 | `ENABLE_KV_TRANSFER` | `1` | 仅 P 节点：`1` 时使用 NIXL `kv_producer`；`0` 时完全省略 `--kv-transfer-config`。TP=2 的 TTFT-only 实验应设为 `0`。 |
 | `PROMPT_STREAM_UPDATE_COALESCING_CONFIG` | 空，功能关闭 | 仅 P 节点使用的 Update 合并 JSON；非空时透传为 `--prompt-stream-update-coalescing-config`。 |
+
+当前 P 使用 `CHUNK_SPARSE_ATTN`，要求 TP=1、eager、同步调度和 16-token KV block。D 显式指定 `TRITON_ATTN`，通过支持 padding mask 的 `unified_attention` 完整读取历史 KV，decode 不启用块稀疏。两端保持模型、KV dtype、block size 和 padding 语义一致；完整 P/D 传输与质量仍需验证。旧的 TP=2 实验需显式指定 `ATTENTION_BACKEND=TRITON_ATTN`。
+
+本次只调整文档命令，`start_d_node.sbatch` 的默认后端仍为
+`CHUNK_SPARSE_ATTN`；启动 D 时需保留下面显式指定的 `ATTENTION_BACKEND`。
 
 使用中间 padding mask 时，在原有提交命令中增加
 `PROMPT_STREAM_MASKED_PADDING=1`。例如仅测 P 首 token：
 
 ```shell
 PROMPT_STREAM_MASKED_PADDING=1 \
-ATTENTION_BACKEND=TRITON_ATTN \
+ATTENTION_BACKEND=CHUNK_SPARSE_ATTN \
 ENABLE_KV_TRANSFER=0 \
 MODEL_PATH="${HOME}/Models/Qwen2.5-3B" \
 SERVED_MODEL_NAME=qwen2.5-3b \
-GPU_MEMORY_UTILIZATION=0.6 \
+GPU_MEMORY_UTILIZATION=0.8 \
 MAX_MODEL_LEN=4096 \
 MAX_NUM_SEQS=64 \
 sbatch --nodelist=g2c9 research/scripts/server/start_p_node.sbatch
@@ -251,6 +261,8 @@ sbatch --nodelist=<GPU_NODE> research/scripts/server/start_p_node.sbatch
 排除节点：
 
 ```shell
+ATTENTION_BACKEND=TRITON_ATTN \
+PROMPT_STREAM_MASKED_PADDING=1 \
 sbatch --exclude=<GPU_NODE> research/scripts/server/start_d_node.sbatch
 ```
 
@@ -272,9 +284,11 @@ mkdir -p research/scripts/logs
 
 ```shell
 VLLM_NIXL_SIDE_CHANNEL_HOST=g2c9 \
+ATTENTION_BACKEND=CHUNK_SPARSE_ATTN \
+PROMPT_STREAM_MASKED_PADDING=1 \
 MODEL_PATH=/workplace/home/huangxinying/Models/Qwen2.5-3B/ \
 SERVED_MODEL_NAME=qwen2.5-3b \
-GPU_MEMORY_UTILIZATION=0.6 \
+GPU_MEMORY_UTILIZATION=0.8 \
 MAX_MODEL_LEN=4096 \
 MAX_NUM_SEQS=64 \
 sbatch --nodelist=g2c9 research/scripts/server/start_p_node.sbatch
@@ -282,10 +296,12 @@ sbatch --nodelist=g2c9 research/scripts/server/start_p_node.sbatch
 
 ```shell
 VLLM_NIXL_SIDE_CHANNEL_HOST=g2c9 \
+ATTENTION_BACKEND=CHUNK_SPARSE_ATTN \
+PROMPT_STREAM_MASKED_PADDING=1 \
 PROMPT_STREAM_UPDATE_COALESCING_CONFIG='{"update_policy":"fixed_window","soft_window_ms":20,"hard_deadline_ms":80}' \
 MODEL_PATH=/workplace/home/huangxinying/Models/Qwen2.5-3B/ \
 SERVED_MODEL_NAME=qwen2.5-3b \
-GPU_MEMORY_UTILIZATION=0.6 \
+GPU_MEMORY_UTILIZATION=0.8 \
 MAX_MODEL_LEN=4096 \
 MAX_NUM_SEQS=64 \
 sbatch --nodelist=g2c9 research/scripts/server/start_p_node.sbatch
@@ -293,9 +309,11 @@ sbatch --nodelist=g2c9 research/scripts/server/start_p_node.sbatch
 
 ```shell
 VLLM_NIXL_SIDE_CHANNEL_HOST=g2c14 \
+ATTENTION_BACKEND=TRITON_ATTN \
+PROMPT_STREAM_MASKED_PADDING=1 \
 MODEL_PATH=/workplace/home/huangxinying/Models/Qwen2.5-3B/ \
 SERVED_MODEL_NAME=qwen2.5-3b \
-GPU_MEMORY_UTILIZATION=0.6 \
+GPU_MEMORY_UTILIZATION=0.8 \
 MAX_MODEL_LEN=4096 \
 MAX_NUM_SEQS=64 \
 sbatch --nodelist=g2c14 research/scripts/server/start_d_node.sbatch

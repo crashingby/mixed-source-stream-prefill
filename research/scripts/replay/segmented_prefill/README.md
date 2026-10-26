@@ -350,12 +350,12 @@ RUN_PREFIX=ttft \
 sbatch research/scripts/replay/segmented_prefill/run_ttft_qps_sweep.sbatch
 ```
 
-### 使用 Triton backend 重跑
+### 使用自定义后端重跑
 
-attention backend 由 P/D server 启动时全局决定；replay client 不能按请求切换。两个启动脚本现已接受可选的 `ATTENTION_BACKEND` 环境变量。保留既有 FA 结果目录，并使用独立的 `RUN_PREFIX=triton-ttft`：
+attention backend 由各 P/D server 在启动时分别决定；replay client 不能按请求切换。两个启动脚本现已接受可选的 `ATTENTION_BACKEND` 环境变量。保留既有 FA 结果目录，并使用独立的 `RUN_PREFIX=chunk-ttft`：
 
 ```shell
-ATTENTION_BACKEND=TRITON_ATTN \
+ATTENTION_BACKEND=CHUNK_SPARSE_ATTN \
 MODEL_PATH=<MODEL_PATH> \
 SERVED_MODEL_NAME=<SERVED_MODEL_NAME> \
 GPU_MEMORY_UTILIZATION=<GPU_UTIL> \
@@ -364,7 +364,7 @@ MAX_NUM_SEQS=64 \
 sbatch --nodelist=<P_HOST> research/scripts/server/start_p_node.sbatch
 ```
 
-若之后测量完整 P/D transfer 与 decode，D 节点也以同样的 `ATTENTION_BACKEND=TRITON_ATTN` 重启。当前 sweep 全部使用 `--ttft-only`，首 token 只由 P 节点生成，D 不会实际进行 KV load；但三种模式都必须通过同一个 Triton P 节点运行。
+若之后测量完整 P/D transfer 与 decode，D 节点显式使用 `ATTENTION_BACKEND=TRITON_ATTN`，通过 `unified_attention` 完整读取历史 KV，不做块稀疏。启用中间 padding mask 时，P/D 均设置 `PROMPT_STREAM_MASKED_PADDING=1`；完整启动命令见 [服务端 README](../../server/README.md)。当前 sweep 全部使用 `--ttft-only`，首 token 只由 P 节点生成，D 不会实际进行 KV load；但三种模式都必须通过同一个 `CHUNK_SPARSE_ATTN` P 节点运行。
 
 ```shell
 DATA_DIR=research/data/mix_source \
@@ -385,11 +385,11 @@ SOURCE_FINISH_DELAY=0.0 \
 MAX_TOKENS=64 \
 TEMPERATURE=0 \
 SSE_TIMEOUT=120 \
-RUN_PREFIX=triton-ttft \
+RUN_PREFIX=chunk-ttft \
 sbatch research/scripts/replay/segmented_prefill/run_ttft_qps_sweep.sbatch
 ```
 
-该命令依次写入 `triton-ttft-stream-*`、`triton-ttft-merged-update-*` 和 `triton-ttft-normal-*`。它们应与旧的 `ttft-*` FA/auto 结果分开画图和汇总。
+该命令依次写入 `chunk-ttft-stream-*`、`chunk-ttft-merged-update-*` 和 `chunk-ttft-normal-*`。它们应与旧的 `ttft-*` FA/auto 和 `triton-ttft-*` unified 结果分开画图和汇总。
 
 输出目录名形如：
 

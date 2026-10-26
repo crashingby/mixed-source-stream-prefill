@@ -34,6 +34,7 @@ from vllm.v1.attention.backends.utils import (
     compute_mm_prefix_range_tensor,
     get_kv_cache_layout,
 )
+from vllm.v1.attention.ops.query_probe_attention import QueryProbeAttention
 from vllm.v1.attention.ops.triton_prefill_attention import context_attention_fwd
 from vllm.v1.attention.ops.triton_reshape_and_cache_flash import (
     triton_reshape_and_cache_flash,
@@ -95,6 +96,7 @@ class TritonAttentionMetadata:
     mm_prefix_range_tensor: torch.Tensor | None = None
     # shape=[num_reqs, 2]，只屏蔽物理 KV 中的区间，不改变 block table。
     prompt_stream_padding_ranges: torch.Tensor | None = None
+    query_probe: QueryProbeAttention | None = None  # 当前批次的逐行读取策略。
 
 
 class TritonAttentionMetadataBuilder(AttentionMetadataBuilder[TritonAttentionMetadata]):

@@ -43,6 +43,7 @@ async def execute_workload(
     *,
     on_result: Callable[[ResultT], None] | None = None,
     fail_fast_error: Callable[[ResultT], str | None] | None = None,
+    closed_loop: bool = False,
 ) -> list[ResultT]:
     """共享请求时钟；串行和并发均先落盘，再判断实验失败。
 
@@ -52,6 +53,7 @@ async def execute_workload(
         execute_one: 接收索引、计划偏移毫秒和客户端准入延迟毫秒。
         on_result: 每请求完成后的同步持久化回调。
         fail_fast_error: 返回错误文本时取消其它在途请求。
+        closed_loop: QPS=0 时按并发上限补充请求；默认保留其他实验的串行语义。
     """
     qps = getattr(args, "qps", 0.0)
     offsets = planned_arrival_offsets(
@@ -76,9 +78,13 @@ async def execute_workload(
                 on_result(result)
             if fail_fast_error is not None and (error := fail_fast_error(result)):
                 raise ReplayHttpError(error)
+            # 闭环模式的空闲间隔属于当前客户端槽位，不阻塞其他在途请求。
+            delay = getattr(args, "inter_request_delay", 0.0)
+            if qps == 0 and closed_loop and delay > 0:
+                await asyncio.sleep(delay)
             return index, result
 
-    if qps == 0:
+    if qps == 0 and not closed_loop:
         results = []
         for index in range(count):
             _, result = await run_one(index)

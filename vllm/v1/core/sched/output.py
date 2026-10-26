@@ -5,6 +5,8 @@ from dataclasses import dataclass, field
 from functools import cached_property
 from typing import TYPE_CHECKING
 
+from vllm.v1.query_probe import QueryProbeWork
+
 if TYPE_CHECKING:
     import numpy as np
     import numpy.typing as npt
@@ -220,6 +222,9 @@ class SchedulerOutput:
     # list of mm_hash strings associated with the encoder outputs to be
     # freed from the encoder cache.
     free_encoder_mm_hashes: list[str]
+
+    # 联合执行的行策略与评分目标，包含更新和最终问题的读取范围。
+    query_probe_work: dict[str, QueryProbeWork] = field(default_factory=dict)
 
     # Request IDs that are preempted in this step.
     # Only used for v2 model runner.

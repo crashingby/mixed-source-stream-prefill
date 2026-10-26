@@ -179,7 +179,8 @@ class SchedulerConfig:
     prompt_stream_masked_padding: bool = False
     """屏蔽分段 Prompt Stream 的中间 padding，并修正真实 token 的 RoPE 位置。
 
-    需显式选择 TRITON_ATTN；P/D 两端必须启用相同语义。关闭时保留原有
+    需显式选择 TRITON_ATTN 或 CHUNK_SPARSE_ATTN；P/D 两端必须启用相同语义。
+    关闭时保留原有
     padding 近似，便于在相同调度及 block 布局下进行消融实验。
     """
 

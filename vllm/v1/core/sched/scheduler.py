@@ -858,11 +858,15 @@ class Scheduler(SchedulerInterface):
             return 0
         timestamp = time.monotonic() if now is None else now
         num_flushed = 0
-        for request, reason in controller.pop_due_requests(self.requests, timestamp):
+        for due_request, reason in controller.pop_due_requests(
+            self.requests, timestamp
+        ):
             num_flushed += int(
-                self._flush_prompt_stream_update(request, timestamp, reason)
+                self._flush_prompt_stream_update(due_request, timestamp, reason)
             )
-            self._reconcile_prompt_stream_request(request, evaluate_coalescing=False)
+            self._reconcile_prompt_stream_request(
+                due_request, evaluate_coalescing=False
+            )
 
         # 只遍历未放行候选；失败不会改变负载，同一压力快照可供其余候选复用。
         pressure_context: UpdateCoalescingContext | None = None
@@ -928,6 +932,10 @@ class Scheduler(SchedulerInterface):
         scheduler 仍然使用 vLLM 原有的 token catch-up 模型，但这里会把
         本轮 token 数裁剪到剩余 prompt token 范围内。
         """
+        if request.query_probe is not None and self._prompt_stream_inflight_steps.get(
+            request.request_id, 0
+        ):
+            return 0
         if request.is_prompt_stream_finished():
             return num_new_tokens
         num_remaining_prompt_tokens = max(
@@ -998,6 +1006,10 @@ class Scheduler(SchedulerInterface):
     def _prepare_prompt_stream_execution(self, request: Request) -> None:
         """在计算 token budget 前刷新流式请求的阶段执行视图。"""
         if not request.is_prompt_streaming():
+            return
+        if request.query_probe is not None and self._prompt_stream_inflight_steps.get(
+            request.request_id, 0
+        ):
             return
         request.prepare_prompt_stream_execution(self.block_size)
         if request.num_prompt_tokens + 1 > self.max_model_len:
@@ -1967,6 +1979,9 @@ class Scheduler(SchedulerInterface):
                 self._prompt_stream_inflight_steps[req_id] = (
                     self._prompt_stream_inflight_steps.get(req_id, 0) + 1
                 )
+            probe_work = request.build_query_probe_work(num_scheduled_token)
+            if probe_work is not None:
+                scheduler_output.query_probe_work[req_id] = probe_work
             request.advance_prompt_stream_computed_tokens(num_scheduled_token)
             if self.defer_block_free:
                 # Record the in-flight step, to fence deferred block freeing.
@@ -2429,6 +2444,19 @@ class Scheduler(SchedulerInterface):
                 # be set to None (in order to finish async KV transfer).
                 # In this case, we use is_finished() to check.
                 continue
+
+            probe_work = scheduler_output.query_probe_work.get(req_id)
+            if probe_work is not None and request.complete_query_probe_step(
+                probe_work, model_runner_output.query_probe_results.get(req_id)
+            ):
+                # 该请求一批在途；真实回包后私有页才可归还，正式 PA 保留。
+                probe_key = request.get_prompt_stream_segment_key(
+                    PromptStreamKVSegment.PROBE
+                )
+                probe_blocks = self.kv_cache_manager.get_block_ids(probe_key)
+                assert request.query_probe is not None
+                request.query_probe.released_probe_blocks += sum(map(len, probe_blocks))
+                self.kv_cache_manager.coordinator.free(probe_key)
 
             req_index = model_runner_output.req_id_to_index[req_id]
             generated_token_ids = (
@@ -3485,23 +3513,20 @@ class Scheduler(SchedulerInterface):
             view = request.prompt_stream_execution_view
             if view is None:
                 return 0
-            segment_key = request.get_prompt_stream_segment_key(
-                request.get_prompt_stream_write_segment()
+            targets = self.kv_cache_manager.get_prompt_stream_allocation_targets(
+                request, max(0, request.num_tokens - request.num_computed_tokens)
             )
-            segment_num_tokens = max(0, request.num_tokens - view.segment_offset)
-            segment_num_computed_tokens = (
-                request.get_prompt_stream_segment_num_computed_tokens()
-            )
-            return self.kv_cache_manager.coordinator.get_num_blocks_to_allocate(
-                request_id=segment_key,
-                num_tokens=segment_num_tokens,
-                new_computed_blocks=(
-                    self.kv_cache_manager.empty_kv_cache_blocks.blocks
-                ),
-                num_encoder_tokens=0,
-                total_computed_tokens=segment_num_computed_tokens,
-                num_tokens_main_model=segment_num_tokens,
-                apply_admission_cap=True,
+            return sum(
+                self.kv_cache_manager.coordinator.get_num_blocks_to_allocate(
+                    request_id=key,
+                    num_tokens=end,
+                    new_computed_blocks=self.kv_cache_manager.empty_kv_cache_blocks.blocks,
+                    num_encoder_tokens=0,
+                    total_computed_tokens=start,
+                    num_tokens_main_model=end,
+                    apply_admission_cap=True,
+                )
+                for key, start, end in targets
             )
 
         full_num_tokens = min(request.num_tokens, self.max_model_len)

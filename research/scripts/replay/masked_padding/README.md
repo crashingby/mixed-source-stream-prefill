@@ -83,8 +83,8 @@ $$
 两组实验必须满足以下条件：
 
 - **P 和 D 同时切换开关**。不允许 P 开启、D 关闭，或反过来。
-- **两组都使用 `TRITON_ATTN`**。关闭组不能退回自动选择的 FlashAttention，
-  否则测到的是后端差异。
+- **两组均固定 P 为 `CHUNK_SPARSE_ATTN`、D 为 `TRITON_ATTN`**。D 使用
+  `unified_attention` 完整读取 KV；关闭组也保持这一逐角色配置，避免测到后端差异。
 - **两组都使用 `GENERATION_CONFIG=vllm`**。这会统一 Qwen 的 sampling 默认值，
   避免模型目录中的 `repetition_penalty=1.05` 只让开启组失败。
 - **关闭 Update coalescing**。本实验只隔离 padding mask，不混入另一项优化。
@@ -109,10 +109,10 @@ $$
 ```shell
 MODEL_PATH=<MODEL_PATH> \
 SERVED_MODEL_NAME=<SERVED_MODEL_NAME> \
-GPU_MEMORY_UTILIZATION=0.6 \
+GPU_MEMORY_UTILIZATION=0.8 \
 MAX_MODEL_LEN=4096 \
 MAX_NUM_SEQS=64 \
-ATTENTION_BACKEND=TRITON_ATTN \
+ATTENTION_BACKEND=CHUNK_SPARSE_ATTN \
 GENERATION_CONFIG=vllm \
 PROMPT_STREAM_MASKED_PADDING=0 \
 PROMPT_STREAM_UPDATE_COALESCING_CONFIG='' \
@@ -124,7 +124,7 @@ sbatch --nodelist=<P_NODE> research/scripts/server/start_p_node.sbatch
 ```shell
 MODEL_PATH=<MODEL_PATH> \
 SERVED_MODEL_NAME=<SERVED_MODEL_NAME> \
-GPU_MEMORY_UTILIZATION=0.6 \
+GPU_MEMORY_UTILIZATION=0.8 \
 MAX_MODEL_LEN=4096 \
 MAX_NUM_SEQS=64 \
 ATTENTION_BACKEND=TRITON_ATTN \

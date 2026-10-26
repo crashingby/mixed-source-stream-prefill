@@ -54,7 +54,7 @@ header。`--input-transport token_ids` 用于历史预分词实验复现。
 | Proxy | `g2c14` | HTTP `8000`，连接 `g2c9:8100/8200`。 |
 | Replay | `g2c14` | 访问 `http://g2c14:8000`；不申请 GPU。 |
 
-P/D 使用 Qwen2.5-3B、TP=1、PP=1、DP=1、`TRITON_ATTN`、`--prompt-stream-masked-padding`、`--generation-config vllm` 和同步调度。本轮命令将显存比例显式设为 `0.90`；启动脚本未传参的默认值仍为 `0.85`。实际设备已被其它进程占用时会在启动前检查失败，不会自行换到未分配的 GPU。
+历史实验的 P/D 使用 Qwen2.5-3B、TP=1、PP=1、DP=1、`TRITON_ATTN`、`--prompt-stream-masked-padding`、`--generation-config vllm` 和同步调度。当前启动命令和脚本的默认显存比例统一为 `0.8`。实际设备已被其它进程占用时会在启动前检查失败，不会自行换到未分配的 GPU。下方复现命令显式选择 P 为 `CHUNK_SPARSE_ATTN`、D 为 `TRITON_ATTN`；D 通过 `unified_attention` 完整读取 KV，只屏蔽 padding。旧结果不能当作当前配置的测量结果。
 
 两组都使用下列 connector 配置，只按角色改变 `kv_role`：
 
@@ -83,16 +83,31 @@ D 的角色是 `kv_consumer`。`stable_kv_push=true` 打开接收、增量传输
 ```shell
 mkdir -p research/scripts/logs
 
-SERVER_NODE=g2c9 \
+REPO_ROOT="${PWD}" \
 MODEL_PATH="${HOME}/Models/Qwen2.5-3B" \
 SERVED_MODEL_NAME=qwen2.5-3b \
-GPU_MEMORY_UTILIZATION=0.90 \
+GPU_MEMORY_UTILIZATION=0.8 \
 MAX_MODEL_LEN=4096 \
 MAX_NUM_SEQS=64 \
 PROMPT_STREAM_MASKED_PADDING=1 \
-ATTENTION_BACKEND=TRITON_ATTN \
-bash research/scripts/server/start_stable_kv_pair.sh
+srun --job-name=stable-kv-pd --partition=gpu --nodelist=g2c9 \
+  --nodes=1 --ntasks=2 --ntasks-per-node=2 \
+  --gpus-per-task=1 --gpu-bind=single:1 \
+  --cpus-per-task=8 --mem=24G --time=04:00:00 --kill-on-bad-exit=1 \
+  --output="${PWD}/research/scripts/logs/stable-kv-pd-%j-rank-%t.out" \
+  --error="${PWD}/research/scripts/logs/stable-kv-pd-%j-rank-%t.out" \
+  bash -c '
+    case "$SLURM_PROCID" in
+      0) export ATTENTION_BACKEND=CHUNK_SPARSE_ATTN ;;
+      1) export ATTENTION_BACKEND=TRITON_ATTN ;;
+    esac
+    exec bash "$REPO_ROOT/research/scripts/server/start_stable_kv_node.sh"
+  '
 ```
+
+现有 `start_stable_kv_pair.sh` 会把一个 `ATTENTION_BACKEND` 值传给两端；这里
+使用相同的单 allocation 资源布局，在每个 task 内按 rank 指定后端，再调用
+同一个节点脚本。模型、KV 布局和 padding 配置在两端保持一致。
 
 这个命令会保持前台运行。只启动这一对服务，已有同端口实验实例时先结束它们。
 Slurm 负责 GPU 隔离，不需要也不应该手动覆盖 `CUDA_VISIBLE_DEVICES`。
@@ -130,7 +145,7 @@ curl --fail http://g2c9:8200/health
 | `SERVER_TIME` | `04:00:00` | P/D allocation 时间上限。 |
 | `MODEL_PATH` | `${HOME}/Models/Qwen2.5-3B` | P/D 的模型和 tokenizer 本地目录。 |
 | `SERVED_MODEL_NAME` | `qwen2.5-3b` | 客户端提交的模型名。 |
-| `GPU_MEMORY_UTILIZATION` | `0.85` | 每张卡上 vLLM 的显存比例。 |
+| `GPU_MEMORY_UTILIZATION` | `0.8` | 每张卡上 vLLM 的显存比例。 |
 | `MAX_MODEL_LEN` | `4096` | 模板、知识、Question、物理 padding 和生成的序列长度约束。 |
 | `MAX_NUM_SEQS` | `64` | 模型调度的并发序列上限，不是接收会话占用的块数上限。 |
 | `P_PORT` / `D_PORT` | `8100` / `8200` | 两端 OpenAI HTTP 端口。 |

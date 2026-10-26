@@ -525,7 +525,9 @@ class VllmConfig:
             return use_v2_model_runner
 
         # 首版坐标分流在 GPUModelRunner 中实现，自动选择时使用此路径。
-        if self.scheduler_config.prompt_stream_masked_padding:
+        backend = self.attention_config.backend
+        chunk_sparse = backend is not None and backend.name == "CHUNK_SPARSE_ATTN"
+        if self.scheduler_config.prompt_stream_masked_padding or chunk_sparse:
             return False
 
         if self.model_config is not None and self.model_config.is_diffusion:
@@ -860,6 +862,7 @@ class VllmConfig:
 
     def __post_init__(self):
         """Verify configs are valid & consistent with each other."""
+        from vllm.platforms import current_platform
 
         # To give each torch profile run a unique instance name.
         self.instance_id = f"{time.time_ns()}"
@@ -869,14 +872,31 @@ class VllmConfig:
 
         self.try_verify_and_update_config()
 
-        if self.scheduler_config.prompt_stream_masked_padding:
+        backend = self.attention_config.backend
+        chunk_sparse = backend is not None and backend.name == "CHUNK_SPARSE_ATTN"
+        if chunk_sparse and (
+            not current_platform.is_cuda()
+            or self.model_config is None
+            or not self.model_config.enforce_eager
+            or self.parallel_config.tensor_parallel_size != 1
+            or self.cache_config.cache_dtype != "auto"
+            or self.cache_config.block_size not in (None, 16)
+        ):
+            raise ValueError(
+                "CHUNK_SPARSE_ATTN requires CUDA, --enforce-eager, TP=1, "
+                "block_size=16 and auto KV dtype."
+            )
+
+        if self.scheduler_config.prompt_stream_masked_padding or chunk_sparse:
             # 当前协议仍以一个连续物理进度推进，只开放已经实现坐标分流的
             # 同步、一维 RoPE、full-attention Triton 路径；TP 可正常使用。
-            backend = self.attention_config.backend
-            if backend is None or backend.name != "TRITON_ATTN":
+            if backend is None or backend.name not in (
+                "TRITON_ATTN",
+                "CHUNK_SPARSE_ATTN",
+            ):
                 raise ValueError(
                     "--prompt-stream-masked-padding requires "
-                    "--attention-backend TRITON_ATTN."
+                    "--attention-backend TRITON_ATTN or CHUNK_SPARSE_ATTN."
                 )
             if (
                 self.attention_config.use_non_causal
@@ -938,17 +958,14 @@ class VllmConfig:
                 )
 
         if (
-            self.scheduler_config.prompt_stream_update_coalescing_config
-            is not None
+            self.scheduler_config.prompt_stream_update_coalescing_config is not None
             and self.parallel_config.data_parallel_size > 1
         ):
             raise ValueError(
-                "Prompt stream Update coalescing does not support data "
-                "parallelism."
+                "Prompt stream Update coalescing does not support data parallelism."
             )
         if (
-            self.scheduler_config.prompt_stream_update_coalescing_config
-            is not None
+            self.scheduler_config.prompt_stream_update_coalescing_config is not None
             and self.kv_transfer_config is not None
             and (
                 self.kv_transfer_config.kv_connector
@@ -957,7 +974,8 @@ class VllmConfig:
                     self.kv_transfer_config.kv_connector == "NixlPushConnector"
                     and self.kv_transfer_config.kv_connector_extra_config.get(
                         "stable_kv_push"
-                    ) is True
+                    )
+                    is True
                 )
                 or not self.kv_transfer_config.is_kv_producer
             )

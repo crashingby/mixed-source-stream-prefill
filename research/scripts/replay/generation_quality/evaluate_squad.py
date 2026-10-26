@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-"""使用 SQuAD v2 官方 EM/F1 口径评估两种 generation quality 结果。"""
+"""兼容旧 SQuAD 工具接口；命令行统一转交数据集感知的三模式评分器。"""
 
 from __future__ import annotations
 
@@ -412,36 +412,12 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> None:
-    """加载两个模式的结果，计算官方指标并写出配对统计。"""
-    args = parse_args()
-    normal_records = _load_generation_records(args.normal_results)
-    segmented_records = _load_generation_records(args.segmented_results)
-    _validate_mode(normal_records, "normal")
-    _validate_mode(segmented_records, "segmented")
-
-    rows, paired_summary = _paired_rows_and_summary(
-        normal_records,
-        segmented_records,
+    """保留旧命令，采用当前完整选中分母和三模式配对报告。"""
+    from research.scripts.replay.generation_quality.evaluate_answers import (
+        main as evaluate_answers_main,
     )
-    summary = {
-        "schema_version": EVALUATION_SCHEMA_VERSION,
-        "metric_definition": {
-            "normalization": (
-                "Dataset-specific official normalization selected by "
-                "evaluation_protocol."
-            ),
-            "multiple_gold_answers": "Maximum EM and F1 over official answers.",
-            "score_scale": "Mode-level exact_match and f1 use 0--100.",
-        },
-        "normal": _mode_summary(normal_records),
-        "segmented": _mode_summary(segmented_records),
-        "paired": paired_summary,
-    }
-    _write_csv(args.output_dir / "per_request_scores.csv", rows)
-    _write_json(args.output_dir / "evaluation_summary.json", summary)
 
-    print(json.dumps(summary, ensure_ascii=False, indent=2, sort_keys=True))
-    print(f"Evaluation written to {args.output_dir}")
+    evaluate_answers_main()
 
 
 if __name__ == "__main__":

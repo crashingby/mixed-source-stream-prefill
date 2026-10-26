@@ -44,6 +44,9 @@ class PromptStreamStartRequest(OpenAIBaseModel):
     request_id: str | None = None
     stream: bool = True
     sampling_params: dict[str, Any] = Field(default_factory=dict)
+    # 提前注册与 finish 一致的问题后缀，不进入正式 prompt。
+    probe_query: str | None = None
+    probe_keep_ratio: float | None = Field(default=None, ge=0.0, le=1.0)
 
     def get_sampling_params_dict(self) -> dict[str, Any]:
         """合并顶层扩展字段和 `sampling_params` 字段。"""

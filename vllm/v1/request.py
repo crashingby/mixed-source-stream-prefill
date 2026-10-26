@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import enum
+import hashlib
 import json
 import time
 from collections import deque
@@ -33,6 +34,12 @@ from vllm.v1.engine.prompt_stream import (
     parse_prompt_stream_padding_range,
 )
 from vllm.v1.metrics.stats import PrefillStats
+from vllm.v1.query_probe import (
+    AppendBlockPolicy,
+    QueryProbeResult,
+    QueryProbeState,
+    QueryProbeWork,
+)
 from vllm.v1.structured_output.request import StructuredOutputRequest
 from vllm.v1.utils import ConstantList
 
@@ -56,6 +63,7 @@ class PromptStreamKVSegment(enum.Enum):
 
     PREFIX_APPEND = "prefix_append"
     UPDATE = "update"
+    PROBE = "probe"  # 临时 Query 的私有物理段。
 
 
 class PromptStreamExecutionPhase(enum.Enum):
@@ -191,12 +199,14 @@ class PromptStreamWorkItem:
     Question 也作为显式 work 排在最终 Update work 后面。
     """
 
+    # 非空 Append 可附带临时 Query；进度使用联合物理序列坐标。
     # 本 work item 要写入的物理 KV 域。
     phase: PromptStreamExecutionPhase
     # Append/Question work 完成时 PREFIX_APPEND 应达到的逻辑长度（含模板）。
     prefix_append_logical_len: int = 0
     # Append work 完成时应提交的 Append epoch。
     target_append_epoch: int = 0
+    probe_attempt_id: int | None = None  # None 表示 bootstrap 或已评分的恢复。
     # Update work 在 flush 时冻结的完整目标快照。
     update_token_ids: tuple[int, ...] | None = None
     # Update work 在 flush 时冻结的逻辑执行基准。
@@ -218,9 +228,7 @@ class PromptStreamWorkItem:
     # work 真正成为 active 时分配的物理执行 attempt ID。
     execution_attempt_id: int | None = None
     # 区分 policy work 与抢占后重建物理 KV 的 recovery work。
-    execution_origin: PromptStreamExecutionOrigin = (
-        PromptStreamExecutionOrigin.POLICY
-    )
+    execution_origin: PromptStreamExecutionOrigin = PromptStreamExecutionOrigin.POLICY
 
 
 @dataclass(frozen=True)
@@ -248,6 +256,7 @@ class PromptStreamExecutionView:
     segment_offset: int
     # 当前 work 冻结的物理 padding 区间；Append 增长后不能沿用旧视图。
     padding_range: tuple[int, int] = (0, 0)
+    probe_start: int = -1  # 非负值表示 PA 与私有 PROBE 的写入分界。
 
 
 @dataclass
@@ -385,18 +394,14 @@ class PromptStreamTokenStats:
         return {
             "metrics_schema_version": self.metrics_schema_version,
             "coalescing_enabled": self.coalescing_enabled,
-            "update_coalescing_config_json": (
-                self.update_coalescing_config_json
-            ),
+            "update_coalescing_config_json": (self.update_coalescing_config_json),
             "update_events_accepted": self.update_events_accepted,
             "update_policy_works_admitted": self.update_policy_works_admitted,
             "update_policy_works_completed": self.update_policy_works_completed,
             "update_policy_works_cancelled_by_recovery": (
                 self.update_policy_works_cancelled_by_recovery
             ),
-            "update_policy_works_outstanding": (
-                self.update_policy_works_outstanding
-            ),
+            "update_policy_works_outstanding": (self.update_policy_works_outstanding),
             "update_works_admitted": self.update_works_admitted,
             "update_works_completed": self.update_works_completed,
             "eager_update_prefill_tokens": self.eager_update_prefill_tokens,
@@ -409,12 +414,8 @@ class PromptStreamTokenStats:
             "policy_extra_update_prefill_tokens": (
                 self.policy_extra_update_prefill_tokens
             ),
-            "admitted_update_prefill_tokens": (
-                self.admitted_update_prefill_tokens
-            ),
-            "scheduled_update_prefill_tokens": (
-                self.scheduled_update_prefill_tokens
-            ),
+            "admitted_update_prefill_tokens": (self.admitted_update_prefill_tokens),
+            "scheduled_update_prefill_tokens": (self.scheduled_update_prefill_tokens),
             "saved_update_prefill_tokens": self.saved_update_prefill_tokens,
             "extra_update_prefill_tokens": self.extra_update_prefill_tokens,
             "update_tokens_invalidated": self.update_tokens_invalidated,
@@ -499,9 +500,7 @@ class PromptStreamState:
     # Scheduler 实际推进的 Update token 累计，preemption 重放会重复增加。
     total_scheduled_update_prefill_tokens: int
     # 稳定 admission ledger；终态只由完成或显式 recovery 取消推进。
-    update_admissions: dict[int, UpdateAdmissionRecord] = field(
-        default_factory=dict
-    )
+    update_admissions: dict[int, UpdateAdmissionRecord] = field(default_factory=dict)
     next_update_admission_id: int = 1
     # 物理 attempt 与 recovery token 统计独立于 policy admission。
     next_update_execution_attempt_id: int = 1
@@ -609,6 +608,8 @@ class Request:
         reasoning_parser_kwargs: dict[str, Any] | None = None,
         abort_immediately: bool = False,
         prompt_stream_event: PromptStreamEvent | None = None,
+        probe_token_ids: list[int] | None = None,
+        probe_keep_ratio: float = 0.5,
     ) -> None:
         self.request_id = request_id
         self.client_index = client_index
@@ -733,6 +734,11 @@ class Request:
         # 流式 prefill 的入站事件。对于普通请求为 None。
         # 对于 duplicate request id 的流式事件，这个字段用于传给 scheduler。
         self.prompt_stream_event = prompt_stream_event
+        self.query_probe = (
+            QueryProbeState(list(probe_token_ids), probe_keep_ratio)
+            if probe_token_ids is not None
+            else None
+        )
 
         # 流式 prefill 的长期状态。只有 scheduler 中的长期 Request 才应初始化。
         self.prompt_stream: PromptStreamState | None = None
@@ -774,6 +780,8 @@ class Request:
             reasoning_parser_kwargs=request.reasoning_parser_kwargs,
             abort_immediately=request.abort_immediately,
             prompt_stream_event=request.prompt_stream_event,
+            probe_token_ids=request.probe_token_ids,
+            probe_keep_ratio=request.probe_keep_ratio,
         )
 
     def append_output_token_ids(
@@ -964,9 +972,7 @@ class Request:
         )
         self.prompt_stream.next_update_execution_attempt_id += 1
         self.prompt_stream.update_execution_attempts_started += 1
-        self._mark_prompt_stream_update_admission_active(
-            work_item.update_admission_id
-        )
+        self._mark_prompt_stream_update_admission_active(work_item.update_admission_id)
 
     def _complete_prompt_stream_update_work(
         self,
@@ -976,9 +982,7 @@ class Request:
         self._start_prompt_stream_update_execution_attempt(work_item)
         assert self.prompt_stream is not None
         self.prompt_stream.update_execution_attempts_completed += 1
-        self._complete_prompt_stream_update_admission(
-            work_item.update_admission_id
-        )
+        self._complete_prompt_stream_update_admission(work_item.update_admission_id)
 
     def record_prompt_stream_allocation_failure(
         self,
@@ -998,7 +1002,7 @@ class Request:
 
     def build_prompt_stream_stats(
         self,
-    ) -> dict[str, bool | int | str | None] | None:
+    ) -> dict[str, Any] | None:
         """构造当前 Prompt Stream 请求的独立可序列化统计快照。
 
         该接口只读取请求生命周期累计值，不会清空或转移所有权，因此
@@ -1029,9 +1033,7 @@ class Request:
             )
         has_update_events = prompt_stream.update_events_accepted > 0
         if coalescing_enabled and has_update_events:
-            eager_tokens: int | None = (
-                prompt_stream.total_eager_update_prefill_tokens
-            )
+            eager_tokens: int | None = prompt_stream.total_eager_update_prefill_tokens
             net_tokens_avoided = (
                 prompt_stream.total_eager_update_prefill_tokens
                 - prompt_stream.total_admitted_update_prefill_tokens
@@ -1091,9 +1093,7 @@ class Request:
             update_execution_attempts_preempted=(
                 prompt_stream.update_execution_attempts_preempted
             ),
-            update_recovery_works_created=(
-                prompt_stream.update_recovery_works_created
-            ),
+            update_recovery_works_created=(prompt_stream.update_recovery_works_created),
             update_tokens_scheduled_total=(
                 prompt_stream.total_scheduled_update_prefill_tokens
             ),
@@ -1131,7 +1131,10 @@ class Request:
                 prompt_stream.prompt_stream_allocation_failures_waiting
             ),
         )
-        return stats.to_dict()
+        result: dict[str, Any] = stats.to_dict()
+        if self.query_probe is not None:
+            result["query_probe"] = self.query_probe.stats()
+        return result
 
     def enable_prompt_stream_update_coalescing(
         self,
@@ -1206,9 +1209,7 @@ class Request:
         prompt_stream.update_coalescing = UpdateCoalescingState(
             config=config,
             request_start_time=start_time,
-            last_admitted_token_ids=tuple(
-                prompt_stream.update_committed_token_ids
-            ),
+            last_admitted_token_ids=tuple(prompt_stream.update_committed_token_ids),
             last_admitted_append_epoch=source_state.update_committed_append_epoch,
             stats_last_admitted_token_ids=tuple(
                 prompt_stream.update_committed_token_ids
@@ -1352,7 +1353,8 @@ class Request:
         if stream is None:
             return max(
                 0,
-                self.num_tokens_with_spec + self.num_output_placeholders
+                self.num_tokens_with_spec
+                + self.num_output_placeholders
                 - self.num_computed_tokens,
             )
         work = stream.active_work_item
@@ -1368,24 +1370,26 @@ class Request:
             if stream.question_work_completed:
                 return max(
                     0,
-                    self.num_tokens_with_spec + self.num_output_placeholders
+                    self.num_tokens_with_spec
+                    + self.num_output_placeholders
                     - self.num_computed_tokens,
                 )
             return 0
         if work.phase == PromptStreamExecutionPhase.PREFIX_APPEND:
             target = (
                 (work.prefix_append_logical_len + block_size - 1)
-                // block_size * block_size
+                // block_size
+                * block_size
             )
             computed = (
-                work.num_computed_tokens if is_active
+                work.num_computed_tokens
+                if is_active
                 else stream.prefix_append_committed_logical_len
             )
         elif work.phase == PromptStreamExecutionPhase.UPDATE:
             target = len(work.update_token_ids or ())
             computed = (
-                work.num_computed_tokens if is_active
-                else work.update_common_prefix_len
+                work.num_computed_tokens if is_active else work.update_common_prefix_len
             )
         else:
             target = len(work.question_token_ids or ())
@@ -1454,8 +1458,7 @@ class Request:
         base = state.last_admitted_token_ids
         required_append_epoch = source_state.append_epoch
         same_append_context = (
-            not base
-            or state.last_admitted_append_epoch == required_append_epoch
+            not base or state.last_admitted_append_epoch == required_append_epoch
         )
         common_prefix_len = (
             self._get_common_prefix_len(list(base), list(target))
@@ -1475,13 +1478,9 @@ class Request:
             if same_stats_append_context
             else 0
         )
-        is_new_logical_admission = (
-            target != stats_base
-            or (
-                bool(target)
-                and state.stats_last_admitted_append_epoch
-                != required_append_epoch
-            )
+        is_new_logical_admission = target != stats_base or (
+            bool(target)
+            and state.stats_last_admitted_append_epoch != required_append_epoch
         )
         admission_id: int | None = None
         if is_new_logical_admission:
@@ -1497,9 +1496,7 @@ class Request:
         self.prompt_stream.pending_work_items.append(
             PromptStreamWorkItem(
                 phase=PromptStreamExecutionPhase.UPDATE,
-                prefix_append_logical_len=(
-                    self.get_prompt_stream_prefix_append_len()
-                ),
+                prefix_append_logical_len=(self.get_prompt_stream_prefix_append_len()),
                 update_token_ids=target,
                 execution_base_token_ids=base,
                 # 空基准不复用任何 UPDATE KV，因此不绑定 Append epoch。
@@ -1562,14 +1559,10 @@ class Request:
         prompt_stream.pending_work_items.append(
             PromptStreamWorkItem(
                 phase=PromptStreamExecutionPhase.QUESTION,
-                prefix_append_logical_len=(
-                    self.get_prompt_stream_prefix_append_len()
-                ),
+                prefix_append_logical_len=(self.get_prompt_stream_prefix_append_len()),
                 required_append_epoch=required_append_epoch,
                 update_token_ids=tuple(
-                    self._get_prompt_stream_segment_token_ids(
-                        PromptSourceType.UPDATE
-                    )
+                    self._get_prompt_stream_segment_token_ids(PromptSourceType.UPDATE)
                 ),
                 question_token_ids=tuple(prompt_stream.suffix_token_ids),
             )
@@ -1650,9 +1643,7 @@ class Request:
             in (UpdateAdmissionStatus.PENDING, UpdateAdmissionStatus.ACTIVE)
             for record in self.prompt_stream.update_admissions.values()
         )
-        latest_update_token_ids = (
-            self._get_latest_prompt_stream_update_snapshot()
-        )
+        latest_update_token_ids = self._get_latest_prompt_stream_update_snapshot()
         latest_update_materialized = (
             latest_update_token_ids is None
             or tuple(self.prompt_stream.update_committed_token_ids)
@@ -1904,13 +1895,16 @@ class Request:
                         f"update source, but request_id={self.request_id} "
                         f"already has source_id={existing_source_id}."
                     )
-        elif source_state is not None and event.source_id != "__prompt_stream_start__":
-            if source_state.append_source_id is not None:
-                raise ValueError(
-                    "Prompt stream Update coalescing supports exactly one "
-                    f"Append source, but request_id={self.request_id} already "
-                    f"has source_id={source_state.append_source_id}."
-                )
+        elif (
+            source_state is not None
+            and event.source_id != "__prompt_stream_start__"
+            and source_state.append_source_id is not None
+        ):
+            raise ValueError(
+                "Prompt stream Update coalescing supports exactly one "
+                f"Append source, but request_id={self.request_id} already "
+                f"has source_id={source_state.append_source_id}."
+            )
 
         source = PromptSourceState(
             source_id=event.source_id,
@@ -1998,6 +1992,21 @@ class Request:
         # Append 的 KV 语义是请求级尾部追加。source.token_ids 负责来源级
         # 去重和完成状态，物理顺序则必须使用全局事件提交顺序，不能按
         # source 分组重排交错到达的 chunks。
+        if event.token_ids and self.query_probe is not None:
+            start = self.get_prompt_stream_prefix_append_len()
+            self.query_probe.chunks.append(
+                AppendBlockPolicy(
+                    start=start,
+                    end=start + len(event.token_ids),
+                    source_id=event.source_id,
+                    chunk_id=event.chunk_id,
+                    sequence_no=event.sequence_no,
+                    epoch=len(self.query_probe.chunks) + 1,
+                    token_digest=hashlib.sha256(
+                        json.dumps(event.token_ids).encode()
+                    ).hexdigest(),
+                )
+            )
         source.token_ids.extend(event.token_ids or [])
         prompt_stream.append_token_ids.extend(event.token_ids or [])
         source_state = prompt_stream.coalescing_sources
@@ -2249,6 +2258,11 @@ class Request:
         self._validate_prompt_stream_can_mutate(event)
         prompt_stream = self._ensure_prompt_stream_state()
         new_suffix_token_ids = list(event.token_ids or [])
+        if (
+            self.query_probe is not None
+            and new_suffix_token_ids != self.query_probe.token_ids
+        ):
+            raise ValueError("finish question must match the registered probe_query.")
         if not new_suffix_token_ids:
             raise ValueError(
                 "PROMPT_FINISHED must carry a non-empty final question for "
@@ -2288,10 +2302,7 @@ class Request:
                     # 请求级 finish 同时声明该可选来源不会再出现。
                     self.on_prompt_stream_source_finished(source_type)
                     continue
-                if (
-                    source.source_type != source_type
-                    or source.pending_events
-                ):
+                if source.source_type != source_type or source.pending_events:
                     raise ValueError(
                         "PROMPT_FINISHED requires every present source to be "
                         "type-consistent with no pending events: "
@@ -2585,6 +2596,14 @@ class Request:
                 work_item.num_computed_tokens = (
                     prompt_stream.prefix_append_committed_logical_len
                 )
+                if self.query_probe is not None:
+                    chunk = self.query_probe.chunk_at(
+                        work_item.prefix_append_logical_len
+                    )
+                    if not chunk.published:
+                        assert prompt_stream.block_size is not None
+                        self.query_probe.begin(chunk.end, prompt_stream.block_size)
+                        work_item.probe_attempt_id = self.query_probe.attempt_id
                 prompt_stream.active_work_item = work_item
                 return
 
@@ -2624,9 +2643,7 @@ class Request:
                     "Prompt stream UPDATE work is missing its frozen snapshot: "
                     f"request_id={self.request_id}."
                 )
-            if not 0 <= work_item.update_common_prefix_len <= len(
-                update_token_ids
-            ):
+            if not 0 <= work_item.update_common_prefix_len <= len(update_token_ids):
                 raise RuntimeError(
                     "Prompt stream UPDATE work has an invalid source-local LCP: "
                     f"request_id={self.request_id}, "
@@ -2729,11 +2746,25 @@ class Request:
                 prefix_append_token_ids = self._get_prefix_append_physical_token_ids(
                     active_work_item.prefix_append_logical_len
                 )
+                probe_tokens = (
+                    self.query_probe.token_ids
+                    if active_work_item.probe_attempt_id is not None
+                    and self.query_probe is not None
+                    else []
+                )
                 return PromptStreamExecutionView(
                     phase=PromptStreamExecutionPhase.PREFIX_APPEND,
                     write_segment=PromptStreamKVSegment.PREFIX_APPEND,
-                    required_segments=(PromptStreamKVSegment.PREFIX_APPEND,),
-                    token_ids=tuple(prefix_append_token_ids),
+                    required_segments=(
+                        (
+                            PromptStreamKVSegment.PREFIX_APPEND,
+                            PromptStreamKVSegment.PROBE,
+                        )
+                        if probe_tokens
+                        else (PromptStreamKVSegment.PREFIX_APPEND,)
+                    ),
+                    token_ids=tuple(prefix_append_token_ids + probe_tokens),
+                    probe_start=len(prefix_append_token_ids) if probe_tokens else -1,
                     num_computed_tokens=active_work_item.num_computed_tokens,
                     prefix_append_physical_len=len(prefix_append_token_ids),
                     segment_offset=0,
@@ -2744,16 +2775,16 @@ class Request:
                 )
 
             if active_work_item.phase == PromptStreamExecutionPhase.QUESTION:
-                update_token_ids = active_work_item.update_token_ids or ()
-                question_token_ids = active_work_item.question_token_ids
-                assert question_token_ids is not None
-                prefix_append_token_ids = active_work_item.prefix_append_token_ids
+                question_update_tokens = active_work_item.update_token_ids or ()
+                question_suffix_tokens = active_work_item.question_token_ids
+                assert question_suffix_tokens is not None
+                question_prefix_tokens = active_work_item.prefix_append_token_ids
                 execution_token_ids = (
-                    list(prefix_append_token_ids)
-                    + list(update_token_ids)
-                    + list(question_token_ids)
+                    list(question_prefix_tokens)
+                    + list(question_update_tokens)
+                    + list(question_suffix_tokens)
                 )
-                prefix_append_physical_len = len(prefix_append_token_ids)
+                prefix_append_physical_len = len(question_prefix_tokens)
                 return PromptStreamExecutionView(
                     phase=PromptStreamExecutionPhase.QUESTION,
                     write_segment=PromptStreamKVSegment.UPDATE,
@@ -2764,7 +2795,7 @@ class Request:
                     token_ids=tuple(execution_token_ids),
                     num_computed_tokens=(
                         prefix_append_physical_len
-                        + len(update_token_ids)
+                        + len(question_update_tokens)
                         + active_work_item.num_computed_tokens
                     ),
                     prefix_append_physical_len=prefix_append_physical_len,
@@ -2777,10 +2808,10 @@ class Request:
 
             # Update delta 基于 flush 时冻结的 PREFIX_APPEND KV 和 work 自己
             # 保存的 source-local LCP KV。新 KV 仍然只写入 UPDATE segment。
-            update_token_ids = active_work_item.update_token_ids
-            assert update_token_ids is not None
+            active_update_tokens = active_work_item.update_token_ids
+            assert active_update_tokens is not None
             execution_token_ids = list(active_work_item.prefix_append_token_ids) + list(
-                update_token_ids
+                active_update_tokens
             )
             prefix_append_physical_len = len(active_work_item.prefix_append_token_ids)
             return PromptStreamExecutionView(
@@ -2951,9 +2982,7 @@ class Request:
         if view.phase == PromptStreamExecutionPhase.UPDATE:
             # 该接口在 Scheduler 完成本轮 schedule 后推进进度，因此这里
             # 诚实记录 scheduled token；preemption 后的重放会再次累计。
-            prompt_stream.total_scheduled_update_prefill_tokens += (
-                num_scheduled_tokens
-            )
+            prompt_stream.total_scheduled_update_prefill_tokens += num_scheduled_tokens
             if (
                 active_work_item is not None
                 and active_work_item.execution_origin
@@ -2971,6 +3000,14 @@ class Request:
             prompt_stream.total_recovery_prefix_append_prefill_tokens += (
                 num_scheduled_tokens
             )
+        if view.probe_start >= 0:
+            assert active_work_item is not None
+            active_work_item.num_computed_tokens = new_num_computed_tokens
+            prompt_stream.prefix_append_num_computed_tokens = min(
+                new_num_computed_tokens, view.probe_start
+            )
+            self.num_computed_tokens = new_num_computed_tokens
+            return
         if view.phase == PromptStreamExecutionPhase.PREFIX_APPEND:
             # PREFIX_APPEND work 的全局位置就是 segment-local 位置。
             local_num_computed_tokens = min(
@@ -3023,9 +3060,7 @@ class Request:
                         source_state.update_committed_append_epoch = (
                             active_work_item.required_append_epoch
                         )
-                    self._complete_prompt_stream_update_work(
-                        active_work_item
-                    )
+                    self._complete_prompt_stream_update_work(active_work_item)
                     prompt_stream.active_work_item = None
         else:
             local_num_computed_tokens = max(
@@ -3048,6 +3083,82 @@ class Request:
                     prompt_stream.active_work_item = None
 
         self.num_computed_tokens = new_num_computed_tokens
+
+    def build_query_probe_work(self, num_tokens: int) -> QueryProbeWork | None:
+        """冻结本批行级可见范围；用于 scheduler 到 worker 的专用通道。"""
+        state = self.query_probe
+        view = self.prompt_stream_execution_view
+        if state is None or view is None:
+            return None
+        assert self.prompt_stream is not None
+        active = self.prompt_stream.active_work_item
+        history_end = view.padding_range[0]
+        if view.phase == PromptStreamExecutionPhase.PREFIX_APPEND:
+            # bootstrap 无历史策略；恢复时也不能让本块使用自己的选择结果。
+            chunk = next((c for c in state.chunks if c.end == history_end), None)
+            history_end = chunk.start if chunk is not None else 0
+        dropped = (
+            []
+            if view.phase == PromptStreamExecutionPhase.QUESTION
+            else state.dropped_before(history_end)
+        )
+        candidates = (
+            state.chunk_at(active.prefix_append_logical_len).block_ids
+            if view.probe_start >= 0 and active is not None
+            else []
+        )
+        state.forward_count += 1
+        if view.probe_start >= 0:
+            state.probe_forward_count += 1
+            chunk = state.chunk_at(view.padding_range[0])
+            chunk.forward_count += 1
+            if self.num_computed_tokens + num_tokens > view.probe_start:
+                chunk.query_forward_count += 1
+            if (
+                self.num_computed_tokens < chunk.end
+                and self.num_computed_tokens + num_tokens > view.probe_start
+            ):
+                chunk.joint_forward_count += 1
+        return QueryProbeWork(
+            attempt_id=state.attempt_id,
+            computed_tokens=self.num_computed_tokens,
+            scheduled_tokens=num_tokens,
+            prefix_len=view.padding_range[0],
+            probe_start=view.probe_start,
+            candidate_blocks=list(candidates),
+            dropped_blocks=dropped,
+            padding_range=view.padding_range,
+            is_final_step=self.num_computed_tokens + num_tokens >= len(view.token_ids),
+            suppress_sampling=view.phase != PromptStreamExecutionPhase.QUESTION,
+        )
+
+    def complete_query_probe_step(
+        self,
+        work: QueryProbeWork,
+        result: QueryProbeResult | None,
+    ) -> bool:
+        """GPU 回包后累加评分并提交正式 Append；返回是否可释放私有段。"""
+        state = self.query_probe
+        if state is None or work.probe_start < 0 or work.attempt_id != state.attempt_id:
+            return False
+        if result is not None:
+            state.accumulate(result)
+        if not work.is_final_step:
+            return False
+        assert self.prompt_stream is not None
+        active = self.prompt_stream.active_work_item
+        assert active is not None and active.probe_attempt_id == work.attempt_id
+        state.publish()
+        self.prompt_stream.prefix_append_committed_logical_len = (
+            active.prefix_append_logical_len
+        )
+        self.prompt_stream.prefix_append_num_computed_tokens = work.probe_start
+        self.prompt_stream.prefix_append_bootstrap_completed = True
+        sources = self.prompt_stream.coalescing_sources
+        if sources is not None:
+            sources.committed_append_epoch = active.target_append_epoch
+        self.prompt_stream.active_work_item = None
+        return True
 
     def _get_latest_prompt_stream_update_snapshot(
         self,
@@ -3105,9 +3216,7 @@ class Request:
         )
 
         # 物理 KV 被释放前，先按 segment 记录实际丢失的有效计算进度。
-        prefix_append_tokens_discarded = (
-            prompt_stream.prefix_append_num_computed_tokens
-        )
+        prefix_append_tokens_discarded = prompt_stream.prefix_append_num_computed_tokens
         update_tokens_discarded = prompt_stream.update_num_computed_tokens
         question_tokens_discarded = prompt_stream.question_num_computed_tokens
         prompt_stream.total_prefix_append_tokens_discarded_by_preemption += (
@@ -3169,6 +3278,8 @@ class Request:
         prompt_stream.prefix_append_bootstrap_completed = False
         prompt_stream.prefix_append_recovery_pending = True
         prompt_stream.active_work_item = None
+        if self.query_probe is not None:
+            self.query_probe.reset_attempt()
         prompt_stream.pending_work_items.clear()
         prompt_stream.pending_update_kv_truncation_keep_tokens = None
         prompt_stream.question_work_enqueued = False
@@ -3180,7 +3291,18 @@ class Request:
 
         # recovery 必须先重建最终 PA。模板 bootstrap 由 work selector 创建；
         # 若存在 Append，再追加一个从模板末尾追到完整 PA 的 recovery work。
-        if prompt_stream.append_token_ids:
+        if self.query_probe is not None:
+            # 按原事件边界恢复，历史策略仍按当前事件之前的范围过滤。
+            for chunk in self.query_probe.chunks:
+                prompt_stream.pending_work_items.append(
+                    PromptStreamWorkItem(
+                        phase=PromptStreamExecutionPhase.PREFIX_APPEND,
+                        prefix_append_logical_len=chunk.end,
+                        target_append_epoch=chunk.epoch,
+                        execution_origin=PromptStreamExecutionOrigin.RECOVERY,
+                    )
+                )
+        elif prompt_stream.append_token_ids:
             prompt_stream.pending_work_items.append(
                 PromptStreamWorkItem(
                     phase=PromptStreamExecutionPhase.PREFIX_APPEND,
@@ -3205,6 +3327,7 @@ class Request:
             and (carried_admission_id is not None or bool(latest_update_token_ids))
         )
         if should_recover_update:
+            assert latest_update_token_ids is not None
             required_append_epoch = (
                 source_state.append_epoch if source_state is not None else 0
             )

@@ -15,7 +15,7 @@
 | Proxy/replay | g2c14 |
 | 模型 | Qwen2.5-3B |
 | 显存比例 | 0.90 |
-| 注意力 | TRITON_ATTN，Masked Padding 开启，同步调度 |
+| 历史实验注意力 | TRITON_ATTN，Masked Padding 开启，同步调度 |
 | 数据 | 稳定知识占比 87.5%，Append=1792、Update=256 tokens |
 | 来源间隔 | Append=0.1 s，Update=0.2 s，source finish delay=0 |
 | 回放 | QPS=2，Poisson，seed=2026，并发上限 8，完整生成 64 tokens |
@@ -131,18 +131,34 @@ profiling 本身会增加开销。这里的 8 请求窗口只用于定位，不�
 从仓库根目录，在 g2c14 启动唯一一对服务。每次重跑换新的输出目录：
 
 ```shell
+mkdir -p research/scripts/logs
+
 NSYS_OUTPUT_DIR="${PWD}/research/scripts/replay/stable_kv_push/results/nsys-new" \
 PYTHON_BIN="${PWD}/research/scripts/replay/stable_kv_push/nsys/profile_python.sh" \
-SERVER_NODE=g2c9 \
+REPO_ROOT="${PWD}" \
 MODEL_PATH="${HOME}/Models/Qwen2.5-3B" \
 SERVED_MODEL_NAME=qwen2.5-3b \
-GPU_MEMORY_UTILIZATION=0.90 \
+GPU_MEMORY_UTILIZATION=0.8 \
 MAX_MODEL_LEN=4096 \
 MAX_NUM_SEQS=64 \
 PROMPT_STREAM_MASKED_PADDING=1 \
-ATTENTION_BACKEND=TRITON_ATTN \
-bash research/scripts/server/start_stable_kv_pair.sh
+srun --job-name=stable-kv-pd --partition=gpu --nodelist=g2c9 \
+  --nodes=1 --ntasks=2 --ntasks-per-node=2 \
+  --gpus-per-task=1 --gpu-bind=single:1 \
+  --cpus-per-task=8 --mem=24G --time=04:00:00 --kill-on-bad-exit=1 \
+  --output="${PWD}/research/scripts/logs/stable-kv-pd-%j-rank-%t.out" \
+  --error="${PWD}/research/scripts/logs/stable-kv-pd-%j-rank-%t.out" \
+  bash -c '
+    case "$SLURM_PROCID" in
+      0) export ATTENTION_BACKEND=CHUNK_SPARSE_ATTN ;;
+      1) export ATTENTION_BACKEND=TRITON_ATTN ;;
+    esac
+    exec bash "$REPO_ROOT/research/scripts/server/start_stable_kv_node.sh"
+  '
 ```
+
+与上层 README 相同，rank 0 的 P 使用自定义后端，rank 1 的 D 使用原 Triton
+后端，只屏蔽 padding。按 rank 设置避免把 P 的后端配置同时应用于 D。
 
 另一个 g2c14 终端启动专用 proxy，命令见上层 README。确认两端健康后：
 
@@ -165,3 +181,5 @@ bash research/scripts/replay/stable_kv_push/nsys/run_capture.sh
 
 图形界面可直接打开 `.nsys-rep`，查看主执行线程的长 launch 与 copy 线程。
 无需重新启动服务或重新联网下载数据。
+
+当前启动命令的 P 使用 `CHUNK_SPARSE_ATTN`，D 使用 `TRITON_ATTN`。上面的历史采样结果两端均使用 `TRITON_ATTN`，重测后需分别保存和比较。

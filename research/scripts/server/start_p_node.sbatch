@@ -23,7 +23,7 @@ NIXL_SIDE_CHANNEL_PORT="${NIXL_SIDE_CHANNEL_PORT:-5600}"
 # NIXL 会把这个地址交给远端节点主动发起握手。未显式指定时使用实际
 # Slurm 运行节点的 hostname，避免跨节点 P/D 错把 localhost 发布给对端。
 NIXL_SIDE_CHANNEL_HOST="${VLLM_NIXL_SIDE_CHANNEL_HOST:-$(hostname)}"
-GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.65}"
+GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.8}"
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-4096}"
 MAX_NUM_SEQS="${MAX_NUM_SEQS:-64}"
 TENSOR_PARALLEL_SIZE="${TENSOR_PARALLEL_SIZE:-1}"
@@ -31,7 +31,7 @@ if ! [[ "${TENSOR_PARALLEL_SIZE}" =~ ^[1-9][0-9]*$ ]]; then
   echo "TENSOR_PARALLEL_SIZE must be a positive integer, got: ${TENSOR_PARALLEL_SIZE}" >&2
   exit 2
 fi
-ATTENTION_BACKEND="${ATTENTION_BACKEND:-}"
+ATTENTION_BACKEND="${ATTENTION_BACKEND:-CHUNK_SPARSE_ATTN}"
 GENERATION_CONFIG="${GENERATION_CONFIG:-}"
 PROMPT_STREAM_MASKED_PADDING="${PROMPT_STREAM_MASKED_PADDING:-0}"
 if [[ "${PROMPT_STREAM_MASKED_PADDING}" != "0" && "${PROMPT_STREAM_MASKED_PADDING}" != "1" ]]; then
@@ -40,8 +40,8 @@ if [[ "${PROMPT_STREAM_MASKED_PADDING}" != "0" && "${PROMPT_STREAM_MASKED_PADDIN
 fi
 PADDING_ARGS=()
 if [[ "${PROMPT_STREAM_MASKED_PADDING}" == "1" ]]; then
-  # 当前 range mask 仅由 Triton 实现；显式指定其他后端会在 vLLM 启动时拒绝。
-  ATTENTION_BACKEND="${ATTENTION_BACKEND:-TRITON_ATTN}"
+  # 实验默认使用共享的 dense/sparse 算子；TRITON_ATTN 保留 unified 路由。
+  ATTENTION_BACKEND="${ATTENTION_BACKEND:-CHUNK_SPARSE_ATTN}"
   # Qwen 的 generation_config.json 默认含 repetition_penalty=1.05。该采样
   # 规则会把物理 padding token 计入历史词频，masked-padding 路径会拒绝它。
   GENERATION_CONFIG="${GENERATION_CONFIG:-vllm}"

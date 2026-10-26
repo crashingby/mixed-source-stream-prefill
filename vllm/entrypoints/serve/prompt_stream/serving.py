@@ -84,7 +84,40 @@ class PromptStreamServing:
         prefix_token_ids = self._resolve_start_prompt_token_ids(
             request.prompt, add_special_tokens=request.add_special_tokens
         )
+        probe_token_ids = None
+        if request.probe_query is not None:
+            probe_token_ids = self._resolve_token_ids(
+                PromptStreamEventRequest(
+                    source_id="__probe__",
+                    event_type="prompt_finished",
+                    text=request.probe_query,
+                )
+            )
+            if not probe_token_ids:
+                raise ValueError("probe_query must contain at least one token.")
+            config = self.engine_client.vllm_config
+            backend = config.attention_config.backend
+            if backend is None or backend.name != "CHUNK_SPARSE_ATTN":
+                raise ValueError(
+                    "Query probe requires --attention-backend CHUNK_SPARSE_ATTN."
+                )
+            # 首版使用 eager 的单 GPU Triton 路径，避免图捕获缓存动态策略。
+            if (
+                not config.model_config.enforce_eager
+                or config.parallel_config.tensor_parallel_size != 1
+                or not config.scheduler_config.prompt_stream_masked_padding
+                or self._block_size() != 16
+                or config.cache_config.cache_dtype != "auto"
+            ):
+                raise ValueError(
+                    "Query probe requires --enforce-eager, TP=1 and "
+                    "--prompt-stream-masked-padding, block_size=16 and auto KV dtype."
+                )
+        elif request.probe_keep_ratio is not None:
+            raise ValueError("probe_keep_ratio requires probe_query.")
         start_required_len = self._align_to_block_size(len(prefix_token_ids)) + 1
+        if probe_token_ids is not None:
+            start_required_len += len(probe_token_ids)
         if start_required_len > self._max_model_len():
             raise ValueError(
                 "Prompt stream start exceeds the P node model limit after "
@@ -100,6 +133,12 @@ class PromptStreamServing:
             arrival_time=time.time(),
             # 实际 engine 分词必须与长度镜像使用同一标记。
             tokenization_kwargs={"add_special_tokens": request.add_special_tokens},
+            probe_token_ids=probe_token_ids,
+            probe_keep_ratio=(
+                request.probe_keep_ratio
+                if request.probe_keep_ratio is not None
+                else 0.5
+            ),
         )
 
         # `add_request()` 会把外部 request id 随机化为内部 request id。后续
@@ -111,6 +150,15 @@ class PromptStreamServing:
             prefix_token_ids=prefix_token_ids,
             sampling_params=sampling_params,
         )
+        if probe_token_ids is not None:
+            from vllm.v1.query_probe import QueryProbeState
+
+            length_request.query_probe = QueryProbeState(
+                probe_token_ids,
+                request.probe_keep_ratio
+                if request.probe_keep_ratio is not None
+                else 0.5,
+            )
         self.sessions[internal_request_id] = PromptStreamSession(
             request_id=internal_request_id,
             collector=collector,
@@ -281,6 +329,13 @@ class PromptStreamServing:
         length_request.apply_prompt_stream_event(event)
         layout = length_request.get_prompt_stream_layout()
         required_sequence_len = layout.physical_total_len + 1
+        if length_request.query_probe is not None:
+            probe_len = (
+                self._align_to_block_size(layout.prefix_len + layout.append_len)
+                + len(length_request.query_probe.token_ids)
+                + 1
+            )
+            required_sequence_len = max(required_sequence_len, probe_len)
         max_model_len = self._max_model_len()
         if required_sequence_len <= max_model_len:
             return length_request
