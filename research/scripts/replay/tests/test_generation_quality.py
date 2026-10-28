@@ -260,7 +260,8 @@ def test_sparse_full_generation(
     assert len(rows) == 2 and all(row["result_status"] == "ok" for row in rows)
     assert all(row["response_text"] == "Alpha city" for row in rows)
     assert all(
-        row["num_prefill_token_ids"] == row["num_decode_token_ids"] == 1 for row in rows
+        row["num_prefill_token_ids"] == 0 and row["num_decode_token_ids"] == 2
+        for row in rows
     )
     assert all(row["probe_keep_ratio"] == 0.5 for row in rows)
     starts = [body for path, body in proxy.requests if path.endswith("/start")]

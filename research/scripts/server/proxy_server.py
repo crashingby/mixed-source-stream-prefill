@@ -354,47 +354,6 @@ def _apply_decode_prompt_to_request(
     decode_request["prompt"] = session.decode_prompt_text
 
 
-def _append_prefill_output_token_ids(
-    session: PromptStreamProxySession,
-    response_json: dict[str, Any],
-) -> int:
-    """把 P 节点首 token 追加到 D 侧 prompt token 镜像。
-
-    Args:
-        session: 当前 prompt stream 会话。
-        response_json: P 节点 `/prompt_stream/finish` 返回的 JSON。
-
-    Returns:
-        实际追加的 P 侧输出 token 数。
-    """
-    output_token_ids = response_json.get("output_token_ids")
-    if not isinstance(output_token_ids, list):
-        return 0
-    if session.decode_prompt_token_ids is None:
-        return 0
-
-    normalized_token_ids = [int(token_id) for token_id in output_token_ids]
-    session.decode_prompt_token_ids.extend(normalized_token_ids)
-    return len(normalized_token_ids)
-
-
-def _shrink_decode_max_tokens(
-    decode_request: dict[str, Any],
-    num_prefill_output_tokens: int,
-) -> None:
-    """扣除 P 节点已经生成并交给 D 的首 token 数。
-
-    Args:
-        decode_request: 即将发给 D 节点的 OpenAI 请求体。
-        num_prefill_output_tokens: P 节点已经生成的输出 token 数。
-    """
-    if num_prefill_output_tokens <= 0:
-        return
-    max_tokens = decode_request.get("max_tokens")
-    if isinstance(max_tokens, int):
-        decode_request["max_tokens"] = max(0, max_tokens - num_prefill_output_tokens)
-
-
 def _validate_prompt_stream_padding_manifest(
     response_json: dict[str, Any],
 ) -> dict[str, int] | None:
@@ -441,7 +400,6 @@ def _validate_prompt_stream_padding_manifest(
 def _validate_prompt_stream_transfer(
     session: PromptStreamProxySession,
     response_json: dict[str, Any],
-    num_prefill_output_tokens: int,
 ) -> None:
     """在请求 D 之前验证 token view 与远端 KV 覆盖范围一致。"""
     physical_prompt_token_ids = response_json.get("prompt_token_ids")
@@ -478,7 +436,7 @@ def _validate_prompt_stream_transfer(
                 f"metadata={reported_physical_prompt_len}."
             ),
         )
-    decode_prompt_len = physical_prompt_len + num_prefill_output_tokens
+    decode_prompt_len = physical_prompt_len
     if kv_transfer_params.get("prompt_stream_exact_transfer") is not True:
         raise HTTPException(
             status_code=502,
@@ -497,15 +455,12 @@ def _validate_prompt_stream_transfer(
     reported_output_tokens = kv_transfer_params.get(
         "prompt_stream_prefill_output_tokens"
     )
-    if (
-        type(reported_output_tokens) is not int
-        or reported_output_tokens != num_prefill_output_tokens
-    ):
+    if type(reported_output_tokens) is not int or reported_output_tokens != 0:
         raise HTTPException(
             status_code=502,
             detail=(
                 "P node returned inconsistent prefill output-token metadata: "
-                f"response={num_prefill_output_tokens}, "
+                "expected=0, "
                 f"manifest={reported_output_tokens}."
             ),
         )
@@ -610,18 +565,6 @@ def _validate_prompt_stream_transfer(
         )
 
 
-def _should_finish_without_decode(
-    decode_request: dict[str, Any],
-    response_json: dict[str, Any],
-    num_prefill_output_tokens: int,
-) -> bool:
-    """判断 P 首 token 是否已经满足原始请求的停止条件。"""
-    if response_json.get("output_finish_reason") == "stop":
-        return True
-    max_tokens = decode_request.get("max_tokens")
-    return isinstance(max_tokens, int) and max_tokens <= num_prefill_output_tokens
-
-
 def _attach_prompt_stream_metadata(
     response_payload: dict[str, Any],
     prefill_response: dict[str, Any],
@@ -666,78 +609,6 @@ def _attach_prompt_stream_metadata(
     return response_payload
 
 
-def _build_prefill_only_response(
-    session: PromptStreamProxySession,
-    response_json: dict[str, Any],
-) -> dict[str, Any]:
-    """构造无需启动 D 时的 OpenAI completions 响应。"""
-    prompt_token_ids = response_json.get("prompt_token_ids") or []
-    output_token_ids = response_json.get("output_token_ids") or []
-    completion_tokens = len(output_token_ids)
-    prompt_tokens = len(prompt_token_ids)
-    finish_reason = response_json.get("output_finish_reason")
-    if finish_reason != "stop":
-        finish_reason = "length"
-    response_payload = {
-        "id": f"cmpl-{session.request_id}",
-        "object": "text_completion",
-        "created": int(time.time()),
-        "model": session.base_request.get("model"),
-        "choices": [
-            {
-                "index": 0,
-                "text": response_json.get("output_text", ""),
-                "logprobs": None,
-                "finish_reason": finish_reason,
-                "stop_reason": response_json.get("output_stop_reason"),
-                "token_ids": output_token_ids,
-            }
-        ],
-        "usage": {
-            "prompt_tokens": prompt_tokens,
-            "completion_tokens": completion_tokens,
-            "total_tokens": prompt_tokens + completion_tokens,
-        },
-    }
-    return _attach_prompt_stream_metadata(response_payload, response_json)
-
-
-def _merge_prefill_output(
-    response_json: dict[str, Any],
-    prefill_response: dict[str, Any],
-    num_prefill_output_tokens: int,
-) -> dict[str, Any]:
-    """把 P 首 token 合并回 D 的非流式 completions 响应。"""
-    if num_prefill_output_tokens <= 0:
-        return _attach_prompt_stream_metadata(response_json, prefill_response)
-    choices = response_json.get("choices")
-    if not isinstance(choices, list) or len(choices) != 1:
-        raise HTTPException(
-            status_code=502,
-            detail="D node must return exactly one completion choice.",
-        )
-    choice = choices[0]
-    choice["text"] = prefill_response.get("output_text", "") + choice.get("text", "")
-    token_ids = choice.get("token_ids")
-    if isinstance(token_ids, list):
-        choice["token_ids"] = (
-            list(prefill_response.get("output_token_ids") or []) + token_ids
-        )
-
-    usage = response_json.get("usage")
-    if isinstance(usage, dict):
-        prompt_tokens = usage.get("prompt_tokens")
-        completion_tokens = usage.get("completion_tokens")
-        if isinstance(prompt_tokens, int):
-            usage["prompt_tokens"] = max(
-                0,
-                prompt_tokens - num_prefill_output_tokens,
-            )
-        if isinstance(completion_tokens, int):
-            usage["completion_tokens"] = completion_tokens + num_prefill_output_tokens
-    return _attach_prompt_stream_metadata(response_json, prefill_response)
-
-
 def _build_prefill_start_request(
     req_data: dict[str, Any], *, enable_kv_transfer: bool
 ) -> dict[str, Any]:
@@ -778,9 +649,8 @@ def _build_normal_pd_prefill_request(
 ) -> dict[str, Any]:
     """构造普通 completions 的 P 节点首 token 请求。
 
-    P 节点必须返回 prompt 与首个输出 token 的精确 token ids。D 节点随后以
-    prompt_token_ids + prefill_token_id 作为输入，从本地 tail token 继续
-    forward；因此不能依赖文本反解再重新分词。
+    P 返回实际执行的 prompt token IDs。D 加载这些位置的 KV 后重新计算
+    最后一个 prompt token 并采样回答；P 的采样结果仅用于确认 P 已完成。
 
     Args:
         req_data: 客户端发给 proxy 的原始 completions 请求体。
@@ -859,135 +729,22 @@ def _get_normal_pd_prefill_choice(
 def _build_normal_pd_decode_request(
     req_data: dict[str, Any],
     prefill_response: dict[str, Any],
-) -> tuple[dict[str, Any], dict[str, Any], int]:
-    """构造普通 PD 的 D 请求，并返回 P 首 token 的元数据。
-
-    P 的 KV 只覆盖原始 prompt；刚采样出的首 token 尚未被 P 的下一次
-    forward 写入 KV。D 因而接收 prompt + P 首 token，加载原始 prompt
-    的远端 KV，再在本地计算这个 tail token 以得到第二个输出 token。
-
-    Args:
-        req_data: 客户端原始 completions 请求体。
-        prefill_response: P 节点生成一个 token 后的 JSON 响应。
-
-    Returns:
-        (decode_request, prefill_choice, num_prefill_output_tokens)。
-
-    Raises:
-        HTTPException: KV transfer 元数据缺失时抛出。
-    """
+) -> dict[str, Any]:
+    """把 P 实际执行的原始 prompt 与 KV 参数交给 D，由 D 生成全部回答。"""
     prefill_choice = _get_normal_pd_prefill_choice(prefill_response)
-    prompt_token_ids = [
-        int(token_id) for token_id in prefill_choice["prompt_token_ids"]
-    ]
-    output_token_ids = [int(token_id) for token_id in prefill_choice["token_ids"]]
-
-    # D 看到的逻辑序列必须显式带上 P 首 token；add_special_tokens=False
-    # 防止 D 再次插入 BOS/EOS，破坏与 P 的 KV 对齐。
     decode_request = _build_decode_base_request(req_data)
-    decode_request["prompt"] = prompt_token_ids + output_token_ids
+    # 精确 token IDs 避免 D 再次分词；P 的采样结果不属于 D prompt。
+    decode_request["prompt"] = list(prefill_choice["prompt_token_ids"])
     decode_request["add_special_tokens"] = False
-    _shrink_decode_max_tokens(decode_request, len(output_token_ids))
-
     if not global_args.disable_kv_transfer:
-        kv_transfer_params = prefill_response.get("kv_transfer_params")
-        if not isinstance(kv_transfer_params, dict):
+        params = prefill_response.get("kv_transfer_params")
+        if not isinstance(params, dict):
             raise HTTPException(
                 status_code=502,
-                detail=(
-                    "P node normal PD response did not include kv_transfer_params."
-                ),
+                detail="P node normal PD response is missing kv_transfer_params.",
             )
-        decode_request["kv_transfer_params"] = kv_transfer_params
-
-    return decode_request, prefill_choice, len(output_token_ids)
-
-
-def _normal_pd_finish_without_decode(
-    decode_request: dict[str, Any],
-    prefill_choice: dict[str, Any],
-    num_prefill_output_tokens: int,
-) -> bool:
-    """判断普通 PD 的 P 首 token 是否已完成原始生成请求。"""
-    if prefill_choice.get("finish_reason") == "stop":
-        return True
-    max_tokens = decode_request.get("max_tokens")
-    return (
-        isinstance(max_tokens, int)
-        and max_tokens <= 0
-        and num_prefill_output_tokens > 0
-    )
-
-
-def _build_normal_pd_prefill_stream_chunk(
-    prefill_response: dict[str, Any],
-    prefill_choice: dict[str, Any],
-    is_final_chunk: bool,
-) -> dict[str, Any]:
-    """将普通 PD P 节点生成的首 token 编码为 completions SSE payload。"""
-    finish_reason = prefill_choice.get("finish_reason") if is_final_chunk else None
-    if is_final_chunk and finish_reason != "stop":
-        finish_reason = "length"
-    return {
-        "id": prefill_response.get("id", f"cmpl-normal-pd-{time.time_ns()}"),
-        "object": "text_completion",
-        "created": prefill_response.get("created", int(time.time())),
-        "model": prefill_response.get("model"),
-        "choices": [
-            {
-                "index": 0,
-                "text": prefill_choice.get("text", ""),
-                "logprobs": prefill_choice.get("logprobs"),
-                "finish_reason": finish_reason,
-                "stop_reason": prefill_choice.get("stop_reason"),
-                # 即使 token 对应空文本，replay 也能凭 token_ids 识别首 token。
-                "token_ids": list(prefill_choice["token_ids"]),
-            }
-        ],
-    }
-
-
-def _merge_normal_pd_prefill_output(
-    decode_response: dict[str, Any],
-    prefill_choice: dict[str, Any],
-    num_prefill_output_tokens: int,
-) -> dict[str, Any]:
-    """把普通 PD 的 P 首 token 合并进 D 的非流式 completions 响应。"""
-    if num_prefill_output_tokens <= 0:
-        return decode_response
-    choices = decode_response.get("choices")
-    if not isinstance(choices, list) or len(choices) != 1:
-        raise HTTPException(
-            status_code=502,
-            detail="D node normal PD response must contain exactly one choice.",
-        )
-    decode_choice = choices[0]
-    if not isinstance(decode_choice, dict):
-        raise HTTPException(
-            status_code=502,
-            detail="D node normal PD response choice must be a JSON object.",
-        )
-    decode_choice["text"] = str(prefill_choice.get("text", "")) + str(
-        decode_choice.get("text", "")
-    )
-    if isinstance(decode_choice.get("token_ids"), list):
-        decode_choice["token_ids"] = list(prefill_choice["token_ids"]) + list(
-            decode_choice["token_ids"]
-        )
-
-    usage = decode_response.get("usage")
-    if isinstance(usage, dict):
-        prompt_tokens = usage.get("prompt_tokens")
-        completion_tokens = usage.get("completion_tokens")
-        if isinstance(prompt_tokens, int):
-            # D prompt 多出的一个 token 是 P 已采样的输出，不属于用户 prompt。
-            usage["prompt_tokens"] = max(
-                0,
-                prompt_tokens - num_prefill_output_tokens,
-            )
-        if isinstance(completion_tokens, int):
-            usage["completion_tokens"] = completion_tokens + num_prefill_output_tokens
-    return decode_response
+        decode_request["kv_transfer_params"] = params
+    return decode_request
 
 
 def _format_upstream_error(
@@ -1061,132 +818,6 @@ def _encode_sse_payload(payload: dict[str, Any]) -> bytes:
     """
     serialized_payload = json.dumps(payload, ensure_ascii=False)
     return f"data: {serialized_payload}\n\n".encode()
-
-
-def _build_prefill_stream_chunk(
-    session: PromptStreamProxySession,
-    prefill_response: dict[str, Any],
-    is_final_chunk: bool,
-) -> dict[str, Any]:
-    """把 P 节点 finish 的首个生成 token 构造成 completions SSE chunk。
-
-    P 节点在 ``prompt_stream/finish`` 成功时已经完成最终问题的 prefill 并
-    产生一个输出 token。stream 模式必须立即把它发送给客户端，不能等待 D
-    节点完成剩余 decode，否则 finish-to-first-token 不再是实际 TTFT。
-
-    Args:
-        session: 绑定 P/D 节点与请求参数的 proxy 会话。
-        prefill_response: P 节点 finish 返回的首 token 和 KV 元数据。
-        is_final_chunk: P 的首 token 是否已经满足停止条件。
-
-    Returns:
-        OpenAI completions SSE 使用的单个 JSON payload。
-    """
-    output_token_ids = prefill_response.get("output_token_ids") or []
-    finish_reason = prefill_response.get("output_finish_reason")
-    if is_final_chunk and finish_reason != "stop":
-        finish_reason = "length"
-    response_payload = {
-        "id": f"cmpl-{session.request_id}",
-        "object": "text_completion",
-        "created": int(time.time()),
-        "model": session.base_request.get("model"),
-        "choices": [
-            {
-                "index": 0,
-                "text": prefill_response.get("output_text", ""),
-                "logprobs": None,
-                "finish_reason": finish_reason if is_final_chunk else None,
-                "stop_reason": prefill_response.get("output_stop_reason"),
-                # token_ids 让客户端能够把空文本的特殊 token 也算作首 token。
-                "token_ids": output_token_ids,
-            }
-        ],
-    }
-    # 流式客户端会把这一帧作为真实首 token；统计必须和首帧一起返回，
-    # 不能放到尾帧，否则 TTFT-only 客户端可能已经结束读取。
-    return _attach_prompt_stream_metadata(response_payload, prefill_response)
-
-
-async def _stream_decode_completion(
-    session: PromptStreamProxySession,
-    prefill_response: dict[str, Any],
-    decode_request: dict[str, Any],
-    num_prefill_output_tokens: int,
-    finish_without_decode: bool,
-) -> AsyncIterator[bytes]:
-    """先发 P 首 token，再透明转发 D 的剩余 SSE decode 流。
-
-    该 generator 仅在外层 HTTP headers 已经开始发送后运行，因此 D 侧错误
-    以 SSE ``error`` chunk 表示。这样客户端至少可以区分“TTFT 已产生”与
-    “后续 decode 失败”。
-
-    Args:
-        session: 当前 prompt stream 会话。
-        prefill_response: P 节点 finish 响应。
-        decode_request: 已写入精确 token view 和 KV transfer 参数的 D 请求。
-        num_prefill_output_tokens: P 已生成并将要合并进输出的 token 数。
-        finish_without_decode: P 首 token 已完成整个请求时为 True。
-
-    Yields:
-        OpenAI completions 兼容的 SSE bytes。
-    """
-    if num_prefill_output_tokens > 0:
-        # 这是流式路径的真实首 token：TTFT 应以此 frame 的到达时刻计量。
-        yield _encode_sse_payload(
-            _build_prefill_stream_chunk(
-                session,
-                prefill_response,
-                is_final_chunk=finish_without_decode,
-            )
-        )
-
-    if finish_without_decode:
-        yield b"data: [DONE]\n\n"
-        return
-
-    try:
-        async with session.decode_client_info["client"].stream(
-            "POST",
-            session.api_endpoint,
-            json=decode_request,
-            headers=_authorization_headers(session.request_id),
-        ) as response:
-            if response.is_error:
-                # StreamingResponse 不能再改 HTTP status；将上游错误编码为 SSE。
-                error_body = await response.aread()
-                try:
-                    decoded_body: Any = json.loads(error_body)
-                except (TypeError, ValueError):
-                    decoded_body = error_body.decode("utf-8", errors="replace")
-                yield _encode_sse_payload(
-                    {
-                        "error": {
-                            "service": "decode",
-                            "endpoint": session.api_endpoint,
-                            "status_code": response.status_code,
-                            "body": decoded_body,
-                        }
-                    }
-                )
-                yield b"data: [DONE]\n\n"
-                return
-
-            # D 已经被扣除了 P 的首 token budget；其 chunk 可原样转发。
-            async for chunk in response.aiter_raw():
-                if chunk:
-                    yield chunk
-    except httpx.RequestError as exc:
-        yield _encode_sse_payload(
-            {
-                "error": {
-                    "service": "decode",
-                    "endpoint": session.api_endpoint,
-                    "error": str(exc),
-                }
-            }
-        )
-        yield b"data: [DONE]\n\n"
 
 
 async def _forward_upstream_stream(
@@ -1289,82 +920,63 @@ async def _forward_normal_request(
     )
 
 
-async def _stream_normal_pd_completion(
-    decode_client_info: dict[str, Any],
+def _build_prefill_ready_event(
     request_id: str,
+    model: str | None,
     prefill_response: dict[str, Any],
-    prefill_choice: dict[str, Any],
-    decode_request: dict[str, Any],
-    finish_without_decode: bool,
-) -> AsyncIterator[bytes]:
-    """先发送普通 PD 的 P 首 token，再透明转发 D 的剩余生成。
-
-    P 的首 token 已在 handler 中同步完成，因此这个 generator 的第一个
-    frame 就是普通 PD 的真实 TTFT。D 请求被放在首 frame 之后，避免其连接
-    建立时间掩盖 P 的首 token 时延。
+) -> dict[str, Any]:
+    """构造 P 首 token 就绪控制事件；不携带回答或占用生成预算。
 
     Args:
-        decode_client_info: 绑定的 D 节点 HTTP client。
-        request_id: 同一 P/D 生命周期使用的请求标识。
-        prefill_response: P 节点的单 token completions 响应。
-        prefill_choice: P 响应中已校验的唯一 choice。
-        decode_request: 已追加 P 首 token 和 KV transfer 参数的 D 请求。
-        finish_without_decode: P 首 token 是否已经满足原始停止条件。
+        request_id: 业务请求标识。
+        model: 客户端请求的模型名称。
+        prefill_response: P 完成响应，供透传 probe 统计和 padding 清单。
 
-    Yields:
-        OpenAI completions 兼容的 SSE bytes。
+    Returns:
+        choices 为空的控制事件，可用于 P-only 或完整 PD 的 SSE。
     """
-    yield _encode_sse_payload(
-        _build_normal_pd_prefill_stream_chunk(
-            prefill_response,
-            prefill_choice,
-            is_final_chunk=finish_without_decode,
-        )
+    return _attach_prompt_stream_metadata(
+        {
+            "id": f"cmpl-{request_id}",
+            "object": "prefill_ready",
+            "event": "prefill_ready",
+            "measurement_scope": "p_side_ttft",
+            "created": int(time.time()),
+            "model": model,
+            "choices": [],
+        },
+        prefill_response,
     )
-    if finish_without_decode:
-        yield b"data: [DONE]\n\n"
-        return
 
+
+async def _stream_pd_completion(
+    decode_client_info: dict[str, Any],
+    api_endpoint: str,
+    request_id: str,
+    decode_request: dict[str, Any],
+    ready_event: dict[str, Any],
+) -> AsyncIterator[bytes]:
+    """先通知 P 已完成，再转发 D 的完整回答；D 错误保留为 SSE 错误。"""
+    yield _encode_sse_payload(ready_event)
     try:
         async with decode_client_info["client"].stream(
             "POST",
-            "/completions",
+            api_endpoint,
             json=decode_request,
             headers=_authorization_headers(request_id),
         ) as response:
             if response.is_error:
-                error_body = await response.aread()
-                try:
-                    decoded_body: Any = json.loads(error_body)
-                except (TypeError, ValueError):
-                    decoded_body = error_body.decode("utf-8", errors="replace")
+                await response.aread()
                 yield _encode_sse_payload(
-                    {
-                        "error": {
-                            "service": "decode",
-                            "endpoint": "/completions",
-                            "status_code": response.status_code,
-                            "body": decoded_body,
-                        }
-                    }
+                    {"error": _format_upstream_error("decode", api_endpoint, response)}
                 )
                 yield b"data: [DONE]\n\n"
                 return
-
-            # D 的 budget 已扣除 P 首 token，可直接转发余下 SSE frame。
             async for chunk in response.aiter_raw():
                 if chunk:
                     yield chunk
     except httpx.RequestError as exc:
-        yield _encode_sse_payload(
-            {
-                "error": {
-                    "service": "decode",
-                    "endpoint": "/completions",
-                    "error": str(exc),
-                }
-            }
-        )
+        yield _encode_sse_payload({"error": {"service": "decode", "message": str(exc)}})
         yield b"data: [DONE]\n\n"
 
 
@@ -1373,21 +985,7 @@ async def _handle_normal_pd_completions(
     *,
     ttft_only: bool,
 ) -> StreamingResponse | JSONResponse | Response:
-    """执行标准普通请求的 P→D 分离，或仅返回 P 首 token。
-
-    ttft_only=False 是完整 PD 链路：P 先为完整 prompt 做 prefill 并采样一个
-    token，proxy 再把 P 的 KV transfer 参数和精确 token view 交给 D。
-    ttft_only=True 只执行前半段，用于与 prompt-stream 的 finish_ttft 口径
-    一致地测量 P 首 token。
-
-    Args:
-        request: 客户端发给 normal completions 路由的 OpenAI 请求。
-        ttft_only: 是否在 P 返回首 token 后立即结束，不启动 D。
-
-    Returns:
-        流式请求返回 P 首 token 加可选 D 后续 token 的 SSE；非流式完整请求
-        返回合并后的 JSON；TTFT-only 始终返回 P 首 token 的 SSE。
-    """
+    """执行普通 PD；TTFT-only 返回 P 就绪事件，完整请求由 D 返回全部回答。"""
     req_data = await request.json()
     request_id = req_data.get("request_id")
     if not isinstance(request_id, str) or not request_id:
@@ -1411,86 +1009,32 @@ async def _handle_normal_pd_completions(
         request_id,
         service_name="prefill",
     )
-    prefill_choice = _get_normal_pd_prefill_choice(prefill_response)
-    num_prefill_output_tokens = len(prefill_choice["token_ids"])
-
-    # 专用 TTFT 路由绝不构造或发送 D 请求。返回完整响应体而非异步 generator，
-    # 与 prompt_stream/finish_ttft 一样避免 headers 已发送后 body 被取消。
+    _get_normal_pd_prefill_choice(prefill_response)
+    ready_event = _build_prefill_ready_event(
+        request_id, req_data.get("model"), prefill_response
+    )
     if ttft_only:
-        sse_body = (
-            _encode_sse_payload(
-                _build_normal_pd_prefill_stream_chunk(
-                    prefill_response,
-                    prefill_choice,
-                    is_final_chunk=True,
-                )
-            )
-            + b"data: [DONE]\n\n"
-        )
-        logger.info(
-            "Proxy normal PD TTFT-only completed: request_id=%s "
-            "prompt_tokens=%s output_tokens=%s kv_transfer_enabled=%s",
-            request_id,
-            len(prefill_choice["prompt_token_ids"]),
-            num_prefill_output_tokens,
-            False,
-        )
+        # P-only 从创建时即禁用 KV producer，完成后不产生 D 生命周期。
         return Response(
-            content=sse_body,
+            content=_encode_sse_payload(ready_event) + b"data: [DONE]\n\n",
             media_type="text/event-stream",
-            headers={
-                "Cache-Control": "no-cache",
-                "X-Accel-Buffering": "no",
-            },
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
 
-    decode_request, prefill_choice, num_prefill_output_tokens = (
-        _build_normal_pd_decode_request(req_data, prefill_response)
-    )
-    finish_without_decode = _normal_pd_finish_without_decode(
-        decode_request,
-        prefill_choice,
-        num_prefill_output_tokens,
-    )
-    logger.info(
-        "Proxy normal PD request: request_id=%s prompt_tokens=%s "
-        "decode_prompt_tokens=%s remote_num_tokens=%s "
-        "num_prefill_output_tokens=%s disable_kv_transfer=%s stream=%s",
-        request_id,
-        len(prefill_choice["prompt_token_ids"]),
-        len(decode_request["prompt"]),
-        (
-            decode_request.get("kv_transfer_params", {}).get("remote_num_tokens")
-            if isinstance(decode_request.get("kv_transfer_params"), dict)
-            else None
-        ),
-        num_prefill_output_tokens,
-        global_args.disable_kv_transfer,
-        bool(decode_request.get("stream", False)),
-    )
-
+    decode_request = _build_normal_pd_decode_request(req_data, prefill_response)
+    decode_client_info = get_next_client(request.app, "decode")
     if decode_request.get("stream", False):
         return StreamingResponse(
-            _stream_normal_pd_completion(
-                decode_client_info=get_next_client(request.app, "decode"),
-                request_id=request_id,
-                prefill_response=prefill_response,
-                prefill_choice=prefill_choice,
-                decode_request=decode_request,
-                finish_without_decode=finish_without_decode,
+            _stream_pd_completion(
+                decode_client_info,
+                "/completions",
+                request_id,
+                decode_request,
+                ready_event,
             ),
             media_type="text/event-stream",
-            headers={
-                "Cache-Control": "no-cache",
-                "X-Accel-Buffering": "no",
-            },
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
-
-    if finish_without_decode:
-        # P 按原始 max_tokens=1 完成时，它自己的 JSON 响应就是最终结果。
-        return JSONResponse(content=prefill_response)
-
-    decode_client_info = get_next_client(request.app, "decode")
     decode_response = await _post_json(
         decode_client_info,
         "/completions",
@@ -1498,13 +1042,7 @@ async def _handle_normal_pd_completions(
         request_id,
         service_name="decode",
     )
-    return JSONResponse(
-        content=_merge_normal_pd_prefill_output(
-            decode_response,
-            prefill_choice,
-            num_prefill_output_tokens,
-        )
-    )
+    return JSONResponse(content=decode_response)
 
 
 @app.post("/v1/completions", response_model=None)
@@ -1519,7 +1057,7 @@ async def forward_normal_completions(
 async def forward_normal_completions_ttft(
     request: Request,
 ) -> Response:
-    """只执行普通 PD 的 P 侧首 token，用于 TTFT 实验。"""
+    """只执行普通 PD 的 P 侧采样，用完成通知测量 P 侧 TTFT。"""
     response = await _handle_normal_pd_completions(request, ttft_only=True)
     assert isinstance(response, Response)
     return response
@@ -1696,87 +1234,33 @@ async def finish_prompt_stream(request: Request):
             ),
         )
 
-    num_prefill_output_tokens = 0
     if not global_args.disable_kv_transfer:
-        num_prefill_output_tokens = _append_prefill_output_token_ids(
-            session,
-            prefill_response,
-        )
-        if num_prefill_output_tokens > 1:
-            raise HTTPException(
-                status_code=502,
-                detail=(
-                    "P node returned more than one prefill output token: "
-                    f"{num_prefill_output_tokens}."
-                ),
-            )
-        _validate_prompt_stream_transfer(
-            session,
-            prefill_response,
-            num_prefill_output_tokens,
-        )
-
+        _validate_prompt_stream_transfer(session, prefill_response)
     decode_request = dict(session.base_request)
-    finish_without_decode = (
-        not global_args.disable_kv_transfer
-        and _should_finish_without_decode(
-            decode_request,
-            prefill_response,
-            num_prefill_output_tokens,
-        )
-    )
-    _shrink_decode_max_tokens(decode_request, num_prefill_output_tokens)
     _apply_decode_prompt_to_request(session, decode_request)
     if not global_args.disable_kv_transfer:
         decode_request["kv_transfer_params"] = prefill_response["kv_transfer_params"]
-    prompt = decode_request.get("prompt")
-    prompt_len = len(prompt) if isinstance(prompt, list) else None
-    kv_transfer_params = decode_request.get("kv_transfer_params") or {}
-    logger.info(
-        "Proxy finish decode request: request_id=%s prompt_token_len=%s "
-        "remote_num_tokens=%s remote_block_counts=%s "
-        "num_prefill_output_tokens=%s disable_kv_transfer=%s stream=%s",
-        session.request_id,
-        prompt_len,
-        kv_transfer_params.get("remote_num_tokens"),
-        [len(group) for group in kv_transfer_params.get("remote_block_ids", [])],
-        num_prefill_output_tokens,
-        global_args.disable_kv_transfer,
-        bool(decode_request.get("stream", False)),
-    )
-
-    if decode_request.get("stream", False):
-        return StreamingResponse(
-            _stream_decode_completion(
-                session=session,
-                prefill_response=prefill_response,
-                decode_request=decode_request,
-                num_prefill_output_tokens=num_prefill_output_tokens,
-                finish_without_decode=finish_without_decode,
-            ),
-            media_type="text/event-stream",
-            headers={
-                "Cache-Control": "no-cache",
-                "X-Accel-Buffering": "no",
-            },
-        )
-
-    if finish_without_decode:
-        response_json = _build_prefill_only_response(session, prefill_response)
-        return JSONResponse(content=response_json)
-
-    # `/finish` 只能作用于完整 P/D 会话；P-only TTFT 会话必须调用
-    # `/finish_ttft`，否则不能在没有 D client 的情况下继续 decode。
     decode_client_info = session.decode_client_info
     if decode_client_info is None:
         raise HTTPException(
-            status_code=409,
-            detail=(
-                "Prompt-stream TTFT-only session must use "
-                "/v1/prompt_stream/finish_ttft."
-            ),
+            status_code=409, detail="P-only sessions must use /finish_ttft."
         )
-
+    if decode_request.get("stream", False):
+        return StreamingResponse(
+            _stream_pd_completion(
+                decode_client_info,
+                session.api_endpoint,
+                session.request_id,
+                decode_request,
+                _build_prefill_ready_event(
+                    session.request_id,
+                    session.base_request.get("model"),
+                    prefill_response,
+                ),
+            ),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
     decode_response = await _post_json(
         decode_client_info,
         session.api_endpoint,
@@ -1784,23 +1268,14 @@ async def finish_prompt_stream(request: Request):
         session.request_id,
         service_name="decode",
     )
-    response_json = _merge_prefill_output(
-        decode_response,
-        prefill_response,
-        num_prefill_output_tokens,
+    return JSONResponse(
+        content=_attach_prompt_stream_metadata(decode_response, prefill_response)
     )
-    return JSONResponse(content=response_json)
 
 
 @app.post("/v1/prompt_stream/finish_ttft")
 async def finish_prompt_stream_ttft(request: Request):
-    """完成 P 节点 prefill，并只返回用于 TTFT 的首 token。
-
-    这个路由用于实验脚本的 ``--ttft-only`` 模式。P 节点 finish 成功后，
-    proxy 不会把 KV transfer 参数交给 D 节点，也不会启动后续 decode。
-    因此客户端在收到首 token 后立即断开 SSE 时，不会留下一个半启动的
-    D 侧 NIXL load 请求。
-    """
+    """完成 P 侧采样并返回 prefill_ready 控制事件，不启动 D。"""
     req_data = await request.json()
     request_id = req_data.get("request_id")
     session = request.app.state.prompt_stream_sessions.get(request_id)
@@ -1838,10 +1313,10 @@ async def finish_prompt_stream_ttft(request: Request):
     # headers 已发出、但 generator 尚未获得调度时，replay 端无限等待 body。
     sse_body = (
         _encode_sse_payload(
-            _build_prefill_stream_chunk(
-                session,
+            _build_prefill_ready_event(
+                session.request_id,
+                session.base_request.get("model"),
                 prefill_response,
-                is_final_chunk=True,
             )
         )
         + b"data: [DONE]\n\n"

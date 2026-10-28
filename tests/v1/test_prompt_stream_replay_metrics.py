@@ -5,17 +5,25 @@
 
 from __future__ import annotations
 
+import asyncio
+import json
 import sys
+from argparse import Namespace
+from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
+import httpx
+
+from research.scripts.replay.common.transport import consume_sse_body
+from research.scripts.replay.token_invalidation.models import InvalidationMetric
+from research.scripts.replay.token_invalidation.replay_common import (
+    validate_measurement,
+)
+
 _REPO_ROOT = Path(__file__).resolve().parents[2]
-_SEGMENTED_REPLAY_DIR = (
-    _REPO_ROOT / "research/scripts/replay/segmented_prefill"
-)
-_COALESCING_REPLAY_DIR = (
-    _REPO_ROOT / "research/scripts/replay/update_coalescing"
-)
+_SEGMENTED_REPLAY_DIR = _REPO_ROOT / "research/scripts/replay/segmented_prefill"
+_COALESCING_REPLAY_DIR = _REPO_ROOT / "research/scripts/replay/update_coalescing"
 sys.path.insert(0, str(_SEGMENTED_REPLAY_DIR))
 sys.path.insert(0, str(_COALESCING_REPLAY_DIR))
 
@@ -184,6 +192,34 @@ def test_schema_v2_accepts_recovery_aware_conservation() -> None:
     assert metric.update_policy_works_cancelled_by_recovery == 1
     assert metric.update_execution_attempts_preempted == 1
     assert metric.update_tokens_scheduled_for_recovery == 5
+
+
+def test_invalidation_accepts_ready_without_answer_token() -> None:
+    """新的 P-only 控制事件仍能产出有效失效统计，不依赖旧版输出 token。"""
+    metric = InvalidationMetric(
+        **asdict(_make_metric()), outbound_update_events=2, changed_update_events=2
+    )
+    ready = {
+        "event": "prefill_ready",
+        "choices": [],
+        "prompt_stream_stats": _valid_recovery_stats_v2(),
+    }
+    response = httpx.Response(
+        200,
+        headers={"content-type": "text/event-stream"},
+        content=f"data: {json.dumps(ready)}\n\ndata: [DONE]\n\n",
+    )
+    measured = asyncio.run(consume_sse_body(response, 0, False, True))
+    args = Namespace(
+        expected_coalescing="disabled",
+        p_node_coalescing_config_json=None,
+        expected_masked_padding="disabled",
+    )
+    validate_measurement(metric, measured, args)
+    assert measured.completion_tokens == 0
+    assert metric.formal_result_status == "valid"
+    assert metric.snapshot_invalidated_tokens == 2
+    assert metric.preemption_discarded_tokens == 7
 
 
 def test_schema_v2_rejects_inconsistent_compatibility_alias() -> None:

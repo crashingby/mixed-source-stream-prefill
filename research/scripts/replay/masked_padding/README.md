@@ -203,7 +203,7 @@ MASKED_PADDING=1
 | `MAX_REQUESTS` | `512` | 每个 QPS、phase、repeat 的逻辑请求数 |
 | `MAX_CONCURRENCY` | `32` | replay 客户端允许的最大在途逻辑请求数；QPS 为 `0` 时脚本强制为 `1` |
 | `NUM_REPEATS` | `3` | 每个配置的正式重复次数 |
-| `MAX_TOKENS` | `128` | `full` 阶段总输出上限；P 首 token 计入其中 |
+| `MAX_TOKENS` | `128` | `full` 阶段由 D 生成的总输出上限；P 内部采样不计入回答 |
 | `RUN_TTFT_SUITE` | `1` | 是否运行 P-only TTFT 阶段 |
 | `RUN_FULL_SUITE` | `1` | 是否运行完整 P→D 阶段 |
 | `RUN_WARMUP` | `1` | 是否先运行不进入正式汇总的完整链路 warmup |

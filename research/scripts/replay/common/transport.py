@@ -48,7 +48,7 @@ def normalize_v1_url(base_url: str, endpoint: str) -> str:
 def prompt_stream_finish_endpoint(args: argparse.Namespace) -> str:
     """返回当前 prompt-stream replay 应使用的 finish 路径。
 
-    TTFT-only 实验只需要 P 节点 finish 后的首 token。此时走 proxy 的
+    TTFT-only 实验以 P 节点的 prefill_ready 控制事件为计时终点。此时走 proxy 的
     `/v1/prompt_stream/finish_ttft`，避免 proxy 再启动 D 节点 decode 并触发
     不必要的 KV transfer。完整生成或非 TTFT-only 调试仍走原 `/finish`。
     """
@@ -131,19 +131,19 @@ async def consume_sse_body(
     save_payloads: bool,
     ttft_only: bool,
 ) -> SseMeasurement:
-    """读取一个 OpenAI SSE 响应并定位第一个生成 token。
+    """读取 SSE 并分别记录 P 完成通知和首个回答 token。
 
     Args:
         response: 已打开且 HTTP status 成功的流式 HTTP 响应。
         first_token_start_time: TTFT 的起点；stream 模式为 finish 发送时刻。
         save_payloads: 是否把每个 JSON payload 保存到结果目录。
-        ttft_only: 首 token 出现后是否立即停止消费 SSE body。
+        ttft_only: 收到 P 就绪通知即完成计时；兼容旧服务的首 token 响应。
 
     Returns:
-        首 token、结束时间和输出规模统计。
+        P 完成通知、首 token、结束时间和输出规模统计。
 
     Raises:
-        ReplayHttpError: 上游返回非 SSE、错误 payload 或无有效首 token。
+        ReplayHttpError: 上游返回非 SSE、错误 payload 或没有本模式的计时终点。
     """
     content_type = response.headers.get("content-type", "")
     if "text/event-stream" not in content_type:
@@ -154,6 +154,7 @@ async def consume_sse_body(
         )
 
     first_token_time: float | None = None
+    prefill_ready_time: float | None = None
     first_token_origin: str | None = None
     completion_chars = 0
     completion_chunks = 0
@@ -211,6 +212,13 @@ async def consume_sse_body(
                 )
             masked_padding_manifest = normalized_padding
 
+        if payload.get("event") == "prefill_ready":
+            prefill_ready_time = time.perf_counter()
+            if ttft_only:
+                # 控制通知完成 P 侧 TTFT 测量，但没有生成任何回答 token。
+                break
+            continue
+
         choices = payload.get("choices")
         if not isinstance(choices, list):
             continue
@@ -221,9 +229,7 @@ async def consume_sse_body(
                 token_arrival_time = time.perf_counter()
                 if first_token_time is None:
                     first_token_time = token_arrival_time
-                    first_token_origin = payload.get("token_source") or (
-                        "prefill" if "token_ids" in choice else "decode"
-                    )
+                    first_token_origin = payload.get("token_source") or "decode"
                 completion_chunks += 1
                 completion_chars += len(chunk_text(choice))
                 raw_token_ids = choice.get("token_ids")
@@ -258,14 +264,16 @@ async def consume_sse_body(
                         payloads=tuple(payloads),
                         prompt_stream_stats=prompt_stream_stats,
                         masked_padding_manifest=masked_padding_manifest,
+                        prefill_ready_time=prefill_ready_time,
                     )
 
     completed_time = time.perf_counter()
-    if first_token_time is None:
+    if first_token_time is None and not (ttft_only and prefill_ready_time is not None):
         raise ReplayHttpError("SSE response ended before emitting a completion token.")
-    if first_token_time < first_token_start_time:
-        raise AssertionError("First token time cannot precede TTFT start time.")
-    assert last_token_time is not None
+    measured_time = (
+        first_token_time if first_token_time is not None else prefill_ready_time
+    )
+    assert measured_time is not None and measured_time >= first_token_start_time
     return SseMeasurement(
         first_token_time=first_token_time,
         first_token_origin=first_token_origin,
@@ -278,6 +286,7 @@ async def consume_sse_body(
         payloads=tuple(payloads),
         prompt_stream_stats=prompt_stream_stats,
         masked_padding_manifest=masked_padding_manifest,
+        prefill_ready_time=prefill_ready_time,
     )
 
 

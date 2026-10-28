@@ -182,7 +182,7 @@ def _complete(
 
 
 def _manifest(producer: StableKVPushController) -> dict[str, Any]:
-    """构造包含中间 padding 与 P 首 token 计数的最终严格 manifest。"""
+    """构造包含中间 padding 与零交接输出计数的最终严格 manifest。"""
     return {
         "stable_kv_session_id": "session",
         "stable_kv_generation": 0,
@@ -198,14 +198,14 @@ def _manifest(producer: StableKVPushController) -> dict[str, Any]:
         "prompt_stream_remote_block_counts": [3],
         "prompt_stream_physical_prompt_len": 10,
         "prompt_stream_logical_prompt_len": 8,
-        "prompt_stream_prefill_output_tokens": 1,
+        "prompt_stream_prefill_output_tokens": 0,
         "prompt_stream_masked_padding": {"version": 1, "start": 6, "end": 8},
     }
 
 
 @pytest.mark.parametrize("early_push", [False, True])
 def test_incremental_handoff_adopts_exact_same_blocks(early_push: bool) -> None:
-    """最终屏障前不能生成；收养后保留地址与引用，并只差 P 首 token 待算。"""
+    """最终屏障前不能生成；收养后保留地址与引用，并重算最后一个 prompt token。"""
     producer, consumer = _pair(early_push)
     groups = producer.manager.reserve_stable_kv_blocks("source", 10).blocks
     if early_push:
@@ -236,7 +236,7 @@ def test_incremental_handoff_adopts_exact_same_blocks(early_push: bool) -> None:
     free_before = consumer.manager.block_pool.get_num_free_blocks()
     request = Request(
         request_id="request-D",
-        prompt_token_ids=list(range(10)) + [99],
+        prompt_token_ids=list(range(10)),
         sampling_params=SamplingParams(
             max_tokens=3, extra_args={"kv_transfer_params": dict(params)}
         ),
@@ -248,8 +248,8 @@ def test_incremental_handoff_adopts_exact_same_blocks(early_push: bool) -> None:
         a is b for left, right in zip(before, after) for a, b in zip(left, right)
     )
     assert consumer.manager.block_pool.get_num_free_blocks() == free_before
-    assert request.num_computed_tokens == 10
-    assert request.num_tokens == 11
+    assert request.num_computed_tokens == 9
+    assert request.num_tokens == 10
     assert request.skip_reading_prefix_cache
     assert request.prompt_stream_masked_padding
     assert consumer.sessions["session"].state == "adopted"
@@ -301,7 +301,7 @@ def test_adoption_rejects_changed_or_missing_final_manifest_fields(
         incoming_params[field_name] = replacement
     request = Request(
         request_id="invalid-request-D",
-        prompt_token_ids=list(range(10)) + [99],
+        prompt_token_ids=list(range(10)),
         sampling_params=SamplingParams(
             max_tokens=3, extra_args={"kv_transfer_params": incoming_params}
         ),
@@ -467,7 +467,7 @@ def test_old_generation_completion_does_not_unlock_final_barrier() -> None:
     [
         ("prompt_stream_exact_transfer", False),
         ("prompt_stream_physical_prompt_len", 9),
-        ("prompt_stream_prefill_output_tokens", 0),
+        ("prompt_stream_prefill_output_tokens", 1),
         ("remote_num_tokens", 11),
         ("prompt_stream_remote_block_counts", [2]),
         ("remote_block_ids", [[1, 1, 2]]),

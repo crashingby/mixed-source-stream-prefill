@@ -5,7 +5,7 @@
 import math
 import time
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 from vllm.logger import init_logger
 from vllm.v1.engine.prompt_stream import parse_prompt_stream_padding_range
@@ -17,6 +17,9 @@ from vllm.v1.request import (
 )
 
 if TYPE_CHECKING:
+    from vllm.distributed.kv_transfer.kv_connector.v1.nixl.connector import (
+        NixlPushConnector,
+    )
     from vllm.v1.core.kv_cache_utils import KVCacheBlock
     from vllm.v1.core.sched.output import SchedulerOutput
     from vllm.v1.core.sched.scheduler import Scheduler
@@ -90,7 +93,7 @@ class StableKVPushController:
     def __init__(self, scheduler: "Scheduler") -> None:
         self.scheduler = scheduler
         self.manager = scheduler.kv_cache_manager
-        self.connector = scheduler.connector
+        self.connector = cast("NixlPushConnector", scheduler.connector)
         config = scheduler.vllm_config
         transfer = config.kv_transfer_config
         assert transfer is not None and self.connector is not None
@@ -272,6 +275,7 @@ class StableKVPushController:
             view = request.prompt_stream_execution_view
             if view is None or view.phase != PromptStreamExecutionPhase.PREFIX_APPEND:
                 continue
+            assert request.prompt_stream is not None  # PREFIX_APPEND 的请求状态已建立。
             work = request.prompt_stream.active_work_item
             if work is None:
                 continue
@@ -298,6 +302,7 @@ class StableKVPushController:
         if not session.early_push or session.state != "receiving":
             return
         if completed is None:
+            assert request.prompt_stream is not None
             completed = request.prompt_stream.prefix_append_committed_logical_len
         end = completed // self.block_size
         if end <= session.offered_blocks:
@@ -396,7 +401,7 @@ class StableKVPushController:
             not isinstance(tokens, list)
             or not tokens
             or not all(type(t) is int and t >= 0 for t in tokens)
-            or len(tokens) + 1 > self.scheduler.max_model_len
+            or len(tokens) > self.scheduler.max_model_len
             or not isinstance(params, dict)
         ):
             raise ValueError("Invalid stable KV final token view")
@@ -411,7 +416,7 @@ class StableKVPushController:
             or params.get("prompt_stream_exact_transfer") is not True
             or params.get("prompt_stream_physical_prompt_len") != len(tokens)
             or type(params.get("prompt_stream_prefill_output_tokens")) is not int
-            or params.get("prompt_stream_prefill_output_tokens") != 1
+            or params.get("prompt_stream_prefill_output_tokens") != 0
             or params.get("prompt_stream_remote_block_sizes")
             != [self.block_size] * self.num_groups
             or params.get("prompt_stream_remote_block_counts")
@@ -427,7 +432,7 @@ class StableKVPushController:
             )
         ):
             raise ValueError("Stable KV final manifest does not match session/layout")
-        padding = parse_prompt_stream_padding_range(params, len(tokens) + 1)
+        padding = parse_prompt_stream_padding_range(params, len(tokens))
         if (
             padding is not None
             and not self.scheduler.scheduler_config.prompt_stream_masked_padding
@@ -450,6 +455,7 @@ class StableKVPushController:
     def _check_ready(self, session: StableKVSession) -> None:
         if session.state != "finalizing" or session.producer:
             return
+        assert session.final_tokens is not None and session.final_params is not None
         expected = (len(session.final_tokens) + self.block_size - 1) // self.block_size
         cursor = 0
         for span in sorted(session.ranges.values(), key=lambda r: r.start_block):
@@ -472,7 +478,7 @@ class StableKVPushController:
             self._abort(session, "Received range exceeds final manifest")
 
     def adopt(self, request: "Request") -> None:
-        """D 正常 Request 创建时收养已接收 blocks，首 token 留给本地 forward。"""
+        """D 收养完整 prompt KV，重算最后一个 prompt token 后开始生成。"""
         params = request.kv_transfer_params or {}
         sid = params.get("stable_kv_session_id")
         if sid is None:
@@ -480,11 +486,12 @@ class StableKVPushController:
         session = self._session(sid)
         if session.producer or session.state != "ready":
             raise ValueError(f"Stable KV session is not ready for adoption: {sid}")
+        assert session.final_tokens is not None and session.final_params is not None
         tokens = request.prompt_token_ids
         if (
             tokens is None
-            or len(tokens) != len(session.final_tokens) + 1
-            or tokens[:-1] != session.final_tokens
+            or not tokens
+            or tokens != session.final_tokens
             # 不允许收养时去掉 exact-transfer 或改写有效长度等约束，
             # 否则后续普通 Request 可能误把接收的近似 KV 发布到 prefix cache。
             or any(
@@ -495,7 +502,8 @@ class StableKVPushController:
         ):
             raise ValueError("D prompt or KV manifest differs from finalized view")
         self.manager.adopt_stable_kv_blocks(session.reservation_id, request)
-        request.num_computed_tokens = len(session.final_tokens)
+        # 完整命中仍需重算最后一个 prompt token，以获得采样 logits。
+        request.num_computed_tokens = len(session.final_tokens) - 1
         params["do_remote_prefill"] = False
         params["do_remote_decode"] = False
         session.adopted_request_id = request.request_id
@@ -602,7 +610,7 @@ class StableKVPushController:
         """在主线程应用来自 NIXL worker 的区间与控制事件。"""
         kind = event.get("kind")
         payload = event.get("payload", {}) if kind == "control" else event
-        session = self.sessions.get(payload.get("session_id"))
+        session = self.sessions.get(payload.get("session_id", ""))
         if session is None or payload.get("generation") != session.generation:
             return  # 关闭后的迟到消息不允许重建同名会话。
         session.last_activity = time.monotonic()
@@ -673,7 +681,7 @@ class StableKVPushController:
 
     def _record_stats(self, session: StableKVSession, payload: dict[str, Any]) -> None:
         """按真实 WRITE handle 完成耗时统计，不混入 HTTP/目标分配等待。"""
-        span = session.ranges.get(payload.get("range_id"))
+        span = session.ranges.get(payload.get("range_id", ""))
         if span is None or span.stats_recorded:
             return
         span.stats_recorded = True
@@ -707,9 +715,10 @@ class StableKVPushController:
         )
         # 正常生成路径的 blocks 由正常 Request 释放，不能由 reservation 再释放。
         rid = session.request_id if session.producer else session.adopted_request_id
-        request = self.scheduler.requests.get(rid)
-        if request is not None and not request.is_finished():
-            self.scheduler.finish_requests(rid, RequestStatus.FINISHED_ABORTED)
+        if rid is not None:
+            request = self.scheduler.requests.get(rid)
+            if request is not None and not request.is_finished():
+                self.scheduler.finish_requests(rid, RequestStatus.FINISHED_ABORTED)
 
     def invalidate_request(self, request: "Request") -> None:
         """首版遇到 P 抢占显式终止会话，防止旧地址写入新代次布局。"""
@@ -729,7 +738,7 @@ class StableKVPushController:
                 self._apply_event(event)
             except (KeyError, TypeError, ValueError) as exc:
                 payload = event.get("payload", event)
-                session = self.sessions.get(payload.get("session_id"))
+                session = self.sessions.get(payload.get("session_id", ""))
                 if session is not None:
                     self._abort(session, f"Invalid stable KV protocol event: {exc}")
                 else:

@@ -29,7 +29,7 @@ async def _exercise_proxy(
         "prompt_stream_logical_prompt_len": 23,
         "prompt_stream_remote_block_counts": [3],
         "prompt_stream_remote_block_sizes": [16],
-        "prompt_stream_prefill_output_tokens": 1,
+        "prompt_stream_prefill_output_tokens": 0,
         "prompt_stream_masked_padding": {"version": 1, "start": 19, "end": 32},
     }
 
@@ -70,6 +70,7 @@ async def _exercise_proxy(
         body = json.loads(request.content)
         path = request.url.path
         calls.append(("D", path, body))
+        result: dict[str, Any]
         if path.endswith("/reserve"):
             assert body["early_push"] is early_push
             result = {"peer": {"engine_id": "D", "host": "g2c9", "port": 5601}}
@@ -88,8 +89,8 @@ async def _exercise_proxy(
                 "metrics": {"received_blocks_at_finalize": 1 if early_push else 0},
             }
         elif path.endswith("/completions"):
-            assert body["prompt"] == physical_tokens + [99]
-            assert body["max_tokens"] == 3
+            assert body["prompt"] == physical_tokens
+            assert body["max_tokens"] == 4
             assert body["stream"] is True
             assert body["return_token_ids"] is True
             assert body["kv_transfer_params"]["do_remote_prefill"] is False
@@ -110,9 +111,9 @@ async def _exercise_proxy(
                         }
                     ],
                     "usage": {
-                        "prompt_tokens": 37,
+                        "prompt_tokens": 36,
                         "completion_tokens": 3,
-                        "total_tokens": 40,
+                        "total_tokens": 39,
                     },
                 },
             ]
@@ -176,7 +177,7 @@ async def _exercise_proxy(
 def test_stable_proxy_preserves_handoff_and_metrics(
     early_push: bool, stream: bool
 ) -> None:
-    """验证两种传输模式均保留 P token、padding 和最终 D 指标。"""
+    """验证两种传输模式均透传 P 完成事件、padding 和最终 D 指标。"""
     response, calls = asyncio.run(_exercise_proxy(early_push=early_push, stream=stream))
     assert response.status_code == 200, response.text
     if stream:
@@ -185,16 +186,16 @@ def test_stable_proxy_preserves_handoff_and_metrics(
             for line in response.text.splitlines()
             if line.startswith("data:") and line != "data: [DONE]"
         ]
-        assert chunks[0]["token_source"] == "prefill"
+        assert chunks[0]["event"] == "prefill_ready"
         assert chunks[1]["token_source"] == "decode"
         assert chunks[1]["choices"][0]["token_ids"] == [77]
         metrics = chunks[-1]["stable_kv_metrics"]
     else:
         payload = response.json()
-        assert payload["choices"][0]["token_ids"] == [99, 77, 78, 79]
-        assert payload["choices"][0]["text"] == "Panswer"
+        assert payload["choices"][0]["token_ids"] == [77, 78, 79]
+        assert payload["choices"][0]["text"] == "answer"
         assert payload["usage"]["prompt_tokens"] == 36
-        assert payload["usage"]["completion_tokens"] == 4
+        assert payload["usage"]["completion_tokens"] == 3
         metrics = payload["stable_kv_metrics"]
     assert metrics["early_stable_kv_push"] is early_push
     assert metrics["early_transferred_blocks"] == (1 if early_push else 0)
@@ -212,12 +213,12 @@ def test_stable_proxy_preserves_handoff_and_metrics(
 
 
 def test_stable_proxy_never_decodes_failed_transfer() -> None:
-    """最终接收失败仍可交付 P 首 token，但不得启动 D 生成。"""
+    """最终接收失败仍可交付 P 完成通知，但不得启动 D 生成。"""
     response, calls = asyncio.run(
         _exercise_proxy(early_push=True, stream=True, fail_transfer=True)
     )
     assert response.status_code == 200
-    assert '"token_source": "prefill"' in response.text
+    assert '"event": "prefill_ready"' in response.text
     assert '"error"' in response.text
     assert all(not path.endswith("/completions") for _, path, _ in calls)
     assert any(side == "D" and path.endswith("/abort") for side, path, _ in calls)

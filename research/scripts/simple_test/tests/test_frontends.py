@@ -319,6 +319,8 @@ def test_start_flag_reaches_engine(special_tokens: bool) -> None:
     request = SimpleNamespace(
         request_id=None,
         prompt="rendered",
+        probe_query=None,
+        probe_keep_ratio=None,
         add_special_tokens=special_tokens,
         get_sampling_params_dict=lambda: {},
     )

@@ -73,8 +73,8 @@ def _make_stream_start_payload(
 ) -> dict[str, Any]:
     """构造 proxy `/v1/prompt_stream/start` 请求。
 
-    ``stream=true`` 要求 proxy 使用新增 SSE finish 分支：P 的首 token 会在
-    D decode 完成前立即送回，因此能够精确测量 finish-to-first-token。
+    ``stream=true`` 要求 proxy 使用 SSE：先通知 P 已完成，再发送 D 回答。
+    P-only 和完整生成分别以完成通知、D 首 token 作为计时终点。
     """
     payload = dict(sample.start_request)
     payload.update(
@@ -305,10 +305,10 @@ async def _replay_stream_sample(
         metric.request_error_stage = None
 
         metric.finish_to_first_token_ms = (
-            sse_measurement.first_token_time - finish_sent_time
+            sse_measurement.ttft_time - finish_sent_time
         ) * 1000
         metric.request_to_first_token_ms = (
-            sse_measurement.first_token_time - request_start_time
+            sse_measurement.ttft_time - request_start_time
         ) * 1000
         metric.finish_to_done_ms = (
             sse_measurement.completed_time - finish_sent_time
@@ -316,7 +316,7 @@ async def _replay_stream_sample(
         metric.request_to_done_ms = (
             sse_measurement.completed_time - request_start_time
         ) * 1000
-        metric.ttft_origin = sse_measurement.first_token_origin
+        metric.ttft_origin = sse_measurement.ttft_origin
         apply_completion_measurement(metric, sse_measurement, finish_sent_time)
         apply_prompt_stream_stats(
             metric,

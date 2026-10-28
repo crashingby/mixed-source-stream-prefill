@@ -1,8 +1,10 @@
 # 稳定 KV 提前 Push 实验
 
+当前 P/D 交接由 D 生成全部回答；P-only 使用 `prefill_ready` 控制事件测量 P 侧 TTFT。协议、兼容字段与验证命令见 [P/D 交接说明](../../server/PD-Handoff.md)。
+
 本目录比较两种完整 P/D 生成流程：**提前 Push 已完成的稳定 Prefix+Append 整块**，以及 **P finish 后统一 Push 全部 KV**。两组使用相同 `NixlPushConnector`、相同接收会话协议、相同模型和 Masked Padding，只改变请求里的 `early_stable_kv_push`。
 
-本实验不能使用 `--ttft-only`。P 首 token 已经能够由 proxy 提前返回，本功能主要缩短它之后 D 开始续写的交接间隔。设计依据见 [Early-Stable-KV-Push.md](../../../Early-Stable-KV-Push.md)。
+本实验不能使用 `--ttft-only`。Proxy 先返回 P 完成通知，本功能主要缩短随后 D 返回首个回答 token 的交接间隔。设计依据见 [Early-Stable-KV-Push.md](../../../Early-Stable-KV-Push.md)。
 
 本轮部署、固定变量和正式结果记录见 [EXPERIMENTS.md](EXPERIMENTS.md)。
 
@@ -43,7 +45,7 @@ header。`--input-transport token_ids` 用于历史预分词实验复现。
 | [`start_stable_kv_node.sh`](../../server/start_stable_kv_node.sh) | 每个 Slurm task 的实际启动命令；rank 0 是 P，rank 1 是 D。 |
 | [`stable_kv_proxy.py`](../../server/stable_kv_proxy.py) | 独立实验网关；在 g2c14 建立两端会话、转发事件、完成 finalize 和完整输出。 |
 
-数据解析、`apply_chat_template` 以及 Append/Update 的事件发送复用 `segmented_prefill`。完整输出消费与传输计量采用本目录的实现，避免把 P 首 token 当成 D 首 token。
+数据解析、`apply_chat_template` 以及 Append/Update 的事件发送复用 `segmented_prefill`。完整输出消费与传输计量采用本目录的实现，分别记录 P 完成通知和 D 首 token。
 
 ## 本轮部署约束
 
@@ -190,9 +192,7 @@ for mode in finish early; do
 done
 ```
 
-`--max-tokens` 至少为 2，因为 P 消耗第一个输出 token，D 才有机会生成续写。
-即使设为 64，模型也可能在 P 首 token 就输出 EOS；这种请求记录为完整响应，
-但没有 D 首 token，不能用于交接时延比较。
+`--max-tokens=1` 也会执行 D 生成；P 的内部采样结果不消耗回答预算。
 
 ## 指标如何解释
 
@@ -201,8 +201,8 @@ done
 | `p_finish_to_d_first_token_ms` | Proxy 读完 P finish 响应，到 proxy 收到第一个真实 D 输出 token。 | **主要指标**；包含 finalize、剩余传输屏障、D 请求构造/提交、排队和首次本地执行。 |
 | `d_request_to_first_token_ms` | Proxy 提交 D completions，到收到 D 首 token。 | 当前路径在 finalize 后才提交 D，因此主要反映 D 的准入、排队和计算，不应代替上一个指标。 |
 | `finalize_wait_ms` | Proxy 内部 finalize 调用阶段的等待。 | 包含剩余传输、控制轮询和最终就绪检查，不等同于纯网络传输。 |
-| `finish_to_p_first_client_ms` | Replay 发送 finish 到收到 P token。 | 检查提前发送是否影响 P 的 prefill / 首 token。 |
-| `finish_to_d_first_client_ms` | Replay 发送 finish 到收到 D token。 | 用户侧可观察的完整续写启动时间。 |
+| `finish_to_p_first_client_ms` | Replay 发送 finish 到收到 P 完成通知。 | 检查提前发送是否影响 P 侧 TTFT。 |
+| `finish_to_d_first_client_ms` | Replay 发送 finish 到收到 D 首 token。 | 用户侧可观察的首个回答等待时间。 |
 | `final_transfer_ms` | P worker 报告的最终传输批次 NIXL duration 累计值。 | 不包含 proxy 构造和 D 排队；多批重叠时，累计值也不等于端到端等待。 |
 | `early_transferred_bytes` | 归类为提前批次的实际传输字节。 | 表示工作被移到提前通道；不单独证明这些字节全部在 P finish 之前完成。 |
 | `final_transferred_bytes` | 最终批次实际传输字节。 | 直接观察 finish 阶段剩余传输量是否减少。 |
@@ -220,7 +220,7 @@ Proxy 时间差均在同一 proxy 进程用单调时钟计算。NIXL 时长来�
 避免模型下载代理转发这些内部地址。
 
 SSE 会标记 `token_source=prefill/decode`。最终 metadata 帧携带
-`stable_kv_metrics`，replay 一直消费到 `[DONE]`，不在 P 首 token 后关闭连接。
+`stable_kv_metrics`，replay 一直消费到 `[DONE]`，不在 P 完成通知后关闭连接。
 空文本但有 `token_ids` 的帧仍然算输出 token。
 
 `transport_status` 表示是否完整成功，`metrics_status` 表示统计字段和实验开关
@@ -269,7 +269,7 @@ warmup 和背景负载造成的顺序效应。P/D 的四小时默认时限不足
 | `--append-chunk-interval` / `--update-chunk-interval` | `0.5` / `0.2` 秒 | 两个来源内部目标事件间隔。来源并发，同一来源逐次等待 ACK。 |
 | `--append-initial-delay` / `--update-initial-delay` | `0` 秒 | start ACK 后首事件的延迟。 |
 | `--source-finish-delay` | `0` 秒 | 该来源最后一次数据 ACK 后发 source_finished 的延迟。 |
-| `--max-tokens` | `64` | P 与 D 合计输出上限，D 获得扣除 P 首 token 后的余额。 |
+| `--max-tokens` | `64` | D 完整回答的输出上限。 |
 | `--http-timeout` | `120` 秒 | HTTP 各网络阶段的超时。 |
 | `--finish-timeout` | `180` 秒 | 覆盖 finish 提交、等待 headers、完整 SSE 的总期限。 |
 | `--seed` / `--random-seed` | `2026` / `2026` | 分别控制采样和泊松到达序列。 |
@@ -427,10 +427,7 @@ Question；实际提前传输量则包含满足整块要求的模板与 Append�
 跨占比原始时延还受到 Update 长度与重算量变化影响；判断传输优化应优先看
 同占比、同 QPS 的配对降幅，以及实际完成水位和最终传输量，不把不同占比间的
 原始时延差全部归因于提前 Push。
-**客户端真正收到的首 token 来自 P**，不是 D。图中的用户 finish→D 指标是
-客户端从提交 finish 到收到第一个 D 续写 token 的实际间隔，并不等同于常规 TTFT。
-它同时反映 P finish 之前的等待和之后的交接：提前发送可能减少交接却拖慢 P，
-因此必须读取这个完整区间的实际分位数，不能把 P 首 token P95 和交接 P95 相加。
+**当前协议的回答全部来自 D**。历史结果采用 P 首 token 加 D 续写的旧协议，不能直接与新协议的用户 TTFT 混算。
 
 输出 token 一致性也会统计，但不能只凭两次整模型输出相同就证明传输正确：
 两条来源仍存在竞争，传输开销可能改变其相对调度时刻。传输正确性还应核对

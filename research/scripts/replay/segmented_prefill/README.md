@@ -1,5 +1,7 @@
 # 分段流式 Prefill 回放实验
 
+当前 P/D 交接由 D 生成全部回答；P-only 使用 `prefill_ready` 控制事件测量 P 侧 TTFT。协议、兼容字段与验证命令见 [P/D 交接说明](../../server/PD-Handoff.md)。
+
 本目录提供三个相互独立的实验入口。它们读取同一批
 独立的 questions、append_chunks、pipeline_pools 数据，也兼容
 `research/data/mix_source/requests/*.json`，使用不同的 REST 请求链路：
@@ -39,8 +41,8 @@ normal 整段分词与 stream 逐块分词的边界差异保留。历史预分�
 | 类型 | proxy 路径 | 后端 |
 | --- | --- | --- |
 | mixed-source 流式 prefill | `/v1/prompt_stream/start`、`/event`、`/finish`、`/finish_ttft`、`/abort` | P 节点完成流式 prefill；完整生成走 D，TTFT-only 不启动 D |
-| 普通 PD completions | `/v1/completions` | P 对完整 prompt prefill 并生成首 token；D 加载 P 的 KV 后继续 decode |
-| 普通 PD completions TTFT-only | `/v1/completions_ttft` | 只请求 P，P 返回首 token 后立即结束，不创建 D 请求 |
+| 普通 PD completions | `/v1/completions` | P 完成 prefill；D 加载原始 prompt KV 并生成全部回答 |
+| 普通 PD completions TTFT-only | `/v1/completions_ttft` | 只请求 P，收到 P 完成通知后立即结束，不创建 D 请求 |
 | 普通 chat completions | `/v1/chat/completions` | 当前仍直接转发到一个 D 节点 |
 | 普通 Responses API | `/v1/responses` | 当前仍直接转发到一个 D 节点 |
 
@@ -100,7 +102,7 @@ Update 分开暴露给服务端。客户端本地维护两个状态：
 
 这个模式用于衡量“朴素整段 Update”相对于我们分段 KV 管理方案的 TTFT
 差距。开启 `--ttft-only` 时，它从 `/prompt_stream/finish_ttft` 到首个
-SSE token 计 TTFT，不会启动 D 节点。
+SSE 完成通知计 P 侧 TTFT，不会启动 D 节点。
 
 ### 普通整段 prompt
 
@@ -114,12 +116,12 @@ SSE token 计 TTFT，不会启动 D 节点。
 
 1. proxy 强制 P 使用 `stream=false`、`max_tokens=1` 和 `return_token_ids=true`。
 2. P 对完整 prompt 做 prefill，返回一个首 token 和 `kv_transfer_params`。
-3. 完整生成时，proxy 将 P 实际使用的 `prompt_token_ids` 加上 P 首 token 作为 D 的输入，扣除一个生成 budget，并把 KV 参数交给 D。
-4. P 的首 token 先作为 SSE 发给客户端，D 再继续输出剩余 token。
+3. 完整生成时，proxy 将 P 实际使用的 `prompt_token_ids` 和 KV 参数交给 D，保留完整生成预算。
+4. P 的完成通知先作为 SSE 发给客户端，D 再生成全部回答。
 
-开启 `--ttft-only` 时，`replay_normal.py` 改请求 `/v1/completions_ttft`。该路由仍让 P 对同一个完整 prompt 做 prefill 并固定生成一个 token，但在 P 返回后立即发送 `[DONE]`，不会向 D 发任何请求。
+开启 `--ttft-only` 时，`replay_normal.py` 改请求 `/v1/completions_ttft`。该路由仍让 P 对同一个完整 prompt 做 prefill 并内部采样一个 token，但仅向客户端发送 `prefill_ready` 和 `[DONE]`，不会向 D 发任何请求。
 
-因此普通模式的 TTFT 从 normal 请求提交到收到 P 首 token 计量，`ttft_origin` 为 `normal_prefill`。它与另外两种模式一样测量 P 侧产生的首 token；区别只是普通模式必须在该请求开始时一次性 prefill 整个最终 prompt。
+普通模式在 `--ttft-only` 下从 normal 请求提交计时至 `prefill_ready`，`ttft_origin=prefill_ready`。完整生成则以 D 的首个回答 token 为终点。普通模式在请求开始时一次性 prefill 整个最终 prompt。
 
 ## 样本长度控制
 
@@ -307,8 +309,8 @@ QPS = 0.5, 1, 2, 4
 
 三种模式都会开启 `--ttft-only`。
 
-- 流式 prefill 与合并 Update baseline 走 `/v1/prompt_stream/finish_ttft`：P 在最终问题 prefill 后返回首 token，不启动 D。
-- 普通 baseline 走 `/v1/completions_ttft`：P 对完整最终 prompt 做一次普通 prefill 并返回首 token，同样不启动 D。
+- 流式 prefill 与合并 Update baseline 走 `/v1/prompt_stream/finish_ttft`：P 在最终问题 prefill 后返回完成通知，不启动 D。
+- 普通 baseline 走 `/v1/completions_ttft`：P 对完整最终 prompt 做一次普通 prefill 并返回完成通知，同样不启动 D。
 
 这使三条线都排除了 D 侧 KV load、decode 以及完整输出长度带来的干扰。
 
@@ -364,7 +366,7 @@ MAX_NUM_SEQS=64 \
 sbatch --nodelist=<P_HOST> research/scripts/server/start_p_node.sbatch
 ```
 
-若之后测量完整 P/D transfer 与 decode，D 节点显式使用 `ATTENTION_BACKEND=TRITON_ATTN`，通过 `unified_attention` 完整读取历史 KV，不做块稀疏。启用中间 padding mask 时，P/D 均设置 `PROMPT_STREAM_MASKED_PADDING=1`；完整启动命令见 [服务端 README](../../server/README.md)。当前 sweep 全部使用 `--ttft-only`，首 token 只由 P 节点生成，D 不会实际进行 KV load；但三种模式都必须通过同一个 `CHUNK_SPARSE_ATTN` P 节点运行。
+若之后测量完整 P/D transfer 与 decode，D 节点显式使用 `ATTENTION_BACKEND=TRITON_ATTN`，通过 `unified_attention` 完整读取历史 KV，不做块稀疏。启用中间 padding mask 时，P/D 均设置 `PROMPT_STREAM_MASKED_PADDING=1`；完整启动命令见 [服务端 README](../../server/README.md)。当前 sweep 全部使用 `--ttft-only`，以 P 的完成通知计时，D 不会实际进行 KV load；三种模式都通过同一个 `CHUNK_SPARSE_ATTN` P 节点运行。
 
 ```shell
 DATA_DIR=research/data/mix_source \
@@ -486,7 +488,7 @@ done
 | `--seed` | 无 | 发送给 vLLM 的采样 seed。 |
 | `--random-seed` | `0` | 只控制 Poisson 到达间隔。 |
 | `--http-timeout` | `600` | HTTP 超时，单位秒。 |
-| `--ttft-only` | 关闭 | 只记录 TTFT。prompt-stream 类模式调用 `/v1/prompt_stream/finish_ttft`；普通模式调用 `/v1/completions_ttft`。两者都是 P 返回一个首 token 后立即 `[DONE]`，不启动 D。 |
+| `--ttft-only` | 关闭 | 只记录 TTFT。prompt-stream 类模式调用 `/v1/prompt_stream/finish_ttft`；普通模式调用 `/v1/completions_ttft`。两者都是 返回 `prefill_ready` 后立即 `[DONE]`，不启动 D。 |
 | `--sse-timeout` | 不限制 | 单个成功 SSE 响应的消费超时，单位秒；用于避免 HTTP 200 后一直等不到 `[DONE]`。 |
 | `--output-dir` | `research/scripts/replay/segmented_prefill/results` | 实验结果根目录。 |
 | `--run-name` | 时间戳与模式 | 指定本次结果子目录名称。 |
@@ -531,11 +533,11 @@ scheduler 由实际时序决定。`replay_merged_update.py` 则在客户端侧�
 主指标列仍统一叫 `finish_to_first_token_ms`：
 
 - 流式 prefill 和合并 Update baseline 在 `--ttft-only` 下表示
-  `/prompt_stream/finish_ttft` 到首 token；非 TTFT-only 调试时表示
+  `/prompt_stream/finish_ttft` 到 P 完成通知；非 TTFT-only 调试时表示
   `/prompt_stream/finish` 到首 token。
 - 普通模式没有独立 finish 阶段。在 `--ttft-only` 下，它表示
-  `/v1/completions_ttft` 到 P 首 token；非 TTFT-only 调试时表示
-  `/v1/completions` 到 P 首 token，同时也等于 `request_to_first_token_ms`。
+  `/v1/completions_ttft` 到 P 完成通知；非 TTFT-only 调试时表示
+  `/v1/completions` 到 D 首 token，同时也等于 `request_to_first_token_ms`。
 
 ## 常见问题
 

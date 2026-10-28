@@ -1,5 +1,7 @@
 # 稳定 KV 提前传输的受控实验记录
 
+本文记录采用 P 首 token 加 D 续写的历史协议；当前的 D 完整生成协议和指标定义见 [P/D 交接说明](../../server/PD-Handoff.md)。历史数值保留原口径。
+
 本轮在相同 NIXL Push 链路上比较 `early_stable_kv_push=true/false`。
 两组都消费完整 P/D 输出，不使用 TTFT-only。主要观察 P finish 响应到
 proxy 收到 D 首续写 token 的 P90/P95，P99 仅作为探索性尾部指标。

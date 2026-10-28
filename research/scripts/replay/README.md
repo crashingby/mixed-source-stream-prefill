@@ -1,5 +1,7 @@
 # 科研数据回放
 
+当前 P/D 交接由 D 生成全部回答；P-only 使用 `prefill_ready` 控制事件测量 P 侧 TTFT。协议、兼容字段与验证命令见 [P/D 交接说明](../server/PD-Handoff.md)。
+
 本目录把离线证据转换为 REST 请求，比较普通整段 Prefill、分段流式 Prefill、
 Update 合并、masked padding 和稳定 KV 提前传输。各实验保留独立入口与指标，
 共同使用 `common/` 里的数据读取、模板渲染、请求时间线和 HTTP/SSE 实现。
@@ -16,7 +18,7 @@ Update 合并、masked padding 和稳定 KV 提前传输。各实验保留独立
 | `generation_quality/` | `normal/segmented/sparse` 保存完整答案，`evaluate_answers.py` 按 TriviaQA/HotpotQA 协议评分并比较分段与稀疏退化。 |
 | `token_invalidation/` | 三个回放入口比较 Update-first、Append-first 整体建模与分段管理的实际失效 token，使用 P-only TTFT 路由。 |
 | `query_probe/` | `replay.py`，经 P-only TTFT 路由验证联合 Append/Query prefill、块评分、固定比例选择及临时 KV 回收。 |
-| `stable_kv_push/` | `replay_stable_kv_push.py`，分别观察 P/D 首 token 与实际 KV 传输指标。 |
+| `stable_kv_push/` | `replay_stable_kv_push.py`，分别观察 P 完成通知、D 首 token 与实际 KV 传输指标。 |
 | `tests/` | CPU 回归测试，使用临时数据和模拟 HTTP 响应。 |
 
 `segmented_prefill/replay_common.py` 和 `prompt_stream_stats_v2.py` 保留旧导入路径，
@@ -156,7 +158,7 @@ HotpotQA 在对应数据生成完成后换用 `configs/hotpotqa.json`。
   `request_metrics.csv`、`event_metrics.csv` 和 `summary.json`，失败或取消时也保存
   已完成请求。质量与稳定 KV 分别即时刷写 `generations.jsonl` 和 `requests.jsonl`。
 - 完整 SSE 必须收到 `[DONE]`；收到 token 后断流仍记为失败。
-  TTFT-only 在首 token 到达后主动结束消费。
+  TTFT-only 在 P 完成通知到达后主动结束消费。
 - 保留各实验统计校验：coalescing 的真实 P 配置与 recovery-aware 守恒、masked
   padding manifest，以及稳定 KV 的 P/D token 来源和传输字节守恒。
 

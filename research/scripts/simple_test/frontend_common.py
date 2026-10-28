@@ -21,7 +21,7 @@ from research.scripts.replay.common.dispatch import abort_prompt_stream
 from research.scripts.replay.common.prompt import ChatTemplateRenderer
 from research.scripts.replay.common.transport import (
     chunk_text,
-    consume_sse_response,
+    iter_sse_payloads,
     normalize_v1_url,
     post_json,
 )
@@ -205,7 +205,6 @@ async def finish_request(
     payload: dict[str, Any],
 ) -> dict[str, Any]:
     """消费 P JSON、proxy JSON 或 proxy TTFT SSE，完整 SSE 必须有 DONE。"""
-    started = time.perf_counter()
     async with client.stream(
         "POST", normalize_v1_url(args.proxy_url, path), json=payload
     ) as response:
@@ -213,28 +212,29 @@ async def finish_request(
             body = (await response.aread()).decode(errors="replace")
             raise RuntimeError(f"finish HTTP {response.status_code}: {body}")
         if "text/event-stream" in response.headers.get("content-type", ""):
-            measured = await consume_sse_response(
-                response, started, True, False, args.http_timeout
-            )
-            text = "".join(
-                chunk_text(choice)
-                for frame in measured.payloads
-                for choice in frame.get("choices", [])
-                if isinstance(choice, dict)
-            )
-            tokens = [
-                token
-                for frame in measured.payloads
-                for choice in frame.get("choices", [])
-                if isinstance(choice, dict)
-                for token in choice.get("token_ids", [])
-            ]
-            return {
-                "output_text": text,
-                "output_token_ids": tokens,
-                "prompt_stream_stats": measured.prompt_stream_stats,
-                "prompt_stream_masked_padding": measured.masked_padding_manifest,
+            # simple_test 完整读取控制流，断流即失败；P-only 也必须看到 DONE。
+            frames = [frame async for frame in iter_sse_payloads(response)]
+            result: dict[str, Any] = {
+                "prefill_ready": any(
+                    frame.get("event") == "prefill_ready" for frame in frames
+                ),
+                "output_text": "".join(
+                    chunk_text(choice)
+                    for frame in frames
+                    for choice in frame.get("choices", [])
+                ),
+                "output_token_ids": [
+                    token
+                    for frame in frames
+                    for choice in frame.get("choices", [])
+                    for token in choice.get("token_ids", [])
+                ],
             }
+            for frame in frames:
+                for name in ("prompt_stream_stats", "prompt_stream_masked_padding"):
+                    if name in frame:
+                        result[name] = frame[name]
+            return result
         value = json.loads(await response.aread())
         if not isinstance(value, dict):
             raise ValueError("finish 响应必须是 JSON 对象")
@@ -362,7 +362,7 @@ async def run_demo(args: argparse.Namespace, events: list[DemoEvent]) -> dict[st
             checked = validate_prompt_tokens(
                 response, prefix_tokens, tokens_by_source, kinds, padding
             )
-            if p_only:
+            if p_only and not response.get("prefill_ready"):
                 output_tokens = response.get("output_token_ids")
                 if (
                     not isinstance(output_tokens, list)

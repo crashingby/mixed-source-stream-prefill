@@ -1,5 +1,7 @@
 # Prompt Stream 最小测试
 
+当前 P/D 交接由 D 生成全部回答；P-only 使用 `prefill_ready` 控制事件测量 P 侧 TTFT。协议、兼容字段与验证命令见 [P/D 交接说明](../server/PD-Handoff.md)。
+
 三个入口分别测试 Append、Update 和交错来源。现在既可以**直连 P 节点**，也可以
 通过 proxy 测试 P-only 或完整 P→D 流程。默认输入是原始文本；客户端只渲染模型
 chat template，P 负责分词。

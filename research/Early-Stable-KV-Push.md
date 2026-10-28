@@ -1,10 +1,12 @@
 # 稳定 Prefix KV 的提前传输设计、实现与实验
 
+当前 P/D 交接由 D 生成全部回答；P-only 使用 `prefill_ready` 控制事件测量 P 侧 TTFT。协议、兼容字段与验证命令见 [P/D 交接说明](scripts/server/PD-Handoff.md)。
+
 ## 设计状态与结论
 
 本文记录混合来源流式 Prefill 的稳定 KV 提前传输方案、当前源码实现和截至 **2026-10-05** 的实验结论。区间级 NIXL WRITE、D 只接收会话、最终 block table 收养、专用 proxy 与配对 replay 已实现。除真实双卡 smoke 外，已完成原有性能集的两轮对照、稳定知识占比与 QPS 的受控矩阵，以及一次短区间 nsys 排查。
 
-正式实验在同一主机的两张 A30 上进行，共提交 5120 次非预热测量请求，5119 次完整成功且统计有效。顺序负载下，受控场景的 P→D 交接 P95 改善约 7.4%–51.5%；但部分并发场景的 P 首 token 和客户端续写等待反而变慢。因此当前结论是**可以把稳定 KV 的传输移出最终交接，并缩短特定条件下的交接尾延迟**，不是全负载、无代价的端到端加速。
+**历史实验说明：** 下述正式实验及已有数值使用旧版 P 首 token 交付协议；当前执行协议见上方链接。正式实验在同一主机的两张 A30 上进行，共提交 5120 次非预热测量请求，5119 次完整成功且统计有效。顺序负载下，受控场景的 P→D 交接 P95 改善约 7.4%–51.5%；但部分并发场景的 P 首 token 和客户端续写等待反而变慢。因此当前结论是**可以把稳定 KV 的传输移出最终交接，并缩短特定条件下的交接尾延迟**，不是全负载、无代价的端到端加速。
 
 核心目标是在知识源持续产生内容时，把已经稳定的 `PREFIX_APPEND` KV 提前送到 D，隐藏最终 P/D 交接中的部分传输时间。不提前计算 D 的输出，不改变 Update 的近似语义，也不优化抢占恢复。
 
@@ -14,7 +16,7 @@
 - **D 不通过假 decode 接收 KV。** Worker 复用 `kv_connector_no_forward()`，用零模型 token 的步骤推进传输；接收会话不进入模型 `running`，最终数据齐备后才收养到生成 Request。
 - **普通 Push 与增量 Push 分开处理。** 原有 `NixlPushConnector` 的终态路径仍保留；开启 `stable_kv_push` 后，新增 controller 与 worker 区间协议处理运行期间的稳定块。
 - **仅提前发送真正完成的完整真实 token 块。** `PREFIX_APPEND` 最后包含 padding 的块可能被后续 Append 改写，留到 finish 再传。Update 与 Question 同样留到最终交接。
-- **现有 TTFT-only 实验不能证明这项优化有效。** Proxy 本来就可以先返回 P 首 token，再等待 D；提前传输主要影响 D 的续写启动间隔和完整响应时间。
+- **现有 TTFT-only 实验不能证明这项优化有效。** Proxy 先返回 P 完成通知，再等待 D；提前传输主要影响 D 首个回答 token 的等待时间和完整响应时间。
 
 分段计算与近似语义见 [DONE.md](DONE.md)，空洞掩码与位置修正见 [Masked-Padding.md](Masked-Padding.md)，运行名额与 dormant 规则见 [Scheduler.md](Scheduler.md)。本方案只叠加传输流水线，不重新设计这些计算路径。
 
@@ -31,12 +33,12 @@
 | `start` | 向 P 创建长期 Request，设置 `max_tokens=1` 和完整 PD 的 transfer 参数。 | 尚无本请求，也未分配目标 blocks。 |
 | Append / Update | `/event` 只转发 P，维护 P token ids 的镜像。 | 仍无本请求。 |
 | `finish` | 向 P 提交 Question，等待 P 返回首 token、完整物理 prompt 和 KV manifest。 | 仍未接到生成请求。 |
-| P finish 返回后 | 构造 D 的普通 completions 请求，带完整 prompt、P 首 token 和 transfer 参数。 | 开始正常请求准入、分配 blocks 和加载 KV。 |
+| P finish 返回后 | 构造 D 的普通 completions 请求，带完整物理 prompt 和 transfer 参数。 | 开始正常请求准入、分配 blocks 和加载 KV。 |
 | 远端加载完成 | 继续转发 D 输出。 | 解除远端 KV 等待，开始本地 forward / decode。 |
 
-源码入口是 `_start_prompt_stream()`、`add_prompt_stream_event()`、`finish_prompt_stream()` 和 `_stream_decode_completion()`。其中 SSE 路径明确**先 yield P 首 token，再向 D 发请求**。
+源码入口是 `_start_prompt_stream()`、`add_prompt_stream_event()`、`finish_prompt_stream()` 和 `_stream_pd_completion()`。其中 SSE 路径明确**先 yield P 完成通知，再向 D 发请求**。
 
-[toy_proxy_server.py](../tests/v1/kv_connector/nixl_integration/toy_proxy_server.py) 也采用先向 P 发 `max_tokens=1` 请求、再把 transfer 参数交给 D 的基本交接方式；它没有为流式 Append 提前创建接收端的机制。当前研究 proxy 另外补充了物理 prompt、P 首 token、padding 与严格 manifest 校验，不能为了复用 toy proxy 而丢掉这些信息。
+[toy_proxy_server.py](../tests/v1/kv_connector/nixl_integration/toy_proxy_server.py) 也采用先向 P 发 `max_tokens=1` 请求、再把 transfer 参数交给 D 的基本交接方式；它没有为流式 Append 提前创建接收端的机制。当前研究 proxy 另外补充了物理 prompt、padding 与严格 manifest 校验，不能为了复用 toy proxy 而丢掉这些信息。
 
 ### Pull 的三个调用点
 
@@ -215,7 +217,7 @@ Start 的 reserve 只创建会话，不为每个请求预分配 `MAX_MODEL_LEN` 
 | Update 到达 | 使用现有 PA + UPDATE 计算与 LCP 语义。 | 不计算、不提前接收 Update。 |
 | Question 到达 | 按现有 FIFO 与依赖屏障完成最终 prefill，采样一个 token；终态 hook 发布剩余 blocks。 | 可接收最终区间，仍等待 manifest 屏障。 |
 | finalize | 对在途最终 blocks 保留独立 pin，等待安全完成。 | 固定 manifest，等待所有范围齐备并检查映射，然后标记 ready。 |
-| 普通 D completions | 已返回的首 token 成为 D 输入的最后一个 token。 | 创建生成 Request、收养块表，进入正常 waiting/running 后执行。 |
+| 普通 D completions | D 输入保持 P 的原始物理 prompt。 | 创建生成 Request、收养块表，进入正常 waiting/running 后执行。 |
 
 P 完成新稳定范围后发送 `offer`；D worker 的通知经输出 metadata 到达 EngineCore，由 `_grant_pending()` 分配并发送 `grant`；P 根据 grant 提交精确区间 WRITE。该协议实现于 [stable_push.py](../vllm/distributed/kv_transfer/kv_connector/v1/nixl/stable_push.py)，不复用原有整请求 `PUSH_REG` 的终态含义。Proxy 不参与逐 chunk 的容量握手。
 
@@ -243,7 +245,7 @@ Adopt 完成后，D 正常请求才进入 `waiting`，受原有运行名额和 t
 
 Finalize 到达时，已经发布但尚未完成的 early 区间不会被重新归类或重传。P 只从 `offered_blocks` 之后发布最终尾部；D 汇合原有在途 WRITE 和最终 WRITE 的完成通知，再统一检查 ready。区间通知可以有多次，但只有一条最终生成准入屏障；不是等 early 全部结束后才允许提交尾部 WRITE。
 
-## 最终屏障、P 首 token 与 Masked Padding
+## 最终屏障、P 完成通知与 Masked Padding
 
 ### 进入生成需要三个条件
 
@@ -257,26 +259,19 @@ D 可以开始生成必须同时满足：
 
 P 的 Question 仍按现有规则排队，等待已准入知识 work 完成。D 的最终屏障不会替代 P 的 Question 屏障，两者保护的是不同阶段。
 
-### 保留当前正确的首 token 交接
+### P 完成通知与 D 独立生成
 
-设最终 P 物理 prompt 长度为 $L$，P 采样的首 token 为 $y_0$：
+设最终 P 物理 prompt 长度为 $L$，远端 KV 覆盖 $[0,L)$。P 内部采样的 token 不进入 D 输入或客户端回答，proxy 只发送 `prefill_ready` 控制事件。
 
-- P 已 forward 的 KV 覆盖 $[0,L)$，因此 `remote_num_tokens=L`。
-- P 返回 $y_0$，但只运行 `max_tokens=1` 时，这个刚采样的 token **通常尚未再被 forward，没有对应 KV**。
-- D 输入是完整物理 prompt 加 $y_0$；adopt 后初始有效 computed 长度是 $L$，不是 $L+1$。
-- D 本地 forward $y_0$，生成第二个输出 token；总生成预算扣除 P 已经产生的一个 token。
-
-这与 proxy 当前 `_build_normal_pd_decode_request()` 的语义一致。不能因为提前传输就把 P 首 token 丢掉，也不能把它误计为提前传输的 KV。
-
-若 P 首 token 已触发 stop，或原始预算只有一个 token，则不启动 D 生成；proxy 返回 P 结果并取消 / 清理 D 接收会话及剩余传输。否则会留下无消费者的显存占用。
+D 收养完整物理 prompt 的 KV 后，将 computed 长度设为 $L-1$，重算最后一个 prompt token，再生成第一个回答 token。D 保留完整输出预算，即使 P 内部采样得到 stop，也仍由 D 独立决定生成终止。
 
 ### 最终 manifest 仍是权威布局
 
-最终交接必须继续携带：完整物理 prompt token ids、有效 KV token 数、分组 block IDs / counts / sizes、逻辑与物理长度、padding 元数据和 P 输出 token ids。
+最终交接必须继续携带：完整物理 prompt token ids、有效 KV token 数、分组 block IDs / counts / sizes、逻辑与物理长度、padding 元数据和零值的交接输出计数。
 
 开启 Masked Padding 时，沿用 `prompt_stream_masked_padding={version, start, end}`。D 根据最终区间屏蔽中间 padding，并修正后续语义位置；早期无需知道最后会有多少 padding，因为接收阶段根本不执行 attention。
 
-第一版要求 P/D 相同逻辑和 kernel block size、兼容布局，对每组最终有效块数严格验证为覆盖 $L$ 所需的数量。D 可以另外有 decode 容量，但不得把它混入已经有效接收的 KV 范围。`_finalize()` 检查 exact-transfer、物理长度、首 token 数、组数、块数、block size 和 session 身份；`adopt()` 再验证 D prompt 恰好为已冻结的物理 prompt 加一个首 token，并保持相同 mask。
+第一版要求 P/D 相同逻辑和 kernel block size、兼容布局，对每组最终有效块数严格验证为覆盖 $L$ 所需的数量。D 可以另外有 decode 容量，但不得把它混入已经有效接收的 KV 范围。`_finalize()` 检查 exact-transfer、物理长度、交接输出计数为零、组数、块数、block size 和 session 身份；`adopt()` 再验证 D prompt 恰好为已冻结的物理 prompt，并保持相同 mask。
 
 外部流式 KV 的 adopt 不叠加一次 D 本地 prefix-cache 命中：接收到的 block table 已经是本请求的权威布局。首版保持该接收 / 收养路径的 blocks 不参与可复用缓存发布，避免 masked / 近似语义与正常 prompt hash 混用；普通请求的 prefix cache 不受影响。
 
@@ -326,7 +321,7 @@ Masked Padding 的 0 / 1 配置均要明确传递；Update coalescing 可以独�
 
 | 源码位置 | 已实现职责 |
 | --- | --- |
-| [stable_kv_proxy.py](scripts/server/stable_kv_proxy.py) | 独立 proxy；reserve / bind / finalize、首 token 保留、双侧取消和 D 续写计时。 |
+| [stable_kv_proxy.py](scripts/server/stable_kv_proxy.py) | 独立 proxy；reserve / bind / finalize、P 完成通知、双侧取消和 D 续写计时。 |
 | [Stable KV router](../vllm/entrypoints/serve/stable_kv/api_router.py)、[serving](../vllm/entrypoints/serve/stable_kv/serving.py)、[protocol](../vllm/entrypoints/serve/stable_kv/protocol.py) | 内部 ACK 型会话路由和配置、输入校验。 |
 | [EngineClient](../vllm/engine/protocol.py)、[AsyncLLM](../vllm/v1/engine/async_llm.py)、[core_client.py](../vllm/v1/engine/core_client.py) | `stable_kv_control` 传递到 EngineCore utility。 |
 | [StableKVPushController](../vllm/v1/core/stable_kv_push.py) | PA 完成区间、offer/grant、接收会话、最终 manifest、pin、统计及取消状态机。 |
@@ -379,18 +374,18 @@ P 显式指定 `--attention-backend CHUNK_SPARSE_ATTN`，D 显式指定
 
 ## 如何验证收益和正确性
 
-### 区分客户端首 token 与 D 首次续写
+### 区分 P 完成通知与 D 首个回答 token
 
-当前 proxy 首 token 来自 P。保持这个输出策略时，提前 KV Push 没有直接缩短 P 最终 Question prefill 的计算路径，所以不能只看 `finish_to_first_token_ms` 判断传输优化。
+当前 proxy 先通知 P 完成，再交付 D 的回答。提前 KV Push 没有直接缩短 P 最终 Question prefill 的计算路径，所以不能只看 P 侧 TTFT 判断传输优化。
 
 专用 proxy 和 replay 已增加以下指标，在完整 PD 生成 workload 下比较：
 
 | 指标 | 实际计量口径 |
 | --- | --- |
-| `p_finish_to_d_first_token_ms` | **主要指标**：proxy 读完 P finish JSON，到收到 D 的首个续写 token；包含 finalize、传输屏障、D 提交、排队及本地执行。 |
+| `p_finish_to_d_first_token_ms` | **主要指标**：proxy 读完 P finish JSON，到收到 D 的首个回答 token；包含 finalize、传输屏障、D 提交、排队及本地执行。 |
 | `d_request_to_first_token_ms` | Proxy 发 D completions 到收到 D 首 token；当前提交点位于 finalize ready 之后，所以不含之前的剩余 KV 等待。 |
 | `finalize_wait_ms` | Proxy 内部 finalize/ready 阶段，包含控制轮询、目标扩容和传输等待；不是纯传输时间。 |
-| `finish_to_p_first_client_ms` / `finish_to_d_first_client_ms` | 客户端发 finish 至收到 P / D 首 token。前者才是本路径的客户端 TTFT；后者是收到 D 首次续写的等待，不是常规 TTFT。 |
+| `finish_to_p_first_client_ms` / `finish_to_d_first_client_ms` | 客户端发 finish 至收到 P 完成通知 / D 首 token；前者是 P 侧计时，后者是本协议的用户等待。 |
 | `early_transferred_bytes` / `final_transferred_bytes` | NIXL 完成 handle 的 `totalBytes`，按该区间 early/final 属性累加。 |
 | `final_transfer_ms` | 最终类别各 handle 的 NIXL `xferDuration` 从微秒转为毫秒后求和。它不含 HTTP 或分配时间，多批重叠时也不等于墙钟等待。 |
 | `early_byte_fraction` | early 字节除以总字节。它表示提前类别的份额，**不能保证所有这些字节在 P finish 前已完成**。 |
@@ -400,7 +395,7 @@ P 显式指定 `--attention-backend CHUNK_SPARSE_ATTN`，D 显式指定
 | 成功率与 `metrics_status` | HTTP/SSE 完整成功和统计合法性分别记录；不能隐藏失败后只比较少量快请求。 |
 
 Proxy、worker、replay 各自在自身进程内计时，不相减跨机器单调时钟。输出 SSE
-标记 `token_source=prefill/decode`，避免把 P 首 token 当成 D 首次续写。
+使用 `event=prefill_ready` 通知 P 完成，回答帧标记 `token_source=decode`。
 最终 metadata 帧附带 `stable_kv_metrics`，replay 必须读到 `[DONE]`。
 
 `p_finish_to_d_first_token_ms` 的起点是 proxy 读完 P finish JSON，不是客户端提交 finish 的时刻，也不是 GPU 完成的直接时间戳。它适合测量最终交接阶段，但不能替代客户端延迟。每条请求先测量完整间隔，再计算其分位数；**不能将 P 阶段 P95 与交接 P95 相加，称为客户端 P95**，不同分位数通常不对应同一个请求。
@@ -756,10 +751,10 @@ finish-only 也会与其它请求的 prefill 重叠传输；early 只是让传�
 | D 收到第一批就进入 decode | receive-only 会话保留显存但不进入模型 running；全部最终范围 ready 后，真实 D Request 才收养并准入。 |
 | finalize 一步创建生成任务 | finalize 是 ACK 型布局冻结与屏障；proxy 随后用一次普通 D completions 创建 collector。 |
 | finalize 重拉未完成 early 块 | 不重传已发布区间；等待在途 early 与新 final 区间统一完成。 |
-| 收养时复制或重新申请全部块 | 转交 reservation 的 CPU 所有权表，GPU 地址不变；D 从 computed=L 开始 forward P 首 token。 |
+| 收养时复制或重新申请全部块 | 转交 reservation 的 CPU 所有权表，GPU 地址不变；D 从 computed=L-1 开始重算最后一个 prompt token。 |
 | 已实现纯事件驱动和异步多 TP | 当前是默认 5 ms 的 no-forward 轮询，只支持同步 TP/PP/DP=1。 |
 | 普通 Pull 是本轮基线 | 两组共用增量 Push 协议与 start 会话，只改变稳定块是否提前发布。 |
-| 传输总量减少，或者普通 TTFT 必然改善 | 总字节相同；主要测量是 P finish→D 首续写，客户端 TTFT 来自 P 并需单独报告。 |
+| 传输总量减少，或者 P 侧 TTFT 必然改善 | 总字节相同；主要测量是 P finish→D 首个回答 token。P 侧完成延迟和用户侧 TTFT 分别报告。 |
 | 同步或 PCIe 带宽已被确定为根因 | DeviceSynchronize 很小；小 D2H 与 CPU 慢提交相关，精确根因和实际 UCX transport 尚未确认。 |
 
 本次修正了仅有四条 smoke、正式实验仍待进行的旧状态，补充了接口范围、
@@ -770,7 +765,7 @@ finish-only 也会与其它请求的 prefill 重叠传输；early 只是让传�
 
 本工作的机制特点是利用混合来源流式 Prefill 的稳定 PA 域，按真实完成的
 整块增量发布；D 通过独立 receive-only ownership 接收，最终将原块表收养到
-生成 Request，保留 P 首 token、Masked Padding 和精确 manifest 屏障。
+生成 Request，保留 Masked Padding 和精确 manifest 屏障。
 它将知识流到达阶段的部分稳定 KV 传输与 P 计算重叠，而不提前传可变 Update。
 
 可据现有数据写为：

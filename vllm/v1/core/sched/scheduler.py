@@ -3099,7 +3099,7 @@ class Scheduler(SchedulerInterface):
                 prompt_stream_prompt_token_ids=physical_token_ids,
                 prompt_stream_physical_prompt_len=len(physical_token_ids),
                 prompt_stream_logical_prompt_len=layout.total_len,
-                prompt_stream_prefill_output_tokens=request.num_output_tokens,
+                prompt_stream_prefill_output_tokens=0,  # D 独立生成全部回答。
                 prompt_stream_masked_padding={
                     "version": 1,
                     "start": pad_start,
@@ -3502,7 +3502,7 @@ class Scheduler(SchedulerInterface):
                 prompt_stream_exact_transfer=True,
                 prompt_stream_remote_block_counts=block_counts,
                 prompt_stream_remote_block_sizes=block_sizes,
-                prompt_stream_prefill_output_tokens=request.num_output_tokens,
+                prompt_stream_prefill_output_tokens=0,  # D 独立生成全部回答。
                 remote_num_tokens=physical_prompt_len,
             )
         return delay_free_blocks, kv_transfer_params

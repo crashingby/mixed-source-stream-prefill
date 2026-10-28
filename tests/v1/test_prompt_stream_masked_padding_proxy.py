@@ -30,7 +30,7 @@ def _prefill_response() -> dict[str, Any]:
             "prompt_stream_exact_transfer": True,
             "prompt_stream_physical_prompt_len": 7,
             "prompt_stream_logical_prompt_len": 6,
-            "prompt_stream_prefill_output_tokens": 1,
+            "prompt_stream_prefill_output_tokens": 0,
             "prompt_stream_remote_block_counts": [2],
             "prompt_stream_remote_block_sizes": [4],
             "prompt_stream_masked_padding": {
@@ -73,10 +73,10 @@ def _request(session: proxy.PromptStreamProxySession) -> Any:
     )
 
 
-def test_masked_padding_transfer_preserves_physical_blocks_and_p_token(
+def test_masked_padding_transfer_preserves_original_physical_prompt(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """D 必须收到未压紧的物理 token view、原 block IDs 和 P 首 token。"""
+    """D 接收未压紧的物理 prompt 和全部输出预算，P 采样结果不进入回答。"""
     prefill = _prefill_response()
     sent_requests: list[dict[str, Any]] = []
 
@@ -86,7 +86,7 @@ def test_masked_padding_transfer_preserves_physical_blocks_and_p_token(
         sent_requests.append(args[2])
         return {
             "choices": [{"text": " tail", "token_ids": [20]}],
-            "usage": {"prompt_tokens": 8, "completion_tokens": 1, "total_tokens": 9},
+            "usage": {"prompt_tokens": 7, "completion_tokens": 1, "total_tokens": 8},
         }
 
     monkeypatch.setattr(proxy, "_post_json", post_json)
@@ -96,15 +96,17 @@ def test_masked_padding_transfer_preserves_physical_blocks_and_p_token(
     result = asyncio.run(proxy.finish_prompt_stream(_request(_session())))
     assert len(sent_requests) == 1
     decode = sent_requests[0]
-    assert decode["prompt"] == prefill["prompt_token_ids"] + [19]
+    assert decode["prompt"] == prefill["prompt_token_ids"]
     assert decode["kv_transfer_params"] == prefill["kv_transfer_params"]
-    assert decode["max_tokens"] == 3
+    assert decode["max_tokens"] == 4
     payload = json.loads(result.body)
     assert payload["prompt_stream_masked_padding"] == {
         "version": 1,
         "start": 3,
         "end": 4,
     }
+    assert payload["choices"][0]["text"] == " tail"
+    assert payload["choices"][0]["token_ids"] == [20]
     assert payload["usage"]["prompt_tokens"] == 7
 
 
@@ -116,7 +118,8 @@ def test_ttft_without_connector_keeps_mask_in_first_sse_frame(
     prefill["kv_transfer_params"] = {
         name: value
         for name, value in prefill["kv_transfer_params"].items()
-        if name in {
+        if name
+        in {
             "prompt_stream_masked_padding",
             "prompt_stream_physical_prompt_len",
             "prompt_stream_logical_prompt_len",
@@ -135,7 +138,8 @@ def test_ttft_without_connector_keeps_mask_in_first_sse_frame(
     )
     assert endpoints == ["/prompt_stream/finish"]
     payload = json.loads(result.body.split(b"\n\n")[0].removeprefix(b"data: "))
-    assert payload["choices"][0]["token_ids"] == [19]
+    assert payload["event"] == "prefill_ready"
+    assert payload["choices"] == []
     assert payload["prompt_stream_masked_padding"]["start"] == 3
     assert payload["prompt_stream_stats"] == prefill["prompt_stream_stats"]
 
@@ -193,6 +197,6 @@ def test_empty_padding_range_remains_explicit() -> None:
     params["prompt_stream_masked_padding"]["start"] = 4
     params["prompt_stream_logical_prompt_len"] = 7
     session = _session()
-    session.decode_prompt_token_ids = prefill["prompt_token_ids"] + [19]
-    proxy._validate_prompt_stream_transfer(session, prefill, 1)
+    session.decode_prompt_token_ids = prefill["prompt_token_ids"]
+    proxy._validate_prompt_stream_transfer(session, prefill)
     assert proxy._validate_prompt_stream_padding_manifest(prefill) is not None

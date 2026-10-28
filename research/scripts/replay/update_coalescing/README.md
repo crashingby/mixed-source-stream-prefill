@@ -3,7 +3,7 @@
 本目录用于评估 Prompt Stream 的 **Update coalescing（Update 合并）** 功能。实验通过
 RESTFUL API 回放同一批 mixed-source 请求，同时测量：
 
-- 最终问题到达后，P 节点生成首 token 的 TTFT。
+- 最终问题到达后，收到 `prefill_ready` 完成通知的 P 侧 TTFT，协议见 [P/D 交接说明](../../server/PD-Handoff.md)。
 - Update 合并减少的逻辑 Prefill token。
 - 已物化、后来又因快照变化而失效的 Update KV token。
 - 不同策略、窗口、Update 到达频率和 QPS 下的成功率与尾延迟。
@@ -188,7 +188,7 @@ NUM_REPEATS=3
 会产生 $4 \times 2 \times 3=24$ 个正式 run。replay 中的 profile 参数只是配置
 审计，不会改变 P 的 Engine 配置。
 
-该 sbatch 固定使用 `--ttft-only`。P 生成首 token 后，proxy 直接返回，不再向 D
+该 sbatch 固定使用 `--ttft-only`。P 完成内部采样后，proxy 返回完成通知，不再向 D
 节点发送 decode 请求。因此 TTFT 主实验不会混入 D 节点 KV load 和 decode 噪声。
 
 #### 提交方式
@@ -284,8 +284,8 @@ offered QPS；这正是高负载结果必须同时报告成功率和完成吞吐
 | `TOKENIZER_MODEL` | `${MODEL_PATH}`（若存在） | **必填其一**；回放节点可读的模型目录或 HF ID，用于 `apply_chat_template`，不是 served name。 |
 | `TOKENIZER_TRUST_REMOTE_CODE` | `0` | 设为 `1` 时允许 tokenizer remote code。 |
 | `HTTP_TIMEOUT` | `600` | 普通 HTTP 操作超时，单位秒。 |
-| `SSE_TIMEOUT` | `120` | 等待 P 首 token 的 SSE 超时，单位秒。 |
-| `MAX_TOKENS` | `64` | 生成参数；本 sbatch 固定 TTFT-only，P 首 token 后即结束。 |
+| `SSE_TIMEOUT` | `120` | 等待 P 完成通知的 SSE 超时，单位秒。 |
+| `MAX_TOKENS` | `64` | 生成参数；本 sbatch 固定 TTFT-only，P 完成通知后即结束。 |
 | `TEMPERATURE` | `0` | 生成温度；延迟对比建议固定为 0。 |
 | `RUN_PREFIX` | `coalescing` | 自动生成 run name 的前缀。 |
 | `EVENT_PROGRESS_LOG_INTERVAL` | `0` | 每 N 个 event 打印一次进度；`0` 关闭。 |
@@ -461,7 +461,7 @@ Update 依照自身策略放行，早期 Update KV 可以保留未关注后续 A
 
 | 指标 | 含义 |
 | --- | --- |
-| `finish_to_first_token_ms` | `/finish_ttft` 发出到 P 返回首 token 的时间。 |
+| `finish_to_first_token_ms` | `/finish_ttft` 发出到收到 P 完成通知的时间。 |
 | TTFT P50 / P90 / P95 / P99 | 中位数和尾延迟。 |
 | `transport_success_rate` | HTTP/SSE 链路成功率。 |
 | `first_token_success_rate` | 实际收到首 token 的请求比例，也是 TTFT 的样本口径。 |
@@ -917,7 +917,7 @@ scancel "${P_JOB_ID}"
 | `UPDATE_INITIAL_DELAY` | `0` | Update 首事件延迟。 |
 | `APPEND_CHUNK_INTERVAL` | `0.5` | Append source 内 chunk 间隔。 |
 | `SOURCE_FINISH_DELAY` | `0` | 最后数据事件 ACK 后发送 source finished 的延迟。 |
-| `MAX_TOKENS` | `64` | 普通生成上限；TTFT-only 在 P 首 token 后结束。 |
+| `MAX_TOKENS` | `64` | 普通生成上限；TTFT-only 在 P 完成通知后结束。 |
 | `WARMUP_REQUESTS` | `0` | 正式矩阵前的 warmup 数；正式采集建议 `8`。 |
 | `EVENT_PROGRESS_LOG_INTERVAL` | `0` | 每 N 个 event 打印进度；`0` 关闭。 |
 | `FAIL_FAST` | `0` | 设为 `1` 后首个 HTTP/SSE 或首 token 失败即结束；stats invalid 不触发。 |
@@ -936,8 +936,8 @@ warmup 使用矩阵中的第一个 Update interval，写入 `results/warmup/`，
 - `summary.json`：当前 run 的 TTFT 分位数和全局 token/work 总量。
 - `responses/`：仅在显式使用 `--save-responses` 时生成。
 
-HTTP/SSE 或首 token 失败才会把网络结果标记为错误并触发必要的 abort。已经收到首
-token 后，服务端 stats 缺失、类型错误、recovery-aware 守恒不一致、coalescing
+HTTP/SSE 或 P 完成通知失败才会把网络结果标记为错误并触发必要的 abort。已经收到
+完成通知后，服务端 stats 缺失、类型错误、recovery-aware 守恒不一致、coalescing
 状态与预期不一致，或 P 实际配置与审计 JSON 不一致，只会把 stats/formal 状态标为
 无效：该请求仍进入 TTFT 分布，不再 abort；其 token/work 数据不会填成 0，也不会
 进入正式 token 聚合。schema v1 只作为 legacy 读取，formal 状态为 `not_evaluated`。

@@ -424,8 +424,8 @@ def validate_measurement(
     errors = []
     if not mask_valid:
         errors.append("masked-padding 开关与预期不一致")
-    if measured.completion_tokens != 1 or not measured.completion_token_count_exact:
-        errors.append("TTFT-only 必须返回一个可确认的 P 输出 token")
+    if measured.prefill_ready_time is None or measured.completion_tokens != 0:
+        errors.append("TTFT-only 必须返回 P 完成通知，且不包含回答 token")
     if metric.stats_validation_status != "valid":
         errors.append(metric.stats_validation_error or "主指标要求完整 schema-v2 统计")
     elif metric.update_events_accepted != metric.changed_update_events:
@@ -508,14 +508,14 @@ async def replay_sample(
                 raise ReplayHttpError(f"finish HTTP {response.status_code}: {body}")
             # 统计实验消费完整的 P-only SSE，确保末尾统计和 DONE 都已收到。
             measured = await consume_sse_response(
-                response, sent, args.save_responses, False, args.sse_timeout
+                response, sent, args.save_responses, True, args.sse_timeout
             )
         metric.transport_status = "ok"
         metric.first_token_received = True
         metric.result_status = "ok"
-        metric.ttft_origin = measured.first_token_origin
-        metric.finish_to_first_token_ms = (measured.first_token_time - sent) * 1000
-        metric.request_to_first_token_ms = (measured.first_token_time - started) * 1000
+        metric.ttft_origin = measured.ttft_origin
+        metric.finish_to_first_token_ms = (measured.ttft_time - sent) * 1000
+        metric.request_to_first_token_ms = (measured.ttft_time - started) * 1000
         metric.finish_to_done_ms = (measured.completed_time - sent) * 1000
         metric.request_to_done_ms = (measured.completed_time - started) * 1000
         apply_completion_measurement(metric, measured, sent)

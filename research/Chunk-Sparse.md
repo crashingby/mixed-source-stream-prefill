@@ -1,5 +1,7 @@
 # 基于 Query probe 的 Append KV 块稀疏设计
 
+当前 P/D 交接由 D 生成全部回答；P-only 使用 `prefill_ready` 控制事件测量 P 侧 TTFT。协议、兼容字段与验证命令见 [P/D 交接说明](scripts/server/PD-Handoff.md)。
+
 ## 目标与当前决策
 
 在流式 RAG 预填充过程中，将新 Append 知识块与提前获得的用户问题拼成一次联合 prefill。Append token 按已发布的策略稀疏读取历史 Append；临时 Query token 完整读取当前有效前缀，并用于评估新块中的 KV block（KV 块）。评分完成后发布新块策略，供后续 Append 和 Update 使用，减少注意力计算与读取开销。

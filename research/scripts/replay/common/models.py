@@ -93,8 +93,8 @@ class RequestMetric:
     """一个样本的一次 stream 或 normal 回放结果。
 
     ``finish_to_first_token_ms`` 是本实验的主指标。prompt-stream 类模式从
-    finish HTTP 请求提交到 proxy SSE 的首 token；normal 模式从普通 PD 请求
-    提交到 P 节点产生的首个 SSE token。
+    finish HTTP 请求提交开始计时；normal 模式从完整请求提交开始计时。
+    P-only 的终点是 prefill_ready，完整生成的终点是 D 首个回答 token。
     """
 
     run_id: str
@@ -195,10 +195,31 @@ class SseMeasurement:
     completion_chunks: int
     completion_tokens: int
     completion_token_count_exact: bool
-    last_token_time: float
+    last_token_time: float | None
     payloads: tuple[dict[str, Any], ...]
     prompt_stream_stats: dict[str, Any] | None
     masked_padding_manifest: dict[str, int] | None
+    prefill_ready_time: float | None = None  # P 控制事件，与回答首 token 独立。
+
+    @property
+    def ttft_time(self) -> float:
+        """返回本次计时终点；P-only 使用就绪事件，完整生成使用回答首 token。"""
+        measured = (
+            self.first_token_time
+            if self.first_token_time is not None
+            else self.prefill_ready_time
+        )
+        assert measured is not None
+        return measured
+
+    @property
+    def ttft_origin(self) -> str | None:
+        """显式区分 P 完成通知和实际回答来源。"""
+        return (
+            self.first_token_origin
+            if self.first_token_time is not None
+            else "prefill_ready"
+        )
 
 
 ReplaySample = Callable[

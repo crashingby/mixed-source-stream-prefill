@@ -207,7 +207,7 @@ def test_p_only_finish_manifest_without_connector(aborted: bool) -> None:
     assert manifest["prompt_stream_prompt_token_ids"] == [1, 2, 3, 3, 20, 21]
     assert manifest["prompt_stream_physical_prompt_len"] == 6
     assert manifest["prompt_stream_logical_prompt_len"] == 5
-    assert manifest["prompt_stream_prefill_output_tokens"] == 1
-    assert parse_prompt_stream_padding_range(manifest, 7) == (3, 4)
+    assert manifest["prompt_stream_prefill_output_tokens"] == 0
+    assert parse_prompt_stream_padding_range(manifest, 6) == (3, 4)
     assert "do_remote_prefill" not in manifest
     assert "remote_block_ids" not in manifest

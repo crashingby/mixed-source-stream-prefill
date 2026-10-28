@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import sys
 from pathlib import Path
+from typing import Any
 
 import httpx
 import pytest
@@ -69,6 +70,23 @@ def test_sse_multiline_and_final_metadata() -> None:
     observed = asyncio.run(consume_stable_sse(response))
     assert observed.decode_tokens == [2]
     assert observed.stable_kv_metrics == {"final_transfer_ms": 4}
+
+
+def test_ready_event_does_not_contribute_answer_tokens() -> None:
+    """新协议的 P 计时取完成通知，D 首 token 才是用户回答的起点。"""
+    observation = StreamObservation()
+    observation.observe({"event": "prefill_ready", "choices": []}, 1.0)
+    assert observation.first_prefill_time == 1.0
+    assert observation.first_decode_time is None
+    assert observation.prefill_tokens == []
+    assert observation.completion_text == ""
+    observation.observe(
+        {"token_source": "decode", "choices": [{"text": "A", "token_ids": [10]}]},
+        2.0,
+    )
+    assert observation.first_decode_time == 2.0
+    assert observation.decode_tokens == [10]
+    assert observation.completion_text == "A"
 
 
 def test_disconnect_after_token_is_not_success() -> None:
@@ -185,7 +203,7 @@ def test_stable_matrix_does_not_pool_repeat_percentiles() -> None:
 
     from summarize_stable_kv_matrix import aggregate_comparisons
 
-    first = {
+    first: dict[str, Any] = {
         "num_selected": 100,
         "num_formal_pairs": 90,
         "qps": 1.0,
@@ -294,9 +312,10 @@ def test_stable_matrix_plot_keeps_overall_client_intervals(
 
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
+    from matplotlib.figure import Figure
     from summarize_stable_kv_matrix import plot_matrix
 
-    captured: list[object] = []
+    captured: list[Figure] = []
     original_subplots = plt.subplots
 
     def capture_subplots(*args: object, **kwargs: object) -> object:

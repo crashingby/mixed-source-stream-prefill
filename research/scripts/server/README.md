@@ -1,5 +1,7 @@
 # Prompt Stream Server 脚本
 
+当前 P/D 交接由 D 生成全部回答；P-only 使用 `prefill_ready` 控制事件测量 P 侧 TTFT。协议、兼容字段与验证命令见 [P/D 交接说明](PD-Handoff.md)。
+
 这个目录负责启动实验链路中的服务端组件：
 
 - `proxy_server.py`：实验代理服务器，RAG 前端和 replay 脚本只访问它。
@@ -28,7 +30,7 @@ D；专用 proxy 与 replay 放在 `g2c14`。脚本默认 Qwen2.5-3B、显存比
 
 完整可复制的启动、A/B 开关、回放和指标解释见
 [稳定 KV 提前 Push README](../replay/stable_kv_push/README.md)。该实验需要完整
-D 续写，不能使用只返回 P 首 token 的 TTFT-only 路由。
+D 续写，不能使用只返回 P 完成通知的 TTFT-only 路由。
 
 ## proxy 服务器
 
@@ -39,7 +41,7 @@ D 续写，不能使用只返回 P 首 token 的 TTFT-only 路由。
 - `/v1/prompt_stream/start`：创建长期 prompt stream 请求，并转发给 P 节点。
 - `/v1/prompt_stream/event`：转发 append、update 或 source_finished 事件。
 - `/v1/prompt_stream/finish`：让 P 节点完成最终问题 prefill，再携带 `kv_transfer_params` 请求 D 节点 decode。
-- `/v1/prompt_stream/finish_ttft`：只测 P 节点首 token TTFT，不启动 D 节点。
+- `/v1/prompt_stream/finish_ttft`：以 `prefill_ready` 测量 P 侧 TTFT，不启动 D 节点。
 - `/v1/prompt_stream/abort`：中止仍在 proxy/P 节点侧保存的 prompt stream 会话。
 - `/v1/completions`：普通 OpenAI completions 代理，用于 normal baseline。
 
@@ -164,7 +166,7 @@ sbatch --nodelist=<D_HOST> research/scripts/server/start_d_node.sbatch
 `CHUNK_SPARSE_ATTN`；启动 D 时需保留下面显式指定的 `ATTENTION_BACKEND`。
 
 使用中间 padding mask 时，在原有提交命令中增加
-`PROMPT_STREAM_MASKED_PADDING=1`。例如仅测 P 首 token：
+`PROMPT_STREAM_MASKED_PADDING=1`。例如仅测 P 侧 TTFT：
 
 ```shell
 PROMPT_STREAM_MASKED_PADDING=1 \
@@ -208,7 +210,7 @@ work 的原有行为。D 节点不要设置这个变量。当前 P 脚本支持�
 但仍只支持 DP=1、PP=1 和单 in-flight batch；本脚本已有
 `--no-async-scheduling`，不需要再添加异步调度参数。
 
-只测 TTFT 时，P 生成首 token 后就结束，既不向 D 传 KV，也不需要初始化 NIXL。
+只测 P 侧 TTFT 时，proxy 在 P 内部采样完成后返回 `prefill_ready`，既不向 D 传 KV，也不需要初始化 NIXL。
 特别是当前 TP=2 的 NIXL KV 注册仍在排查，应显式禁用：
 
 ```shell

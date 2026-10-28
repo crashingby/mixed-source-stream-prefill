@@ -1,5 +1,7 @@
 # 分段 KV 中间 Padding 的 Masked Attention 调研
 
+当前 P/D 交接由 D 生成全部回答；P-only 使用 `prefill_ready` 控制事件测量 P 侧 TTFT。协议、兼容字段与验证命令见 [P/D 交接说明](scripts/server/PD-Handoff.md)。
+
 ## 实现状态与启用方式（2026-09）
 
 本文的 Triton 第一版已接入源码。下文保留原始问题分析与设计动机；其中
@@ -467,8 +469,8 @@ mask 的 backend，应在调度前失败，不能只让部分层忽略 padding�
 
 ### P/D 传输
 
-只在 P 节点 mask padding 不够。D 节点拉取已经生成的 KV 后仍会继续对 Question 末尾
-或 P 节点产生的首 token 执行 attention；它必须知道相同的 padding range 和语义位置偏移。
+只在 P 节点 mask padding 不够。D 节点拉取已经生成的 KV 后会重算 Question 最后一个
+token，再生成全部回答；它必须知道相同的 padding range 和语义位置偏移。
 
 因此最终 KV transfer/request metadata 至少需要传递：
 

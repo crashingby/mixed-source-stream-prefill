@@ -71,10 +71,10 @@ PROXY_METRIC_FIELDS = (
 
 @dataclass
 class StreamObservation:
-    """记录完整 SSE 输出，分别识别 P 首 token 与 D 续写。"""
+    """记录完整 SSE 输出，分别识别 P 完成通知与 D 回答。"""
 
-    first_prefill_time: float | None = None  # 客户端看到 P 首 token 的时刻。
-    first_decode_time: float | None = None  # 客户端看到 D 首续写 token 的时刻。
+    first_prefill_time: float | None = None  # 客户端收到 P 完成事件的时刻。
+    first_decode_time: float | None = None  # 客户端看到 D 首个回答 token 的时刻。
     last_decode_time: float | None = None  # 最后一个实际 D token 的时刻。
     prefill_tokens: list[int] = field(default_factory=list)
     decode_tokens: list[int] = field(default_factory=list)
@@ -98,6 +98,9 @@ class StreamObservation:
         manifest = payload.get("prompt_stream_masked_padding")
         if isinstance(manifest, dict):
             self.masked_padding = manifest
+
+        if payload.get("event") == "prefill_ready":
+            self.first_prefill_time = now  # 不增加 prefill_tokens 或回答文本。
 
         # usage/metadata-only SSE 不计为生成 token，也不重置 D 的首 token 时刻。
         for choice in payload.get("choices", []):
@@ -523,8 +526,8 @@ def parse_args() -> argparse.Namespace:
         parser.error("QPS and event delays must be finite and non-negative.")
     if args.max_requests < 0 or args.start_index < 0 or args.max_concurrency < 1:
         parser.error("Invalid request count, start index or concurrency.")
-    if args.max_tokens < 2:
-        parser.error("--max-tokens must be >= 2 to observe D continuation.")
+    if args.max_tokens < 1:
+        parser.error("--max-tokens must be >= 1 to observe D generation.")
     if args.http_timeout <= 0 or args.finish_timeout <= 0:
         parser.error("Timeouts must be positive.")
     args.experiment_suite = "stable_kv_push"  # 复用事件日志时保留独立套件身份。

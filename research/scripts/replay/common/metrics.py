@@ -680,9 +680,11 @@ def apply_completion_measurement(
     metric.completion_chunks = measurement.completion_chunks
     metric.completion_tokens = measurement.completion_tokens
     metric.completion_token_count_exact = measurement.completion_token_count_exact
-    metric.time_to_last_token_ms = (measurement.last_token_time - start_time) * 1000
+    if measurement.last_token_time is not None:
+        metric.time_to_last_token_ms = (measurement.last_token_time - start_time) * 1000
     if measurement.completion_token_count_exact and measurement.completion_tokens > 1:
         assert measurement.first_token_time is not None
+        assert measurement.last_token_time is not None
         duration_ms = (
             measurement.last_token_time - measurement.first_token_time
         ) * 1000

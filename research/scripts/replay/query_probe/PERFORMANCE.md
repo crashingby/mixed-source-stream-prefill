@@ -1,5 +1,7 @@
 # Query probe 正式性能实验
 
+当前 P/D 交接由 D 生成全部回答；P-only 使用 `prefill_ready` 控制事件测量 P 侧 TTFT。协议、兼容字段与验证命令见 [P/D 交接说明](../../server/PD-Handoff.md)。
+
 ## 对照方案
 
 两组统一使用 `--attention-backend CHUNK_SPARSE_ATTN`，共用新版 32×128 attention kernel、KV 分页布局和 padding 掩码。
@@ -43,7 +45,7 @@ sbatch --parsable --nodelist=g2c13 --time=7-00:00:00 \
 
 ## 统计与结果
 
-- 整体 TTFT 从提交 start 到收到 P 首 token，包含来源事件等待、排队、probe、评分和最终 prefill。
+- 整体 TTFT 从提交 start 到收到 P 完成通知，包含来源事件等待、排队、probe、评分和最终 prefill。
 - 同时报告 finish TTFT、平均值、P50/P95/P99、失败数及完成吞吐。
 - 对照核验样本、最终 prompt SHA256、事件计划 SHA256，并结合实际 Update 工作量和恢复统计排除少做工作产生的假加速。
 - 保存配置、硬件信息、源码快照与 SHA256；临时缓存位于仓库 `tmp/`，结束后清理。

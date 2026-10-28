@@ -119,9 +119,20 @@ wait_ready "http://127.0.0.1:${D_PORT}/health" "${PROCESSES[1]}"
 PROCESSES+=("$!")
 wait_ready "${PROXY_URL}/openapi.json" "${PROCESSES[2]}"
 
+# 可选的小规模协议检查：复用当前 allocation 的服务，不额外申请 GPU。
+if [[ "${PD_HANDOFF_SMOKE:-0}" == "1" ]]; then
+  "${PYTHON_BIN}" -m research.scripts.simple_test.pd_handoff \
+    --proxy-url "${PROXY_URL}" --decode-url "http://127.0.0.1:${D_PORT}" \
+    --model "${MODEL}" --output "${OUTPUT_DIR}/pd-handoff.json"
+  "${PYTHON_BIN}" research/scripts/replay/query_probe/replay.py \
+    --proxy-url "${PROXY_URL}" --model "${MODEL}" --tokenizer-model "${MODEL_PATH}" \
+    --max-requests 2 --max-concurrency 2 --mode sparse \
+    --output-dir "${OUTPUT_DIR}/p-only-probe" >"${OUTPUT_DIR}/p-only.log" 2>&1
+fi
+
 # 先确认三种模式均能完成完整 P/D 生成，再开始 1000 请求的正式实验。
 echo "Starting warmup."
-MAX_REQUESTS=4 RUN_PREFIX=warmup \
+MAX_REQUESTS="${WARMUP_REQUESTS:-4}" RUN_PREFIX=warmup \
   bash research/scripts/replay/generation_quality/run_generation_quality.sbatch \
   >"${OUTPUT_DIR}/warmup.log" 2>&1
 echo "Warmup passed; starting formal quality replay."

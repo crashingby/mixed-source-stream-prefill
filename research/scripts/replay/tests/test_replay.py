@@ -300,8 +300,11 @@ def test_shared_config(
     monkeypatch: pytest.MonkeyPatch, inputs: dict[str, Path], entry: str
 ) -> None:
     """所有入口共享数据配置，CLI 显式值优先，配置路径相对 JSON 所在目录。"""
-    args = arguments(monkeypatch, inputs, entry, ("--max-requests", "1"))
+    args = arguments(
+        monkeypatch, inputs, entry, ("--max-requests", "1", "--max-tokens", "1")
+    )
     assert args.max_requests == 1
+    assert args.max_tokens == 1  # D 独立生成，单 token 预算也允许完整 PD 测试。
     assert args.questions_file == inputs["questions"]
     assert args.input_transport == "text"
     assert args.tokenizer_model == str(inputs["model"])
@@ -388,7 +391,12 @@ class FakeProxy:
         )
         frames = [
             {
-                "token_source": "prefill",
+                "event": "prefill_ready",
+                "choices": [],
+                "prompt_stream_masked_padding": {"version": 1, "start": 0, "end": 0},
+            },
+            {
+                "token_source": "decode",
                 "choices": [{"text": "Alpha", "token_ids": [1]}],
                 "prompt_stream_masked_padding": {"version": 1, "start": 0, "end": 0},
             },
@@ -444,6 +452,8 @@ class FakeProxy:
                     "chunks": chunks,
                 }
             frames[0]["prompt_stream_stats"] = stats
+        if path.endswith("_ttft"):
+            frames = frames[:1]
         sse = "".join("data: " + json.dumps(frame) + "\n\n" for frame in frames)
         return httpx.Response(
             200,
@@ -738,7 +748,8 @@ def test_p_only_routes(
     output = asyncio.run(runner.run(args, callbacks[entry]))
     record = next(dataset.iter_jsonl(output / "request_metrics.jsonl"))
     assert record["result_status"] == "ok"
-    assert record["completion_tokens"] == 1
+    assert record["completion_tokens"] == 0
+    assert record["ttft_origin"] == "prefill_ready"
     paths = [path for path, _ in proxy.requests]
     if entry == "normal":
         assert paths == ["/v1/completions_ttft"]

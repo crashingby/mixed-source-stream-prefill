@@ -4,7 +4,7 @@
 """稳定 Prefix KV 提前 Push 的独立实验代理。
 
 外部仍使用 start/event/finish；start 只建立一次 P/D 接收关系，event 只发 P。
-finish 先返回 P 首 token，再等待 D 接收屏障并启动普通 decode。所有交接时间
+finish 先返回 P 完成通知，再等待 D 接收屏障并由 D 生成全部回答。所有交接时间
 均由本进程的 perf_counter 计量，避免跨主机时钟差污染实验。
 """
 
@@ -289,9 +289,8 @@ async def _response_events(
     prefill: dict[str, Any],
     decode_request: dict[str, Any],
     p_finish_time: float,
-    finish_without_decode: bool,
 ) -> AsyncIterator[dict[str, Any]]:
-    """保留 P 首 token，再标记 D 续写帧和一次性实验指标。
+    """发送 P 就绪事件，再标记 D 的完整回答和一次性实验指标。
 
     无论客户端选择 JSON 还是 SSE，上游 D 均使用 SSE，确保首 D token
     计时不是整个生成完成时间。Generator 的 finally 回收双侧会话。
@@ -303,71 +302,66 @@ async def _response_events(
         "finalize_wait_ms": None,
     }
     try:
-        first = common._build_prefill_stream_chunk(
-            session.prompt, prefill, is_final_chunk=finish_without_decode
+        yield common._build_prefill_ready_event(
+            session.prompt.request_id,
+            session.prompt.base_request.get("model"),
+            prefill,
         )
-        first["token_source"] = "prefill"
-        yield first
-        if not finish_without_decode:
-            finalize_wait_ms, received_metrics = await _finalize(
-                application, session, prefill
-            )
-            metrics["finalize_wait_ms"] = finalize_wait_ms
-            metrics["received_blocks_at_finalize"] = received_metrics.get(
-                "received_blocks_at_finalize"
-            )
-            # 收养与生成仍走标准 completions，严禁再次发起普通全量 KV load。
-            params = dict(prefill["kv_transfer_params"])
-            params.update(
-                stable_kv_session_id=session.session_id,
-                do_remote_prefill=False,
-                do_remote_decode=False,
-            )
-            decode_request["kv_transfer_params"] = params
-            decode_request["stream"] = True
-            decode_request["return_token_ids"] = True
-            decode_request["stream_options"] = {"include_usage": True}
-            d_request_time = time.perf_counter()
-            async with application.state.decoder["client"].stream(
-                "POST",
-                "/completions",
-                json=decode_request,
-                headers=common._authorization_headers(session.prompt.request_id),
-            ) as response:
-                if response.is_error:
-                    await response.aread()
-                    raise RuntimeError(f"D completions failed: {response.text}")
-                saw_done = False
-                async for line in response.aiter_lines():
-                    if not line.startswith("data:"):
-                        continue
-                    value = line[5:].strip()
-                    if value == "[DONE]":
-                        saw_done = True
-                        break
-                    payload = json.loads(value)
-                    if "error" in payload:
-                        raise RuntimeError(f"D completions error: {payload['error']}")
-                    if (
-                        _has_token(payload)
-                        and metrics["d_request_to_first_token_ms"] is None
-                    ):
-                        now = time.perf_counter()
-                        metrics["p_finish_to_d_first_token_ms"] = (
-                            now - p_finish_time
-                        ) * 1000
-                        metrics["d_request_to_first_token_ms"] = (
-                            now - d_request_time
-                        ) * 1000
-                    payload["id"] = f"cmpl-{session.prompt.request_id}"
-                    payload["token_source"] = "decode"
-                    usage = payload.get("usage")
-                    if isinstance(usage, dict):
-                        usage["prompt_tokens"] = max(0, usage["prompt_tokens"] - 1)
-                        usage["completion_tokens"] += 1
-                    yield payload
-                if not saw_done:
-                    raise RuntimeError("D stream closed without [DONE].")
+        finalize_wait_ms, received_metrics = await _finalize(
+            application, session, prefill
+        )
+        metrics["finalize_wait_ms"] = finalize_wait_ms
+        metrics["received_blocks_at_finalize"] = received_metrics.get(
+            "received_blocks_at_finalize"
+        )
+        # 收养与生成仍走标准 completions，严禁再次发起普通全量 KV load。
+        params = dict(prefill["kv_transfer_params"])
+        params.update(
+            stable_kv_session_id=session.session_id,
+            do_remote_prefill=False,
+            do_remote_decode=False,
+        )
+        decode_request["kv_transfer_params"] = params
+        decode_request["stream"] = True
+        decode_request["return_token_ids"] = True
+        decode_request["stream_options"] = {"include_usage": True}
+        d_request_time = time.perf_counter()
+        async with application.state.decoder["client"].stream(
+            "POST",
+            "/completions",
+            json=decode_request,
+            headers=common._authorization_headers(session.prompt.request_id),
+        ) as response:
+            if response.is_error:
+                await response.aread()
+                raise RuntimeError(f"D completions failed: {response.text}")
+            saw_done = False
+            async for line in response.aiter_lines():
+                if not line.startswith("data:"):
+                    continue
+                value = line[5:].strip()
+                if value == "[DONE]":
+                    saw_done = True
+                    break
+                payload = json.loads(value)
+                if "error" in payload:
+                    raise RuntimeError(f"D completions error: {payload['error']}")
+                if (
+                    _has_token(payload)
+                    and metrics["d_request_to_first_token_ms"] is None
+                ):
+                    now = time.perf_counter()
+                    metrics["p_finish_to_d_first_token_ms"] = (
+                        now - p_finish_time
+                    ) * 1000
+                    metrics["d_request_to_first_token_ms"] = (
+                        now - d_request_time
+                    ) * 1000
+                payload["id"] = f"cmpl-{session.prompt.request_id}"
+                payload["token_source"] = "decode"
+                yield payload
+            if not saw_done:
+                raise RuntimeError("D stream closed without [DONE].")
         # WRITE handle 的实际计时来自 P，不把控制轮询耗时冒充 KV 传输时间。
         async with asyncio.timeout(application.state.args.finalize_timeout):
             while True:
@@ -383,7 +377,7 @@ async def _response_events(
                 ][0]
                 # 很短的 decode 可能早于 P 主线程回收 WRITE 统计；在首 D token
                 # 计时完成后补齐统计，不改变 handoff 指标的计量截止点。
-                if finish_without_decode or completed_blocks == expected_blocks:
+                if completed_blocks == expected_blocks:
                     break
                 if producer_status.get("state") in ("failed", "aborted"):
                     raise RuntimeError(
@@ -428,11 +422,19 @@ async def _json_response(
     session: StableProxySession,
     prefill: dict[str, Any],
 ) -> JSONResponse:
-    """汇合 P/D 文本与 token IDs，同时保留从上游 SSE 测到的 D 首 token。"""
-    result = common._build_prefill_only_response(session.prompt, prefill)
+    """汇合 D 的全部文本与 token IDs，保留上游 SSE 的首 token 计时。"""
+    result = common._attach_prompt_stream_metadata(
+        {
+            "id": f"cmpl-{session.prompt.request_id}",
+            "object": "text_completion",
+            "model": session.prompt.base_request.get("model"),
+            "choices": [
+                {"index": 0, "text": "", "token_ids": [], "finish_reason": None}
+            ],
+        },
+        prefill,
+    )
     choice = result["choices"][0]
-    choice["text"] = ""
-    choice["token_ids"] = []
     try:
         async for payload in events:
             if "stable_kv_metrics" in payload:
@@ -470,15 +472,8 @@ async def finish(request: Request) -> JSONResponse | StreamingResponse:
             )
             p_finish_time = time.perf_counter()
             common._finish_decode_prompt_token_ids(session.prompt, prefill)
-            count = common._append_prefill_output_token_ids(session.prompt, prefill)
-            if count != 1:
-                raise HTTPException(status_code=502, detail="P must return one token.")
-            common._validate_prompt_stream_transfer(session.prompt, prefill, count)
+            common._validate_prompt_stream_transfer(session.prompt, prefill)
             decode_request = dict(session.prompt.base_request)
-            finish_without_decode = common._should_finish_without_decode(
-                decode_request, prefill, count
-            )
-            common._shrink_decode_max_tokens(decode_request, count)
             common._apply_decode_prompt_to_request(session.prompt, decode_request)
         except BaseException:
             await asyncio.shield(_cleanup(request.app, session))
@@ -489,7 +484,6 @@ async def finish(request: Request) -> JSONResponse | StreamingResponse:
         prefill,
         decode_request,
         p_finish_time,
-        finish_without_decode,
     )
     if session.prompt.base_request.get("stream", False):
         return StreamingResponse(

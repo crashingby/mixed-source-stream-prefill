@@ -1,5 +1,7 @@
 # 分段与块稀疏的生成质量实验
 
+当前 P/D 交接由 D 生成全部回答；P-only 使用 `prefill_ready` 控制事件测量 P 侧 TTFT。协议、兼容字段与验证命令见 [P/D 交接说明](../../server/PD-Handoff.md)。
+
 本目录保存完整 P→D 生成答案，比较普通完整 prefill、分段 dense，以及 Query probe 块稀疏。使用当前 `research/data/questions`、`append_chunks`、`pipeline_pools`，按 `sample_id` 对齐。默认数据集为 TriviaQA，也支持 HotpotQA。
 
 ## 模式与主要对照
@@ -154,7 +156,7 @@ CSV 中的逐样本 EM/F1 与差值使用 0–1；JSON 汇总分数使用 0–10
 
 start 发送模型 chat prefix；Append/Update 按各来源的时钟发送；finish 发送最终问题、统一短答案约束和 assistant generation header。sparse 注册的 `probe_query` 是这段**实际 finish 文本**，保证临时 Query 与最终 Query 一致。
 
-客户端完整消费 P 首 token 和 D 后续 SSE 到 `[DONE]`，并要求合法的 `stop` / `length` 终止原因。仅收到首 token 和 `[DONE]`、缺少终止原因时按失败处理，避免 D 加载失败被误计为成功答案。若 P 首 token 已满足 stop 条件，则允许合法地不再启动 D 续写。每条结果保存 P/D 输出 token 计数及 P 原始 `prompt_stream_stats`。
+客户端保留 `prefill_ready` 中的研究统计，完整消费 D 的全部回答到 `[DONE]`，并要求合法的 `stop` / `length` 终止原因。P 完成通知不计入答案，只有通知而没有 D 终止帧时按失败处理。新结果的 P 输出 token 计数为零，全部回答 token 计入 D。
 
 分段模式检查 masked-padding 元数据、Update 合并关闭、Update 接收数一致；sparse 额外检查每个有效 Append 已发布策略、完整独占块范围、评分和 Top-K、保留比例及私有 Query 页释放数。执行校验失败的答案不会被当作成功生成参与模型质量评分。
 

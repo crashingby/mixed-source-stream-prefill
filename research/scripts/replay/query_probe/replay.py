@@ -196,15 +196,16 @@ async def replay_sample(
             if response.is_error:
                 raise RuntimeError((await response.aread()).decode())
             measured = await consume_sse_response(
-                response, sent, False, False, args.http_timeout
+                response, sent, False, True, args.http_timeout
             )
         completed = True
-        assert measured.first_token_time is not None
+        assert measured.ttft_time is not None
         result["request_to_first_token_ms"] = (
-            measured.first_token_time - request_start
+            measured.ttft_time - request_start
         ) * 1000
-        result["finish_to_first_token_ms"] = (measured.first_token_time - sent) * 1000
-        result["first_token_origin"] = measured.first_token_origin
+        result["finish_to_first_token_ms"] = (measured.ttft_time - sent) * 1000
+        result["first_token_origin"] = measured.ttft_origin
+        result["ttft_scope"] = "p_side"
         result["masked_padding_manifest"] = measured.masked_padding_manifest
         stats = measured.prompt_stream_stats
         result["prompt_stream_stats"] = stats

@@ -148,14 +148,14 @@ async def _replay_normal_sample(
         metric.request_error_stage = None
 
         metric.finish_to_first_token_ms = (
-            sse_measurement.first_token_time - request_start_time
+            sse_measurement.ttft_time - request_start_time
         ) * 1000
         metric.request_to_first_token_ms = metric.finish_to_first_token_ms
         metric.finish_to_done_ms = (
             sse_measurement.completed_time - request_start_time
         ) * 1000
         metric.request_to_done_ms = metric.finish_to_done_ms
-        metric.ttft_origin = "normal_prefill"
+        metric.ttft_origin = sse_measurement.ttft_origin
         apply_completion_measurement(metric, sse_measurement, request_start_time)
         metric.result_status = "ok"
     except Exception as exc:

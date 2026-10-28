@@ -1,5 +1,7 @@
 # Query probe 功能回放
 
+当前 P/D 交接由 D 生成全部回答；P-only 使用 `prefill_ready` 控制事件测量 P 侧 TTFT。协议、兼容字段与验证命令见 [P/D 交接说明](../../server/PD-Handoff.md)。
+
 本目录验证新 Append 与临时 Query 的联合 prefill。Append 行按已发布策略稀疏读取历史块，Query 行完整因果读取，并在最后一个 attention 层统计新 Append 的块分数。评分完成后保留正式 KV、释放临时 Query 页。
 
 默认从 `research/data/append_chunks/triviaqa/web_unfiltered_dev_v1` 和 `research/data/pipeline_pools/triviaqa/wiki_dev_k5_ef8_v1` 按 sample ID 加载三条请求。问题清单使用公共 replay 的 TriviaQA 默认路径。输入均传原文，由 P 节点分词。
@@ -111,8 +113,8 @@ sbatch --nodelist=g2c12 --time=7-00:00:00 \
 
 ### 时间口径与结果
 
-- **整体 TTFT：** `request_to_first_token_ms`，从 start 请求提交前到 P 首 token 到达客户端，包含来源事件等待、HTTP 和服务端排队、probe、评分及正式 prefill。
-- **finish TTFT：** `finish_to_first_token_ms`，从最后的 finish POST 提交到同一个首 token，便于与已有 replay 对比。
+- **整体 TTFT：** `request_to_first_token_ms`，从 start 请求提交前到 P 完成通知到达客户端，包含来源事件等待、HTTP 和服务端排队、probe、评分及正式 prefill。
+- **finish TTFT：** `finish_to_first_token_ms`，从最后的 finish POST 提交到同一个完成通知，便于与已有 replay 对比。
 - `source_dispatch_ms`、事件实际迟发量和 `start_ack_ms` 用于判断客户端发送是否受到服务端阻塞影响。
 - 每组报告均值、P50、P95、P99、成功数、失败数及完成吞吐。正式结果即时写入 `requests.jsonl`，`requests_summary.json` 提供运行中的进度；完成后写 `summary.json`。
 - `comparison/` 生成配对 CSV、JSON 和 `ttft_comparison.png`。两边样本集合、最终正文和完整事件计划的 SHA256 必须一致；只对双方都成功的请求计算配对指标，并保留失败计数。`mean_speedup` 为 dense 平均延迟除以 sparse 平均延迟，大于 1 表示 sparse 更快。

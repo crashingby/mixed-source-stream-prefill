@@ -70,7 +70,7 @@ from research.scripts.replay.generation_quality.evaluators import references
 logger = logging.getLogger(__name__)
 
 MIX_SOURCE_SCHEMA_VERSION = "prompt_stream_mixed/v2"
-QUALITY_REPLAY_SCHEMA_VERSION = "generation_quality_replay/v3"
+QUALITY_REPLAY_SCHEMA_VERSION = "generation_quality_replay/v4"
 DEFAULT_DATA_DIR = Path("research/data/mix_source")
 DEFAULT_OUTPUT_DIR = Path("research/scripts/replay/generation_quality/results")
 DEFAULT_PROXY_URL = "http://127.0.0.1:8000"
@@ -124,7 +124,7 @@ class SseCompletion:
     num_token_ids: int
     prompt_stream_stats: dict[str, Any] | None = None  # P 的实际执行和 probe 统计。
     masked_padding: dict[str, Any] | None = None  # P/D 共同使用的物理 padding 区间。
-    num_prefill_token_ids: int = 0  # 区分 P 首 token 和 D 的完整续写。
+    num_prefill_token_ids: int = 0  # 兼容旧结果；当前回答全部来自 D，此项为零。
     num_decode_token_ids: int = 0
 
 
@@ -475,14 +475,14 @@ def _apply_generation_params(
     payload["max_tokens"] = args.max_tokens
     payload["temperature"] = args.temperature
     payload["seed"] = args.seed
-    payload["return_token_ids"] = True  # 完整 SSE 精确统计 P 和 D 的输出 token。
+    payload["return_token_ids"] = True  # 完整 SSE 精确统计 D 的输出 token。
     if args.stop_at_newline:
         # SQuAD 评测期待短答案片段；两种模式必须使用完全相同的停止条件。
         payload["stop"] = ["\n"]
 
 
 async def _consume_sse(response: httpx.Response) -> SseCompletion:
-    """消费完整 SSE，将 P 首 token 与 D 后续 token 文本拼接成答案。"""
+    """消费完整 SSE，保留 P 控制元数据并汇合 D 的全部回答。"""
     content_type = response.headers.get("content-type", "")
     if "text/event-stream" not in content_type:
         body = (await response.aread()).decode("utf-8", errors="replace")
@@ -495,7 +495,7 @@ async def _consume_sse(response: httpx.Response) -> SseCompletion:
     num_prefill_token_ids = num_decode_token_ids = 0
     stats = padding = None
     async for payload in iter_sse_payloads(response):
-        # 元数据通常在 P 首帧；后续 D 帧没有这些字段，不能覆盖已保存值。
+        # 元数据通常在 P 就绪事件；后续 D 帧没有这些字段，不能覆盖已保存值。
         if "prompt_stream_stats" in payload:
             stats = payload["prompt_stream_stats"]
         if "prompt_stream_masked_padding" in payload:
@@ -515,10 +515,8 @@ async def _consume_sse(response: httpx.Response) -> SseCompletion:
                 num_chunks += 1
             token_ids = choice.get("token_ids")
             if isinstance(token_ids, list):
-                # proxy 未标注来源时，首个 token 帧来自 P，后续帧来自 D。
-                origin = payload.get("token_source") or (
-                    "prefill" if num_token_ids == 0 else "decode"
-                )
+                # 当前协议所有回答均由 D 生成；历史显式来源仍可识别。
+                origin = payload.get("token_source") or "decode"
                 num_token_ids += len(token_ids)
                 if origin == "prefill":
                     num_prefill_token_ids += len(token_ids)
@@ -531,7 +529,7 @@ async def _consume_sse(response: httpx.Response) -> SseCompletion:
                         f"Generation failed: finish_reason={finish_reason}"
                     )
 
-    # D 加载失败可能只留下 P 的首 token 和 [DONE]，不能作为完整答案评分。
+    # D 加载失败可能只留下 P 的完成通知和 [DONE]，不能作为完整答案评分。
     if finish_reason is None:
         raise RuntimeError("Incomplete generation: SSE has no terminal finish_reason.")
 

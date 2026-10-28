@@ -1,5 +1,7 @@
 # Token 失效统计
 
+当前 P/D 交接由 D 生成全部回答；P-only 使用 `prefill_ready` 控制事件测量 P 侧 TTFT。协议、兼容字段与验证命令见 [P/D 交接说明](../../server/PD-Handoff.md)。
+
 本实验用同一批问题、证据和原始事件时间线，比较三种上下文建模方式导致的
 **已计算 token 失效数**。三个回放入口都使用普通 proxy 的 P-only TTFT 路由，不启动 D。
 
