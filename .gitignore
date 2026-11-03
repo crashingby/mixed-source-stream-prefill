@@ -262,4 +262,5 @@ research/scripts/replay/generation_quality/results
 research/scripts/replay/masked_padding/results
 research/scripts/replay/token_invalidation/results
 research/scripts/replay/query_probe/results
+research/scripts/replay/stable_kv_push/results
 /tmp/
