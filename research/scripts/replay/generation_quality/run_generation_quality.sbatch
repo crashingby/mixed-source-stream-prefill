@@ -27,6 +27,7 @@ OVERRIDES=(
   PROXY_URL:proxy-url MODEL:model TOKENIZER_MODEL:tokenizer-model
   START_INDEX:start-index MAX_REQUESTS:max-requests MAX_TOKENS:max-tokens
   TEMPERATURE:temperature SEED:seed QPS:qps MAX_CONCURRENCY:max-concurrency
+  LOAD_MODE:load-mode MAX_INFLIGHT:max-inflight
   INTER_REQUEST_DELAY:inter-request-delay APPEND_INITIAL_DELAY:append-initial-delay
   UPDATE_INITIAL_DELAY:update-initial-delay APPEND_CHUNK_INTERVAL:append-chunk-interval
   UPDATE_CHUNK_INTERVAL:update-chunk-interval SOURCE_FINISH_DELAY:source-finish-delay

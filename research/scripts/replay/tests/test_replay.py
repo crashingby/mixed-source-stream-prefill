@@ -23,6 +23,7 @@ import pytest
 
 from research.scripts.replay.common import config, dataset, runner
 from research.scripts.replay.common.dispatch import send_source_events
+from research.scripts.replay.common.load import mark_request_sent
 from research.scripts.replay.common.prompt import (
     ChatTemplateRenderer,
     LocalTemplateTokenizer,
@@ -37,6 +38,7 @@ from research.scripts.replay.generation_quality.evaluators import (
     references,
     score_answer,
 )
+from research.scripts.replay.query_probe import replay as query_probe
 from research.scripts.replay.segmented_prefill import (
     replay_merged_update,
     replay_normal,
@@ -408,7 +410,9 @@ class FakeProxy:
             },
             {"choices": [], "stable_kv_metrics": metrics},
         ]
-        if "/finish" in path and body["request_id"].startswith("quality-stream-"):
+        if "/finish" in path and body["request_id"].startswith(
+            ("quality-stream-", "probe-")
+        ):
             # 质量入口要求使用可观测的 P 执行统计，不能把未启用 probe 当作 sparse。
             stats = {
                 "coalescing_enabled": False,
@@ -484,7 +488,10 @@ def test_http_workflow(
         raise AssertionError("text transport must not tokenize in replay")
 
     def client_factory(args: argparse.Namespace) -> httpx.AsyncClient:
-        return httpx.AsyncClient(transport=httpx.MockTransport(proxy.handle))
+        return httpx.AsyncClient(
+            transport=httpx.MockTransport(proxy.handle),
+            event_hooks={"request": [mark_request_sent]},
+        )
 
     monkeypatch.setattr(LocalTemplateTokenizer, "encode", no_encode)
     target = (
@@ -525,6 +532,10 @@ def test_http_workflow(
         records = list(dataset.iter_jsonl(output / "requests.jsonl"))
         assert all(record["transport_status"] == "ok" for record in records)
         assert all(record["metrics_status"] == "valid" for record in records)
+    load = dataset.load_json(output / "load_summary.json")
+    assert load["sent_requests"] == load["successful_requests"] == 2
+    assert load["latency_ms"]["arrival_to_first_token_ms"]["count"] == 2
+    assert all(record["load"]["ttft_origin"] == "decode" for record in records)
     assert len(proxy.final_prompts) == 2
     assert all(
         "UP_NEW" in prompt and "UP_OLD" not in prompt for prompt in proxy.final_prompts
@@ -548,6 +559,57 @@ def test_http_workflow(
             render_sample_prompt(case, renderer).logical_prompt_text for case in cases
         ]
     assert proxy.final_prompts == expected
+
+
+@pytest.mark.parametrize("mode", ["dense", "sparse"])
+def test_query_probe_uses_shared_qps_runner(
+    monkeypatch: pytest.MonkeyPatch, inputs: dict[str, Path], mode: str
+) -> None:
+    """专用 probe 入口同样记录开环时间线，预热与正式请求分别计量。"""
+    values = dataset.load_json(inputs["config"])
+    for name in ("max_tokens", "temperature", "seed"):
+        values.pop(name)
+    write_json(inputs["config"], values)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "probe",
+            "--config",
+            str(inputs["config"]),
+            "--output-dir",
+            str(inputs["output"]),
+            "--run-name",
+            mode,
+            "--mode",
+            mode,
+            "--qps",
+            "100",
+            "--max-concurrency",
+            "1",
+            "--warmup-requests",
+            "1",
+        ],
+    )
+    proxy = FakeProxy()
+    monkeypatch.setattr(
+        query_probe,
+        "create_http_client",
+        lambda args: httpx.AsyncClient(
+            transport=httpx.MockTransport(proxy.handle),
+            event_hooks={"request": [mark_request_sent]},
+        ),
+    )
+    output = asyncio.run(query_probe.run(query_probe.parse_args()))
+    rows = list(dataset.iter_jsonl(output / "requests.jsonl"))
+    assert len(rows) == 2
+    assert all(row["status"] == "ok" for row in rows)
+    assert all(row["load"]["ttft_origin"] == "prefill_ready" for row in rows)
+    load = dataset.load_json(output / "summary.json")["load_summary"]
+    assert load["planned_qps"] == 100
+    assert load["inflight_limit"] is None
+    assert load["sent_requests"] == load["successful_requests"] == 2
+    assert dataset.load_json(output / "warmup/load_summary.json")["sent_requests"] == 1
 
 
 @pytest.mark.parametrize("ttft_only", [True, False])

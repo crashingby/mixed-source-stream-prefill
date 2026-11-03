@@ -14,6 +14,7 @@ from collections.abc import Sequence
 from dataclasses import asdict
 from typing import Any
 
+from .load import LOAD_METRIC_FIELDS
 from .models import RequestMetric, SseMeasurement
 from .stats_v2 import (
     PromptStreamStatsV2Error,
@@ -26,6 +27,7 @@ logger = logging.getLogger(__name__)
 
 
 REQUEST_METRIC_FIELDS = (
+    *LOAD_METRIC_FIELDS,
     "run_id",
     "mode",
     "sample_id",
@@ -667,6 +669,8 @@ def request_metric_row(metric: RequestMetric) -> dict[str, Any]:
     row = asdict(metric)
     row.pop("event_metrics", None)
     row.pop("response_payloads", None)
+    load = row.pop("load", None) or {}
+    row.update({field: load.get(field) for field in LOAD_METRIC_FIELDS})
     return row
 
 

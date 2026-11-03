@@ -1,5 +1,7 @@
 # 分段与块稀疏的生成质量实验
 
+所有入口的请求级 QPS、闭环逻辑并发和客户端等待统计统一使用 [负载说明](../LOAD.md)。正 QPS 默认独立发送，`max_concurrency` 只控制闭环；开环保护上限使用 `max_inflight`。
+
 当前 P/D 交接由 D 生成全部回答；P-only 使用 `prefill_ready` 控制事件测量 P 侧 TTFT。协议、兼容字段与验证命令见 [P/D 交接说明](../../server/PD-Handoff.md)。
 
 本目录保存完整 P→D 生成答案，比较普通完整 prefill、分段 dense，以及 Query probe 块稀疏。使用当前 `research/data/questions`、`append_chunks`、`pipeline_pools`，按 `sample_id` 对齐。默认数据集为 TriviaQA，也支持 HotpotQA。
@@ -96,7 +98,7 @@ PROBE_KEEP_RATIO=0.5 RUN_PREFIX=triviaqa-sparse-quality \
 sbatch research/scripts/replay/generation_quality/run_generation_quality.sbatch
 ```
 
-`REPLAY_CONFIG` 可指定自定义 JSON，`MODE_ORDER` 可调换执行顺序，且不得包含重复模式。默认 `QPS=0 MAX_CONCURRENCY=1` 串行；设为 `MAX_CONCURRENCY=4` 时按闭环维持最多四个在途请求，完成一个再补一个，各槽位遵守 `INTER_REQUEST_DELAY`。显式配置正 QPS 时改为按到达时钟发送，并受同一并发上限约束。
+`REPLAY_CONFIG` 可指定自定义 JSON，`MODE_ORDER` 可调换执行顺序，且不得包含重复模式。默认 `QPS=0 MAX_CONCURRENCY=1` 串行；设为 `MAX_CONCURRENCY=4` 时按闭环维持最多四个在途请求，完成一个再补一个，各槽位遵守 `INTER_REQUEST_DELAY`。显式配置正 QPS 时改为按独立到达时钟发送，默认不限制在途数；需要客户端保护上限时单独设置 `MAX_INFLIGHT`。
 
 共享参数优先来自 JSON；只有显式设置的环境变量才追加为 CLI 覆盖，例如 `MODEL`、`TOKENIZER_MODEL`、`MAX_REQUESTS`、`MAX_TOKENS`、`SEED`、`PROBE_KEEP_RATIO`、事件间隔等。更换模型时同时设置 `MODEL` 和 `TOKENIZER_MODEL`，并与 P/D 保持一致。输出位置由 `OUTPUT_DIR` 控制，默认是本目录 `results/`。Slurm 总日志也写到该目录；提交前需要创建它。
 

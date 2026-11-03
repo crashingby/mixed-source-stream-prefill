@@ -110,6 +110,7 @@ run_replay() {
     --qps "${qps}"
     --arrival-process "${ARRIVAL_PROCESS}"
     --random-seed "${random_seed}"
+    --load-mode "${LOAD_MODE:-auto}" --max-inflight "${MAX_INFLIGHT:-0}"
     --max-concurrency "${MAX_CONCURRENCY}"
     --append-initial-delay "${APPEND_INITIAL_DELAY}"
     --update-initial-delay "${UPDATE_INITIAL_DELAY}"
@@ -158,7 +159,7 @@ run_replay() {
 if (( WARMUP_REQUESTS > 0 )); then
   read -r first_update_interval _ <<< "${UPDATE_INTERVAL_LIST}"
   warmup_name="warmup-${COALESCING_PROFILE}-job-${SLURM_JOB_ID:-manual}"
-  run_replay \
+  LOAD_MODE=closed_loop MAX_INFLIGHT=0 MAX_CONCURRENCY=1 run_replay \
     0 \
     "${first_update_interval}" \
     0 \

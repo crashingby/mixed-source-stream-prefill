@@ -25,19 +25,21 @@ from research.scripts.replay.common.config import (
 )
 from research.scripts.replay.common.dataset import select_samples
 from research.scripts.replay.common.dispatch import abort_prompt_stream
+from research.scripts.replay.common.load import read_load_summary
 from research.scripts.replay.common.models import SampleReplayInput
 from research.scripts.replay.common.probe import validate_probe
 from research.scripts.replay.common.prompt import (
     ChatTemplateRenderer,
     render_sample_prompt,
 )
+from research.scripts.replay.common.runner import execute_workload
 from research.scripts.replay.common.timeline import (
-    planned_arrival_offsets,
     sleep_until,
     source_timing,
 )
 from research.scripts.replay.common.transport import (
     consume_sse_response,
+    create_http_client,
     normalize_v1_url,
     post_json,
 )
@@ -241,7 +243,7 @@ async def replay_sample(
 
 
 async def run(args: argparse.Namespace) -> Path:
-    """预热后执行同一批样本；closed-loop 保持指定并发，结果逐请求落盘。"""
+    """预热后按公共闭环或 QPS 时钟执行同一批样本，结果逐请求落盘。"""
     samples = select_samples(args)
     if (
         args.max_requests > 0
@@ -262,60 +264,57 @@ async def run(args: argparse.Namespace) -> Path:
     (directory / "samples.json").write_text(
         json.dumps([sample.sample_id for sample in samples], indent=2)
     )
-    limits = httpx.Limits(
-        max_connections=max(100, args.max_concurrency * 4),
-        max_keepalive_connections=max(20, args.max_concurrency * 2),
-    )
-    async with httpx.AsyncClient(
-        timeout=args.http_timeout, trust_env=False, limits=limits
-    ) as client:
+    async with create_http_client(args) as client:
 
         async def phase(selected: list[SampleReplayInput], name: str) -> dict[str, Any]:
-            """用固定 worker 数产生闭环负载；预热与正式计时独立。"""
-            offsets = planned_arrival_offsets(
-                len(selected), args.qps, args.arrival_process, args.random_seed
-            )
-            pending = iter(enumerate(selected))
+            """预热和正式回放复用公共时钟，分别保存负载及功能统计。"""
             results: list[dict[str, Any]] = []
             epoch = time.perf_counter()
+            load_dir = directory if name == "requests" else directory / name
             with (directory / f"{name}.jsonl").open("w", encoding="utf-8") as output:
 
-                async def worker() -> None:
-                    """一个请求结束后立即取下一个，维持目标在途请求数。"""
-                    for index, sample in pending:
-                        if args.qps > 0:
-                            await sleep_until(epoch + offsets[index])
-                        admitted = time.perf_counter()
-                        result = await replay_sample(client, sample, renderer, args)
-                        result["sample_index"] = index
-                        result["queue_delay_ms"] = (
-                            max(0.0, admitted - epoch - offsets[index]) * 1000
-                            if args.qps > 0
-                            else 0.0
-                        )
-                        results.append(result)
-                        output.write(json.dumps(result, ensure_ascii=False) + "\n")
-                        output.flush()
-                        if len(results) % 10 == 0 or result["status"] == "error":
-                            logger.info(
-                                "%s %s: %d/%d complete; %s %s",
-                                args.mode,
-                                name,
-                                len(results),
-                                len(selected),
-                                sample.sample_id,
-                                result["status"],
-                            )
-                        # 每条完成后刷新，长任务中途也能查看均值与失败数。
-                        summary = summarize(results, time.perf_counter() - epoch)
-                        (directory / f"{name}_summary.json").write_text(
-                            json.dumps(summary, indent=2)
-                        )
+                async def execute(
+                    index: int, offset: float, queue_delay: float
+                ) -> dict[str, Any]:
+                    result = await replay_sample(
+                        client, selected[index], renderer, args
+                    )
+                    result.update(
+                        sample_index=index,
+                        planned_arrival_offset_ms=offset,
+                        queue_delay_ms=queue_delay,
+                    )
+                    return result
 
-                await asyncio.gather(
-                    *(worker() for _ in range(min(args.max_concurrency, len(selected))))
+                def record(result: dict[str, Any]) -> None:
+                    results.append(result)
+                    output.write(json.dumps(result, ensure_ascii=False) + "\n")
+                    output.flush()
+                    if len(results) % 10 == 0 or result["status"] == "error":
+                        logger.info(
+                            "%s %s: %d/%d complete; %s %s",
+                            args.mode,
+                            name,
+                            len(results),
+                            len(selected),
+                            result["sample_id"],
+                            result["status"],
+                        )
+                    (directory / f"{name}_summary.json").write_text(
+                        json.dumps(
+                            summarize(results, time.perf_counter() - epoch), indent=2
+                        )
+                    )
+
+                await execute_workload(
+                    len(selected), args, execute, on_result=record, output_dir=load_dir
                 )
-            return summarize(results, time.perf_counter() - epoch)
+            summary = summarize(results, time.perf_counter() - epoch)
+            summary["load_summary"] = read_load_summary(load_dir)
+            (directory / f"{name}_summary.json").write_text(
+                json.dumps(summary, indent=2)
+            )
+            return summary
 
         if args.warmup_requests and not args.dry_run:
             warmup = await phase(samples[: args.warmup_requests], "warmup")
@@ -324,8 +323,8 @@ async def run(args: argparse.Namespace) -> Path:
         summary = await phase(samples, "requests")
     summary.update(
         mode=args.mode,
-        concurrency=args.max_concurrency,
-        load_model="closed_loop" if args.qps == 0 else "open_loop",
+        concurrency=args.max_concurrency if args.load_mode == "closed_loop" else None,
+        load_model=args.load_mode,
         warmup_requests=min(args.warmup_requests, len(samples)),
     )
     (directory / "summary.json").write_text(json.dumps(summary, indent=2))

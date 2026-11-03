@@ -1,5 +1,7 @@
 # Token 失效统计
 
+所有入口的请求级 QPS、闭环逻辑并发和客户端等待统计统一使用 [负载说明](../LOAD.md)。正 QPS 默认独立发送，`max_concurrency` 只控制闭环；开环保护上限使用 `max_inflight`。
+
 当前 P/D 交接由 D 生成全部回答；P-only 使用 `prefill_ready` 控制事件测量 P 侧 TTFT。协议、兼容字段与验证命令见 [P/D 交接说明](../../server/PD-Handoff.md)。
 
 本实验用同一批问题、证据和原始事件时间线，比较三种上下文建模方式导致的

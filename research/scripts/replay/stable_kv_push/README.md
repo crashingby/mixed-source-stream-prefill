@@ -1,5 +1,7 @@
 # 稳定 KV 提前 Push 实验
 
+所有入口的请求级 QPS、闭环逻辑并发和客户端等待统计统一使用 [负载说明](../LOAD.md)。正 QPS 默认独立发送，`max_concurrency` 只控制闭环；开环保护上限使用 `max_inflight`。
+
 当前 P/D 交接由 D 生成全部回答；P-only 使用 `prefill_ready` 控制事件测量 P 侧 TTFT。协议、兼容字段与验证命令见 [P/D 交接说明](../../server/PD-Handoff.md)。
 
 本目录比较两种完整 P/D 生成流程：**提前 Push 已完成的稳定 Prefix+Append 整块**，以及 **P finish 后统一 Push 全部 KV**。两组使用相同 `NixlPushConnector`、相同接收会话协议、相同模型和 Masked Padding，只改变请求里的 `early_stable_kv_push`。
@@ -263,9 +265,9 @@ warmup 和背景负载造成的顺序效应。P/D 的四小时默认时限不足
 | `--data-dir` | `research/data/mix_source_perf_qwen` | 读取其 `requests/*.json`，不改原始数据。 |
 | `--max-requests` | `16` | 选择多少条完整数据；0 表示全部。指定 `--query-id` 时回放指定样本。 |
 | `--start-index` | `0` | 从完整样本序列的哪个位置开始。 |
-| `--qps` | `0` | 逻辑请求的目标到达率；0 为一个完成再发下一个。 |
+| `--qps` | `0` | 逻辑请求计划到达率；0 使用闭环并发。 |
 | `--arrival-process` | `poisson` | 正 QPS 时采用泊松或 `fixed` 固定到达。 |
-| `--max-concurrency` | `8` | 从 start 到完整输出的最大在途逻辑请求数，排队延迟单独统计。 |
+| `--max-concurrency` | `8` | 闭环从 start 到完整输出的最大在途逻辑请求数；开环使用 `max_inflight`。 |
 | `--append-chunk-interval` / `--update-chunk-interval` | `0.5` / `0.2` 秒 | 两个来源内部目标事件间隔。来源并发，同一来源逐次等待 ACK。 |
 | `--append-initial-delay` / `--update-initial-delay` | `0` 秒 | start ACK 后首事件的延迟。 |
 | `--source-finish-delay` | `0` 秒 | 该来源最后一次数据 ACK 后发 source_finished 的延迟。 |

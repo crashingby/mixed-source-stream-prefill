@@ -64,6 +64,10 @@ RUN_WARMUP="${RUN_WARMUP:-1}"
 WARMUP_REQUESTS="${WARMUP_REQUESTS:-8}"
 FAIL_FAST="${FAIL_FAST:-0}"
 EXTRA_REPLAY_ARGS="${EXTRA_REPLAY_ARGS:-}"
+extra_replay_args=()
+if [[ -n "${EXTRA_REPLAY_ARGS}" ]]; then
+  read -r -a extra_replay_args <<< "${EXTRA_REPLAY_ARGS}"
+fi
 RUN_PREFIX="${RUN_PREFIX:-masked-padding}"
 JOB_TAG="${SLURM_JOB_ID:-manual}"
 
@@ -111,16 +115,16 @@ run_replay() {
   local num_requests="$5"
   local experiment_suite="masked_padding"
   local concurrency="${MAX_CONCURRENCY}"
+  local load_mode="${LOAD_MODE:-auto}"
+  local max_inflight="${MAX_INFLIGHT:-0}"
   local suffix
   local run_name
 
-  # qps=0 表示闭环串行基准；并发必须同步收紧为 1。
-  if [[ "${qps}" == "0" || "${qps}" == "0.0" ]]; then
-    concurrency=1
-  fi
   if [[ "${phase}" == "warmup" ]]; then
     experiment_suite="masked_padding_warmup"
     concurrency=1
+    load_mode=closed_loop
+    max_inflight=0
   fi
 
   suffix="$(qps_suffix "${qps}")"
@@ -138,6 +142,8 @@ run_replay() {
     --arrival-process "${ARRIVAL_PROCESS}"
     --random-seed "${random_seed}"
     --max-concurrency "${concurrency}"
+    --load-mode "${load_mode}"
+    --max-inflight "${max_inflight}"
     --append-initial-delay "${APPEND_INITIAL_DELAY}"
     --update-initial-delay "${UPDATE_INITIAL_DELAY}"
     --append-chunk-interval "${APPEND_CHUNK_INTERVAL}"
@@ -174,7 +180,7 @@ run_replay() {
   fi
 
   echo "=== phase=${phase} qps=${qps} repeat=${repeat_index} run=${run_name} ==="
-  "${PYTHON_BIN}" "${REPLAY_SCRIPT}" "${args[@]}" ${EXTRA_REPLAY_ARGS}
+  "${PYTHON_BIN}" "${REPLAY_SCRIPT}" "${args[@]}" "${extra_replay_args[@]}"
 }
 
 # 完整路径 warmup 同时触发 P、D 与 NIXL；warmup 结果不会进入正式汇总。

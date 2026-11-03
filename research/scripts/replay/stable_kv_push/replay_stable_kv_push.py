@@ -33,6 +33,7 @@ from research.scripts.replay.common.dispatch import abort_prompt_stream
 from research.scripts.replay.common.dispatch import (
     send_source_events as _send_source_events,
 )
+from research.scripts.replay.common.load import mark_first_response, read_load_summary
 from research.scripts.replay.common.models import (
     RenderedReplayPrompt as RenderedReplayPrompt,
 )
@@ -136,6 +137,8 @@ async def consume_stable_sse(response: httpx.Response) -> StreamObservation:
     observation = StreamObservation()
     async for payload in iter_sse_payloads(response):
         observation.observe(payload, time.perf_counter())
+        if observation.first_decode_time is not None:
+            mark_first_response("decode", observation.first_decode_time)
     return observation
 
 
@@ -429,7 +432,9 @@ async def run(args: argparse.Namespace) -> Path:
                 stream.write(json.dumps(row, ensure_ascii=False) + "\n")
                 stream.flush()
 
-            await execute_workload(len(samples), args, execute, on_result=record)
+            await execute_workload(
+                len(samples), args, execute, on_result=record, output_dir=output
+            )
     wall_seconds = time.perf_counter() - epoch
     scalar_keys = sorted(
         {
@@ -451,6 +456,7 @@ async def run(args: argparse.Namespace) -> Path:
         if row["transport_status"] == "ok"
     )
     summary = {
+        "load_summary": read_load_summary(output),
         "num_requests": len(rows),
         "num_transport_success": sum(row["transport_status"] == "ok" for row in rows),
         "num_metrics_valid": sum(row["metrics_status"] == "valid" for row in rows),

@@ -43,6 +43,10 @@ HTTP_TIMEOUT="${HTTP_TIMEOUT:-600}"
 RUN_PREFIX="${RUN_PREFIX:-ttft}"
 FAIL_FAST="${FAIL_FAST:-0}"
 EXTRA_REPLAY_ARGS="${EXTRA_REPLAY_ARGS:-}"
+extra_replay_args=()
+if [[ -n "${EXTRA_REPLAY_ARGS}" ]]; then
+  read -r -a extra_replay_args <<< "${EXTRA_REPLAY_ARGS}"
+fi
 
 echo "SLURM_JOB_ID=${SLURM_JOB_ID:-}"
 echo "SLURM_JOB_NODELIST=${SLURM_JOB_NODELIST:-}"
@@ -87,6 +91,7 @@ run_replay() {
     --qps "${qps}"
     --arrival-process "${ARRIVAL_PROCESS}"
     --random-seed "${RANDOM_SEED}"
+    --load-mode "${LOAD_MODE:-auto}" --max-inflight "${MAX_INFLIGHT:-0}"
     --max-concurrency "${MAX_CONCURRENCY}"
     --max-tokens "${MAX_TOKENS}"
     --temperature "${TEMPERATURE}"
@@ -117,14 +122,14 @@ run_replay() {
       --update-chunk-interval "${UPDATE_CHUNK_INTERVAL}" \
       --source-finish-delay "${SOURCE_FINISH_DELAY}" \
       --ttft-only \
-      ${EXTRA_REPLAY_ARGS}
+      "${extra_replay_args[@]}"
     return
   fi
 
   # normal TTFT 也只测 P 节点的首 token，避免 D decode 干扰三种模式比较。
   common_args+=(--ttft-only)
 
-  "${PYTHON_BIN}" "${script_path}" "${common_args[@]}" ${EXTRA_REPLAY_ARGS}
+  "${PYTHON_BIN}" "${script_path}" "${common_args[@]}" "${extra_replay_args[@]}"
 }
 
 for qps in ${QPS_LIST}; do

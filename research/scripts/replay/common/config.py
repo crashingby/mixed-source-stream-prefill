@@ -12,6 +12,7 @@ import math
 import sys
 from pathlib import Path
 
+from .load import resolve_load_mode
 from .models import ReplayMode
 
 logger = logging.getLogger(__name__)
@@ -107,9 +108,7 @@ def parse_args(mode: ReplayMode) -> argparse.Namespace:
         "--qps",
         type=float,
         default=1.0,
-        help=(
-            "Logical request start rate. Set 0 for closed-loop sequential execution."
-        ),
+        help=("Logical request arrival rate. Set 0 for closed-loop concurrency."),
     )
     parser.add_argument(
         "--arrival-process",
@@ -121,7 +120,7 @@ def parse_args(mode: ReplayMode) -> argparse.Namespace:
         "--max-concurrency",
         type=int,
         default=32,  # 与批量回放 sbatch 统一默认在途请求上限。
-        help="Maximum in-flight logical requests within one replay mode.",
+        help="Closed-loop logical concurrency; open-loop uses --max-inflight.",
     )
     parser.add_argument(
         "--append-initial-delay",
@@ -388,10 +387,44 @@ def add_shared_arguments(parser: argparse.ArgumentParser) -> None:
     """为所有实验添加独立数据、文本传输和配置文件入口。"""
     # 保留各实验原有默认值，仅为尚未暴露公共负载参数的入口补齐选项。
     workload_options = (
-        ("--qps", {"type": float, "default": 0.0}),
+        (
+            "--load-mode",
+            {
+                "choices": ("auto", "closed_loop", "open_loop"),
+                "default": "auto",
+                "help": "auto: 正 QPS 为开环，零 QPS 为闭环",
+            },
+        ),
+        (
+            "--max-inflight",
+            {
+                "type": int,
+                "default": 0,
+                "help": "开环客户端在途上限；0 不限，不使用闭环的 max_concurrency",
+            },
+        ),
+        (
+            "--qps",
+            {"type": float, "default": 0.0, "help": "逻辑请求到达速率；0 使用闭环并发"},
+        ),
+        (
+            "--inter-request-delay",
+            {
+                "type": float,
+                "default": 0.0,
+                "help": "闭环每槽位完成后的空闲秒数；开环忽略",
+            },
+        ),
         ("--arrival-process", {"choices": ("fixed", "poisson"), "default": "fixed"}),
         ("--random-seed", {"type": int, "default": 0}),
-        ("--max-concurrency", {"type": int, "default": 1}),
+        (
+            "--max-concurrency",
+            {
+                "type": int,
+                "default": 1,
+                "help": "闭环在途逻辑请求数；开环使用 max_inflight",
+            },
+        ),
     )
     for option, options in workload_options:
         if option not in parser._option_string_actions:
@@ -482,4 +515,6 @@ def parse_configured_args(
             if action.required:
                 action.required = False
         parser.set_defaults(**defaults)
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    args.load_mode = resolve_load_mode(args)
+    return args

@@ -93,6 +93,7 @@ shared_args=(
   --qps "${QPS}"
   --arrival-process "${ARRIVAL_PROCESS}"
   --random-seed "${RANDOM_SEED}"
+  --load-mode "${LOAD_MODE:-auto}" --max-inflight "${MAX_INFLIGHT:-0}"
   --max-concurrency "${MAX_CONCURRENCY}"
   --append-initial-delay "${APPEND_INITIAL_DELAY}"
   --update-initial-delay "${UPDATE_INITIAL_DELAY}"

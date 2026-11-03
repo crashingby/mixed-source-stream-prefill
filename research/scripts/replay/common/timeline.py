@@ -50,7 +50,7 @@ def planned_arrival_offsets(
     random_seed: int,
 ) -> list[float]:
     """生成一个 mode 内每个请求相对启动点的计划到达时间秒。"""
-    if qps == 0:
+    if num_requests == 0 or qps == 0:
         return [0.0] * num_requests
     random_generator = random.Random(random_seed)
     offsets = [0.0]

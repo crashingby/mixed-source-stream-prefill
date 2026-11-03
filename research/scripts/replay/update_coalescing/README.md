@@ -1,5 +1,7 @@
 # Update 合并回放实验
 
+所有入口的请求级 QPS、闭环逻辑并发和客户端等待统计统一使用 [负载说明](../LOAD.md)。正 QPS 默认独立发送，`max_concurrency` 只控制闭环；开环保护上限使用 `max_inflight`。
+
 本目录用于评估 Prompt Stream 的 **Update coalescing（Update 合并）** 功能。实验通过
 RESTFUL API 回放同一批 mixed-source 请求，同时测量：
 
@@ -235,7 +237,8 @@ sbatch research/scripts/replay/update_coalescing/run_policy_sweep.sbatch
 | `NUM_REPEATS` | `3` | 每个 `(QPS, Update interval)` 点独立重复多少次。 |
 | `BASE_RANDOM_SEED` | `2026` | 第一次重复的到达过程 seed；第 $i$ 次重复使用 `base+i-1`。 |
 | `ARRIVAL_PROCESS` | `poisson` | 请求到达过程，当前常用 `poisson`；也支持 `fixed`。 |
-| `MAX_CONCURRENCY` | `32` | 客户端最多同时保留多少个未完成逻辑请求。 |
+| `MAX_CONCURRENCY` | `32` | 闭环在途逻辑请求上限；正 QPS 时不生效。 |
+| `MAX_INFLIGHT` | `0` | 开环客户端保护上限；0 不限。 |
 
 正式 run 数为：
 
@@ -257,8 +260,9 @@ $$
 
 `QPS_LIST` 控制逻辑请求的计划启动时间。请求启动后，它自己的 Append/Update 事件仍按
 source interval 继续发送。因此流式 workload 的 HTTP event 到达率会高于逻辑 QPS。
-当 `MAX_CONCURRENCY` 已满时，新请求会在客户端等待空位，实际 achieved QPS 可能低于
-offered QPS；这正是高负载结果必须同时报告成功率和完成吞吐的原因。
+开环默认持续按计划发送。显式设置 `MAX_INFLIGHT` 后，到达上限的请求会在客户端
+等待空位；计划时间保持不变，实际发送 QPS 和包含客户端等待的延迟会单独记录。
+高负载结果还需同时报告成功率和完成吞吐。
 
 #### Source 时序参数
 
@@ -302,11 +306,11 @@ Slurm replay 通常运行在其它节点，应使用 proxy 所在节点 hostname
 
 - 使用 `UPDATE_INTERVAL_LIST` 的第一个值。
 - 使用 `BASE_RANDOM_SEED`。
-- 使用 QPS `0`，共享回放器逐请求完成后再启动下一个，因此是串行 warmup。
+- 显式使用 `load_mode=closed_loop`、QPS `0` 和并发 `1`，因此是串行 warmup。
 - 写入 `${OUTPUT_DIR}/warmup`，汇总脚本默认跳过。
 
-它不是每个 QPS 点或每次重复前都重新 warmup。QPS `0` 的串行行为不受
-`MAX_CONCURRENCY` 上限影响；正式采集仍使用统一的并发配置，默认值为 `32`。
+它不是每个 QPS 点或每次重复前都重新 warmup。预热参数只作用于该次调用；
+正式采集按 `LOAD_MODE`、`QPS_LIST` 和对应的客户端上限执行。
 
 ### 汇总与绘图
 
@@ -912,7 +916,8 @@ scancel "${P_JOB_ID}"
 | `UPDATE_INTERVAL_LIST` | `0.2 0.01` | Update source 内事件间隔，单位秒。 |
 | `NUM_REPEATS` | `3` | 每个 QPS/interval 点的重复次数。 |
 | `BASE_RANDOM_SEED` | `2026` | 第一次 Poisson seed；后续依次加 1。 |
-| `MAX_CONCURRENCY` | `32` | 客户端同时在途的请求上限。 |
+| `MAX_CONCURRENCY` | `32` | 闭环在途逻辑请求上限；正 QPS 时不生效。 |
+| `MAX_INFLIGHT` | `0` | 开环客户端保护上限；0 不限。 |
 | `APPEND_INITIAL_DELAY` | `0` | Append 首事件延迟。 |
 | `UPDATE_INITIAL_DELAY` | `0` | Update 首事件延迟。 |
 | `APPEND_CHUNK_INTERVAL` | `0.5` | Append source 内 chunk 间隔。 |

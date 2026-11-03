@@ -55,7 +55,7 @@ def test_quality_closed_loop_concurrency() -> None:
             return index
 
         async with asyncio.timeout(5):
-            results = await execute_workload(12, args, execute, closed_loop=True)
+            results = await execute_workload(12, args, execute)
         assert peak == 4
         assert active == 0
         assert results == list(range(12))

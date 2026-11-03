@@ -404,3 +404,138 @@ CPU 测试覆盖联合完成提交、边界保护、跨 step Query 分数、迟�
 实验记录至少包含数据集 EM / F1、联合 work 耗时、TTFT、吞吐、attempt 次数、模型 forward 次数、拆分原因、Append / Query 各自执行 token 数、评分扫描开销、策略构造耗时、临时 KV 峰值、保护块数量和实际跳过块数量。联合 forward 的总耗时不能再与其中的 Append、Query 子项重复相加；细分成本通过 profiler 或相同配置的消融实验估计。probe 的临时释放单独统计，不混入现有 Update 失效 token 指标。
 
 **端到端收益必须覆盖 probe、额外评分扫描、策略同步与调度开销。** 需要同时使用无 probe 的完整注意力基线、全保留但执行联合 probe 的对照，以及相同预算的随机或固定块选择，区分新增成本、评分价值和稀疏 kernel 本身的收益。另以相同 mask 和评分口径比较联合与分开执行，单独衡量合并调度和模型调用的收益。
+
+## 面向论文的算法形式化
+
+Query probe 可描述为**面向流式知识预填充的查询引导在线 KV 块选择算法**：在新知识到达时估计其各 KV 块对固定用户问题的重要性，将选择结果用于后续知识计算，并在最终问答阶段完整读取有效缓存。以下形式化对应当前实现，使用最后层评分、Append 内固定保留比例以及跨层共享策略。
+
+### 在线状态与联合预填充
+
+设固定模板为 $T$，提前注册的问题后缀为 $Q$，第 $i$ 个 Append 为 $A_i$。其评分上下文为 $C_i=[T;A_1;\ldots;A_i]$，不包含 Update。令 $\mathcal K_{<i}$ 表示模板与历史 Append 的正式 KV，$\Pi_{<i}=\{S_1,\ldots,S_{i-1}\}$ 表示已经发布的选择策略。一次逻辑联合预填充写为：
+
+$$
+\left(\mathcal K_i,\widetilde{\mathcal K}_{Q,i},\mathbf s_i\right)
+=
+\operatorname{JointPrefill}
+\left(A_i,Q;\mathcal K_{<i},\Pi_{<i}\right).
+$$
+
+其中 $\mathcal K_i$ 为新 Append 的正式 KV，$\widetilde{\mathcal K}_{Q,i}$ 为临时 Query 的私有 KV，$\mathbf s_i$ 为当前 Append 的候选块分数。Append 行使用历史策略，Query 行完整读取当前合法前缀；两者共享模型前向中的投影和 MLP 批处理。这里的联合操作可以由多个调度 step 完成，并不要求单次 GPU forward 容纳全部输入。
+
+评分完成后保留 $\mathcal K_i$、发布 $S_i$，并在所有在途访问结束后释放 $\widetilde{\mathcal K}_{Q,i}$。$S_i$ 仅影响后续读取，不追溯改变 $\mathcal K_i$；策略中的块编号始终使用逻辑编号。
+
+### 查询引导的块重要性
+
+令 $\mathcal V_i(q)$ 为第 $i$ 次 probe 中第 $q$ 个 Query token 的合法可见位置，包含 $C_i$ 以及截至自身的 Query 前缀，排除 padding。最后一个 attention 层中，head $h$ 对位置 $t$ 的权重为：
+
+$$
+p^{(i)}_{h,q,t}
+=
+\frac{\exp\!\left(\langle\mathbf q^{(i)}_{h,q},
+\mathbf k^{(i)}_{g(h),t}\rangle/\sqrt{d_h}\right)}
+{\displaystyle\sum_{u\in\mathcal V_i(q)}
+\exp\!\left(\langle\mathbf q^{(i)}_{h,q},
+\mathbf k^{(i)}_{g(h),u}\rangle/\sqrt{d_h}\right)},
+\qquad t\in\mathcal V_i(q).
+$$
+
+$\mathbf q$ 和 $\mathbf k$ 是实际经过 RoPE 的向量，$d_h$ 为 head 维度，$g(h)$ 为 GQA 的 Query-head 到 KV-head 映射。分母覆盖完整合法上下文，即使评分只采集当前 Append 的候选块，也不在候选块内部重新归一化。
+
+设 $m=|Q|$、Query head 数为 $H$，对当前 Append 的完整独占 KV 块 $B_b$，定义：
+
+$$
+s_{i,b}
+=\frac{1}{Hm}\sum_{h=1}^{H}\sum_{q=1}^{m}
+\sum_{t\in B_b}p^{(i)}_{h,q,t}.
+$$
+
+该分数表示对 Query 行与 heads 取平均后，分配给整个 KV 块的注意力权重总量。当前实现的 $Q$ 包含注册的问题后缀及模板边界，$m$ 也按整个后缀计数。候选块均含 16 个有效 token，因此同一次选择中的块长度一致。Query 被拆成多次执行时先累加部分和，最后按完整的 $Hm$ 归一化。
+
+同时记录均匀注意力基准下的校正分数：
+
+$$
+r_{i,b}
+=\frac{1}{Hm}\sum_{h=1}^{H}\sum_{q=1}^{m}
+\frac{|\mathcal V_i(q)|}{|B_b|}
+\sum_{t\in B_b}p^{(i)}_{h,q,t}.
+$$
+
+均匀注意力下该分数为 $1$，可用于观察上下文长度变化带来的影响。当前选择仍依据 $s_{i,b}$；$r_{i,b}$ 不参与排序，也不用于不同到达时刻之间的全局阈值比较。
+
+### 固定预算下的策略生成
+
+令 $\mathcal E_i$ 为 $A_i$ 的完整独占候选块集合，$\mathcal G_i$ 为涉及其边界的保护块集合，$\rho\in[0,1]$ 为候选块保留比例。选择过程可表述为固定预算下的注意力权重总量最大化：
+
+$$
+k_i=\left\lceil\rho|\mathcal E_i|\right\rceil,
+\qquad
+\widehat S_i\in
+\underset{S\subseteq\mathcal E_i,\ |S|=k_i}{\arg\max}
+\sum_{b\in S}s_{i,b},
+\qquad
+S_i=\mathcal G_i\cup\widehat S_i.
+$$
+
+此目标由 Top-K 直接求解，并列分数按逻辑块编号确定顺序。若 $\mathcal E_i$ 为空，则仅保留保护块。保护块不占候选预算，但计入实际注意力读取量；$\rho=0$ 也不意味着整个 Append 完全不可见。
+
+该目标是**基于注意力信号的局部代理目标**，其最优解仅指给定分数与块数预算下的最优选择，不表示回答质量最优。策略按 Append 独立生成，发布后冻结，避免旧策略变化使已有 KV 的依赖关系失效。
+
+### 后续执行的统一注意力掩码
+
+对任意一次执行 work $w$，令 $\mathcal J_w$ 为其快照中允许应用策略的历史 Append 集合，定义跳过的逻辑块：
+
+$$
+\mathcal D_w
+=\bigcup_{j\in\mathcal J_w}
+\left(\mathcal E_j\setminus\widehat S_j\right).
+$$
+
+令 $\mathcal V_w(x)$ 为 query 行 $x$ 在原分段语义下的合法 KV 位置，已经包含阶段可见范围、因果关系和 padding 约束；$\mathcal F_w$ 为需要完整读取的行集合，包括临时 probe Query、最终 Query 和 decode 行。统一掩码为：
+
+$$
+M_w(x,t)=
+\begin{cases}
+0, & t\in\mathcal V_w(x)\ \land\
+\left(x\in\mathcal F_w\ \lor\
+\operatorname{block}(t)\notin\mathcal D_w\right),\\
+-\infty, & \text{其他情况}.
+\end{cases}
+$$
+
+每层、每个 head 的注意力据此计算为：
+
+$$
+\operatorname{Attention}_w(\mathbf Q,\mathbf K,\mathbf V)
+=\operatorname{softmax}\!\left(
+\frac{\mathbf Q\mathbf K^{\mathsf T}}{\sqrt{d_h}}+M_w
+\right)\mathbf V.
+$$
+
+新 Append 与 Update 行应用 $\mathcal D_w$，当前知识段内部仍保持完整因果注意力。保护块不进入 $\mathcal D_w$。实现通过紧凑页列表跳过相应 K/V 读取及 QK、PV 计算，而不是先算完整矩阵再施加掩码。
+
+最终 Query 和 decode 完整读取所有合法 KV，但历史 KV 已可能由稀疏依赖产生。因此，最终完整读取不构成与完整 prefill 等价的保证。未选中的正式 KV 仍保留，算法本身不减少正式缓存容量或 P/D 传输量。
+
+### 算法流程与收益条件
+
+算法输入为固定 $Q$、保留比例 $\rho$ 以及流式 Append / Update 事件；持久状态为正式 KV、分段版本和已发布策略 $\Pi$。
+
+1. **收到 Append $A_i$：** 确定真实 token 边界、候选块和保护块，冻结历史前缀、策略与 attempt 标识，建立 $[A_i;Q]$ 的联合执行视图。
+2. **执行联合预填充：** 按 $M_w$ 计算 Append 与临时 Query；Append KV 写入正式段，Query KV 写入私有段。最后层复用 Query attention 的 LSE，仅重算候选块 QK 并累加评分。
+3. **提交策略：** 全部 Append 与 Query 行完成且 attempt 校验通过后，归一化分数，求解 Top-K 并发布 $S_i$；等待在途引用结束后回收私有 Query KV。
+4. **收到 Update：** 按原分段版本与 LCP 规则确定需要重算的部分，使用当前冻结策略执行知识预填充。
+5. **收到 finish：** 校验问题与注册 $Q$ 一致，完整读取正式 KV 执行最终 Query，随后由 D 完整读取有效 KV 进行生成。
+
+令 $\mathcal W_{\mathrm{knowledge}}$ 表示实际执行的 Append / Update 知识预填充工作，$\Delta T_{\mathrm{attn}}(w)$ 表示在相同形状和后端下，跳过历史块所节省的 attention 时间。计算侧获得净收益需要满足：
+
+$$
+\sum_{w\in\mathcal W_{\mathrm{knowledge}}}
+\Delta T_{\mathrm{attn}}(w)
+>
+T_{\mathrm{probe,extra}}
++T_{\mathrm{score}}
++T_{\mathrm{policy}}.
+$$
+
+$T_{\mathrm{probe,extra}}$ 为联合输入加入临时 Query 后的增量模型执行成本，$T_{\mathrm{score}}$ 为额外评分成本，$T_{\mathrm{policy}}$ 包含策略构造、同步与新增调度成本。各项应互斥统计，不能把独立 Query forward 时间直接叠加到已含 Query 的联合耗时上。此式用于成本分析，端到端 TTFT 还受事件到达、排队及资源竞争影响，必须通过回放测量。
+
+论文实验可用 $\operatorname{Quality}_{\mathrm{sparse}}\geq\operatorname{Quality}_{\mathrm{dense}}-\varepsilon$ 表达可接受质量损失的目标，其中质量采用同一数据集的 EM / F1，$\varepsilon$ 为预先设定的容忍度。该约束由实验检验；当前算法没有从注意力分数推导出的回答误差上界，也不在线保证该约束成立。

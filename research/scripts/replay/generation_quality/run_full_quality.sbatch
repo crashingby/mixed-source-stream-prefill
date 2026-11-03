@@ -84,7 +84,7 @@ SERVER_ARGS=(
   --model "${MODEL_PATH}" --served-model-name "${MODEL}"
   --host 127.0.0.1 --dtype auto --generation-config vllm
   --gpu-memory-utilization "${GPU_MEMORY_UTILIZATION}"
-  --max-model-len "${MAX_MODEL_LEN}" --max-num-seqs "${MAX_CONCURRENCY}"
+  --max-model-len "${MAX_MODEL_LEN}" --max-num-seqs "${MAX_NUM_SEQS:-4}"
   --max-num-batched-tokens "${MAX_NUM_BATCHED_TOKENS}"
   --block-size 16 --tensor-parallel-size 1
   --enforce-eager --no-async-scheduling --prompt-stream-masked-padding

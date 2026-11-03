@@ -3,10 +3,16 @@
 
 """汇总 Query probe 的端到端 TTFT 与 finish TTFT，保留失败计数。"""
 
-import statistics
 from typing import Any
 
+from research.scripts.replay.common.load import distribution
+
 LATENCY_FIELDS = (
+    "queue_delay_ms",
+    "dispatch_lag_ms",
+    "arrival_to_first_token_ms",
+    "sent_to_first_token_ms",
+    "arrival_to_done_ms",
     "request_to_first_token_ms",
     "finish_to_first_token_ms",
     "source_dispatch_ms",
@@ -14,28 +20,6 @@ LATENCY_FIELDS = (
     "event_lateness_mean_ms",
     "event_lateness_max_ms",
 )
-
-
-def distribution(values: list[float]) -> dict[str, float | int] | None:
-    """使用线性插值分位数；空数据没有可报告的延迟。"""
-    if not values:
-        return None
-    ordered = sorted(values)
-
-    def percentile(fraction: float) -> float:
-        position = (len(ordered) - 1) * fraction
-        lower = int(position)
-        upper = min(lower + 1, len(ordered) - 1)
-        return ordered[lower] + (ordered[upper] - ordered[lower]) * (position - lower)
-
-    return {
-        "count": len(values),
-        "mean": statistics.fmean(values),
-        "p50": percentile(0.5),
-        "p95": percentile(0.95),
-        "p99": percentile(0.99),
-        "max": ordered[-1],
-    }
 
 
 def summarize(results: list[dict[str, Any]], elapsed: float) -> dict[str, Any]:
@@ -48,7 +32,9 @@ def summarize(results: list[dict[str, Any]], elapsed: float) -> dict[str, Any]:
         "elapsed_s": elapsed,
         "successful_requests_per_second": len(valid) / elapsed if elapsed else 0,
         "latency_ms": {
-            field: distribution([row[field] for row in valid])
+            field: distribution(
+                [row[field] for row in valid if row.get(field) is not None]
+            )
             for field in LATENCY_FIELDS
         },
         "preemptions": sum(

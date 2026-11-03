@@ -660,6 +660,7 @@ async def run(args: argparse.Namespace) -> Path:
                     execute,
                     on_result=record,
                     fail_fast_error=failure,
+                    output_dir=directory,
                 )
     finally:
         write_outputs(directory, metrics, len(samples))

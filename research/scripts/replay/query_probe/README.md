@@ -1,5 +1,7 @@
 # Query probe 功能回放
 
+所有入口的请求级 QPS、闭环逻辑并发和客户端等待统计统一使用 [负载说明](../LOAD.md)。正 QPS 默认独立发送，`max_concurrency` 只控制闭环；开环保护上限使用 `max_inflight`。
+
 当前 P/D 交接由 D 生成全部回答；P-only 使用 `prefill_ready` 控制事件测量 P 侧 TTFT。协议、兼容字段与验证命令见 [P/D 交接说明](../../server/PD-Handoff.md)。
 
 本目录验证新 Append 与临时 Query 的联合 prefill。Append 行按已发布策略稀疏读取历史块，Query 行完整因果读取，并在最后一个 attention 层统计新 Append 的块分数。评分完成后保留正式 KV、释放临时 Query 页。
@@ -95,9 +97,9 @@ srun --partition=gpu --nodelist=g2c10 --nodes=1 --ntasks=1 --gres=gpu:1 \
 
 `performance.json` 默认选择相同的前 1000 条可回放 TriviaQA，Append 间隔 50 ms、Update 间隔 20 ms。矩阵默认并发度为 4、8、16，共 6 组正式测试、6000 次请求。每组先用前 16 条样本预热，预热不进入统计。正式矩阵前还有两种模式各 2 条请求的接口预检。
 
-负载采用 **closed-loop（闭环）**：保持至多指定数量的在途请求，一个完成后立即补下一个，不固定 QPS。对比时应同时看 TTFT 和完成吞吐。不同并发度的两种模式交替先后顺序，全部串行使用同一张 GPU。
+矩阵默认采用 **closed-loop（闭环）**：保持至多指定数量的在途请求，一个完成后立即补下一个，不固定 QPS。对比时应同时看 TTFT 和完成吞吐。不同负载点的两种模式交替先后顺序，全部串行使用同一张 GPU。也可传入 `--qps 0.25 0.5 1 --arrival-process poisson`，切换为独立到达的开环 QPS 矩阵；`--max-inflight` 默认 0，不套用闭环并发限制。开环图同时展示包含客户端等待的延迟与实际 HTTP 发送后的延迟，详细口径见 [负载说明](../LOAD.md)。
 
-P 固定使用 Qwen2.5-3B、TP=1、eager、`CHUNK_SPARSE_ATTN`、16384 上下文、2048 单轮 token 预算、至少 32 个调度槽位及 0.8 显存利用率。整个矩阵不启动 D，不启用 KV transfer。仓库 `tmp/` 下的临时编译缓存由所有测试组共用，退出时自动清理；日志、源码快照和结果保存在本目录 `results/performance-<job_id>/`。
+P 固定使用 Qwen2.5-3B、TP=1、eager、`CHUNK_SPARSE_ATTN`、16384 上下文、2048 单轮 token 预算及 0.8 显存利用率。调度槽位由独立参数 `--max-num-seqs` 控制，默认 32。整个矩阵不启动 D，不启用 KV transfer。仓库 `tmp/` 下的临时编译缓存由所有测试组共用，退出时自动清理；日志、源码快照和结果保存在本目录 `results/performance-<job_id>/`。
 
 从仓库根目录提交，节点名按当前空闲资源选择：
 
@@ -117,7 +119,7 @@ sbatch --nodelist=g2c12 --time=7-00:00:00 \
 - **finish TTFT：** `finish_to_first_token_ms`，从最后的 finish POST 提交到同一个完成通知，便于与已有 replay 对比。
 - `source_dispatch_ms`、事件实际迟发量和 `start_ack_ms` 用于判断客户端发送是否受到服务端阻塞影响。
 - 每组报告均值、P50、P95、P99、成功数、失败数及完成吞吐。正式结果即时写入 `requests.jsonl`，`requests_summary.json` 提供运行中的进度；完成后写 `summary.json`。
-- `comparison/` 生成配对 CSV、JSON 和 `ttft_comparison.png`。两边样本集合、最终正文和完整事件计划的 SHA256 必须一致；只对双方都成功的请求计算配对指标，并保留失败计数。`mean_speedup` 为 dense 平均延迟除以 sparse 平均延迟，大于 1 表示 sparse 更快。
+- `comparison/` 生成配对 CSV、JSON；闭环图为 `ttft_comparison.png`，开环图为 `qps_ttft_comparison.png`。两边样本集合、最终正文和完整事件计划的 SHA256 必须一致；开环还校验逐请求到达时间一致。只对双方都成功的请求计算配对指标，并保留失败计数。`mean_speedup` 为 dense 平均延迟除以 sparse 平均延迟，大于 1 表示 sparse 更快。
 
 当前矩阵强制 `ATTENTION_BACKEND=CHUNK_SPARSE_ATTN`，并在 `environment.json` 记录后端。两边都使用新版算子；比较包含 probe、评分和稀疏元数据的全部成本。请求长度和边界已改为运行时元数据，不再逐长度编译稀疏 kernel；dtype、布局和内核配置仍可能产生编译变体，`jit_variants.json` 记录本作业的稀疏内核变体。正式测量期间的编译也计入延迟。结果反映系统运行表现，不能直接解读为纯 attention kernel 的加速比。
 

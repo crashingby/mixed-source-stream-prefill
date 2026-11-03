@@ -6,6 +6,7 @@
 import argparse
 import hashlib
 import json
+import math
 import os
 import shutil
 import signal
@@ -104,6 +105,18 @@ def main() -> None:
     """依次运行配对实验，每对完成即更新对比图；结束后释放本作业资源。"""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--concurrency", type=int, nargs="+", default=[4, 8, 16])
+    parser.add_argument(
+        "--qps", type=float, nargs="+", help="开环 QPS 列表；省略时扫描闭环 concurrency"
+    )
+    parser.add_argument(
+        "--max-num-seqs", type=int, default=32, help="P 节点调度上限，与客户端负载独立"
+    )
+    parser.add_argument(
+        "--max-inflight", type=int, default=0, help="开环保护上限；0 不限"
+    )
+    parser.add_argument(
+        "--arrival-process", choices=("fixed", "poisson"), default="fixed"
+    )
     parser.add_argument("--max-requests", type=int, default=1000)
     parser.add_argument("--warmup-requests", type=int, default=16)
     parser.add_argument("--keep-ratio", type=float, default=0.5)
@@ -123,8 +136,19 @@ def main() -> None:
     )
     parser.add_argument("--output-dir", type=Path)
     args = parser.parse_args()
-    if not args.concurrency or min(args.concurrency) < 1 or args.max_requests < 1:
+    if (
+        not args.concurrency
+        or min(args.concurrency) < 1
+        or args.max_requests < 1
+        or args.max_num_seqs < 1
+    ):
         parser.error("并发度和请求数必须为正数")
+    if args.max_inflight < 0 or (args.qps is None and args.max_inflight):
+        parser.error("max-inflight 仅用于 QPS 扫描，且必须非负")
+    if args.qps is not None and any(
+        not math.isfinite(qps) or qps <= 0 for qps in args.qps
+    ):
+        parser.error("QPS 扫描值必须有限且大于零")
     os.chdir(REPO)
     # 同节点可有多个 GPU 作业；先同时保留两个空闲端口，不能连接到别人的服务。
     with socket.socket() as p_socket, socket.socket() as proxy_socket:
@@ -152,7 +176,7 @@ def main() -> None:
         MODEL_PATH=args.model_path,
         PORT=str(args.p_port),
         ATTENTION_BACKEND="CHUNK_SPARSE_ATTN",
-        MAX_NUM_SEQS=str(max(32, max(args.concurrency))),
+        MAX_NUM_SEQS=str(args.max_num_seqs),
         MAX_NUM_BATCHED_TOKENS="2048",
         MAX_MODEL_LEN="16384",
         GPU_MEMORY_UTILIZATION="0.8",
@@ -224,23 +248,33 @@ def main() -> None:
             wait_ready(proxy, f"http://127.0.0.1:{args.proxy_port}/openapi.json")
             # 正式 1000 请求前先跑两种模式的短检验，避免长作业晚发现接口错误。
             cases = [
-                (f"preflight-{mode}", mode, 2, 2, 0) for mode in ("dense", "sparse")
+                (f"preflight-{mode}", mode, 2, 2, 0, 0.0)
+                for mode in ("dense", "sparse")
             ]
-            for index, concurrency in enumerate(args.concurrency):
+            settings = (
+                [(f"qps{qps:g}", 1, qps) for qps in args.qps]
+                if args.qps is not None
+                else [
+                    (f"c{concurrency}", concurrency, 0.0)
+                    for concurrency in args.concurrency
+                ]
+            )
+            for index, (label, concurrency, qps) in enumerate(settings):
                 modes = ("dense", "sparse") if index % 2 == 0 else ("sparse", "dense")
                 if args.reverse_order:
                     modes = tuple(reversed(modes))
                 cases.extend(
                     (
-                        f"{mode}-c{concurrency}",
+                        f"{mode}-{label}",
                         mode,
                         concurrency,
                         args.max_requests,
                         args.warmup_requests,
+                        qps,
                     )
                     for mode in modes
                 )
-            for name, mode, concurrency, count, warmup in cases:
+            for name, mode, concurrency, count, warmup, qps in cases:
                 print(f"Starting {name}: {count} requests", flush=True)
                 command = [
                     sys.executable,
@@ -249,6 +283,14 @@ def main() -> None:
                     str(args.config),
                     "--mode",
                     mode,
+                    "--load-mode",
+                    "open_loop" if qps else "closed_loop",
+                    "--qps",
+                    str(qps),
+                    "--max-inflight",
+                    str(args.max_inflight if qps else 0),
+                    "--arrival-process",
+                    args.arrival_process,
                     "--max-concurrency",
                     str(concurrency),
                     "--max-requests",

@@ -61,6 +61,7 @@ for ((repeat=1; repeat<=NUM_REPEATS; repeat++)); do
         --model "${MODEL}" \
         --tokenizer-model "${TOKENIZER_MODEL}" \
         --max-requests "${MAX_REQUESTS}" \
+        --load-mode "${LOAD_MODE:-auto}" --max-inflight "${MAX_INFLIGHT:-0}" \
         --max-concurrency "${MAX_CONCURRENCY}" \
         --qps "${qps}" \
         --arrival-process poisson \

@@ -42,6 +42,7 @@ from research.scripts.replay.common.dispatch import (
     abort_prompt_stream as _abort_prompt_stream,
 )
 from research.scripts.replay.common.dispatch import send_source_events
+from research.scripts.replay.common.load import mark_first_response, read_load_summary
 from research.scripts.replay.common.models import (
     RenderedReplayPrompt as RenderedQualityPrompt,
 )
@@ -165,6 +166,7 @@ class GenerationResult:
     num_decode_token_ids: int = 0
     source_events_sha256: str = ""  # 配对时同时校验历史快照和来源时间配置。
     generation_settings: dict[str, Any] | None = None  # 固定模型、模板和采样口径。
+    load: dict[str, Any] | None = None  # 到达、客户端等待和真实 HTTP 发送时钟。
 
 
 def _load_gold_manifest(path: Path) -> dict[str, GoldAnswerRecord]:
@@ -514,6 +516,8 @@ async def _consume_sse(response: httpx.Response) -> SseCompletion:
                 text_parts.append(text)
                 num_chunks += 1
             token_ids = choice.get("token_ids")
+            if text or token_ids:
+                mark_first_response(payload.get("token_source") or "decode")
             if isinstance(token_ids, list):
                 # 当前协议所有回答均由 D 生成；历史显式来源仍可识别。
                 origin = payload.get("token_source") or "decode"
@@ -1112,7 +1116,7 @@ async def run(args: argparse.Namespace) -> Path:
                 execute,
                 on_result=record,
                 fail_fast_error=failure,
-                closed_loop=True,
+                output_dir=run_directory,
             )
 
     _write_json(
@@ -1124,6 +1128,7 @@ async def run(args: argparse.Namespace) -> Path:
             "num_successful_requests": num_ok,
             "num_failed_requests": num_error,
             "generation_file": str(generations_path),
+            "load_summary": read_load_summary(run_directory),
         },
     )
     return run_directory

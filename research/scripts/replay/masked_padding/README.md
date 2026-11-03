@@ -1,5 +1,7 @@
 # Masked Padding 性能对比
 
+所有入口的请求级 QPS、闭环逻辑并发和客户端等待统计统一使用 [负载说明](../LOAD.md)。正 QPS 默认独立发送，`max_concurrency` 只控制闭环；开环保护上限使用 `max_inflight`。
+
 本目录评估 `PROMPT_STREAM_MASKED_PADDING=0/1` 对分段流式 Prefill 的性能影响。
 两组实验都使用同一份 mixed-source 数据、相同事件到达计划、相同 Triton
 attention 后端和相同 P/D 资源。唯一主动变量是 P、D 是否启用中间 padding
@@ -199,9 +201,10 @@ MASKED_PADDING=1
 | 参数 | 默认值 | 含义 |
 | --- | ---: | --- |
 | `MASKED_PADDING` | 必填 | 当前 P/D 的真实模式；`0` 为 padding 参与 attention，`1` 为 mask |
-| `QPS_LIST` | `0.5 1 2 4` | offered load；可额外加入 `0` 做闭环串行测试 |
+| `QPS_LIST` | `0.5 1 2 4` | 计划逻辑请求 QPS；`0` 使用 `MAX_CONCURRENCY` 闭环并发 |
 | `MAX_REQUESTS` | `512` | 每个 QPS、phase、repeat 的逻辑请求数 |
-| `MAX_CONCURRENCY` | `32` | replay 客户端允许的最大在途逻辑请求数；QPS 为 `0` 时脚本强制为 `1` |
+| `MAX_CONCURRENCY` | `32` | 闭环在途逻辑请求上限；正 QPS 时不生效 |
+| `MAX_INFLIGHT` | `0` | 开环客户端保护上限；0 不限 |
 | `NUM_REPEATS` | `3` | 每个配置的正式重复次数 |
 | `MAX_TOKENS` | `128` | `full` 阶段由 D 生成的总输出上限；P 内部采样不计入回答 |
 | `RUN_TTFT_SUITE` | `1` | 是否运行 P-only TTFT 阶段 |
@@ -282,7 +285,7 @@ $$
   不是要求两组逐 token 输出相同。
 - `ttft` 阶段不会启动 D，不能据此判断 decode TPS。
 - `full` 阶段的 TPOT 包含 P→D handoff 和 D 首次调度。这是客户端视角的真实代价；
-  如果需要纯 kernel decode 吞吐，应额外运行 `QPS_LIST="0"` 的串行组，并结合
+  如果需要纯 kernel decode 吞吐，应额外运行 `QPS_LIST="0" MAX_CONCURRENCY=1` 的串行组，并结合
   profiler 分离 NIXL 时间。
 - 首轮 Triton JIT、首次 NIXL 建链、不同节点的后台 GPU 负载和抢占都会显著影响
   尾延迟。warmup 与重复实验不能省略。

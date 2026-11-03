@@ -16,7 +16,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from .config import STREAM_TIMING_MODES
+from .load import read_load_summary
 from .metrics import (
     EVENT_METRIC_FIELDS,
     REQUEST_METRIC_FIELDS,
@@ -128,19 +128,11 @@ def write_run_outputs(
         {
             "replay_mode": args.replay_mode,
             "ttft_definition": (
-                "Milliseconds from POST /v1/prompt_stream/finish to the first "
-                "proxy SSE completion token."
-                if args.replay_mode in STREAM_TIMING_MODES
-                else (
-                    "Milliseconds from POST /v1/completions_ttft to the first "
-                    "P-node completion token."
-                    if args.ttft_only
-                    else (
-                        "Milliseconds from POST /v1/completions to the first "
-                        "P-node completion token in the P-to-D path."
-                    )
-                )
+                "P-only: prefill_ready; full PD: D first answer token. "
+                "Existing request/finish fields exclude client admission waiting; "
+                "arrival_to_first_token_ms includes all client waiting."
             ),
+            "load_summary": read_load_summary(run_directory),
             "num_selected_samples": len(samples),
             "num_completed_requests": len(metrics),
             "num_uncompleted_requests": len(samples) - len(metrics),

@@ -1,5 +1,7 @@
 # 科研数据回放
 
+所有入口的请求级 QPS、闭环逻辑并发和客户端等待统计统一使用 [负载说明](LOAD.md)。正 QPS 默认独立发送，`max_concurrency` 只控制闭环；开环保护上限使用 `max_inflight`。
+
 当前 P/D 交接由 D 生成全部回答；P-only 使用 `prefill_ready` 控制事件测量 P 侧 TTFT。协议、兼容字段与验证命令见 [P/D 交接说明](../server/PD-Handoff.md)。
 
 本目录把离线证据转换为 REST 请求，比较普通整段 Prefill、分段流式 Prefill、
@@ -18,6 +20,7 @@ Update 合并、masked padding 和稳定 KV 提前传输。各实验保留独立
 | `generation_quality/` | `normal/segmented/sparse` 保存完整答案，`evaluate_answers.py` 按 TriviaQA/HotpotQA 协议评分并比较分段与稀疏退化。 |
 | `token_invalidation/` | 三个回放入口比较 Update-first、Append-first 整体建模与分段管理的实际失效 token，使用 P-only TTFT 路由。 |
 | `query_probe/` | `replay.py`，经 P-only TTFT 路由验证联合 Append/Query prefill、块评分、固定比例选择及临时 KV 回收。 |
+| `mixed_workload/` | 普通完整 prefill 与流式请求共用到达时间线，比较纯 Update 与分段 + 稀疏，并分别统计普通/流式 TTFT。 |
 | `stable_kv_push/` | `replay_stable_kv_push.py`，分别观察 P 完成通知、D 首 token 与实际 KV 传输指标。 |
 | `tests/` | CPU 回归测试，使用临时数据和模拟 HTTP 响应。 |
 
@@ -25,6 +28,8 @@ Update 合并、masked padding 和稳定 KV 提前传输。各实验保留独立
 实际实现位于公共包。已有汇总、绘图入口和历史结果仍可读取；各实验使用独立结果目录。
 
 Query probe 的启动脚本、数据配置与功能校验见 [query_probe/README.md](query_probe/README.md)。
+
+普通请求与流式请求共存的混合负载、分配比例及配对报告见 [mixed_workload/README.md](mixed_workload/README.md)。
 
 ## Token 失效实验
 
@@ -102,8 +107,9 @@ normal 的整段分词与 stream 的逐块分词可能在边界处不同；本�
 
 | 参数 | 发送语义 |
 | --- | --- |
-| `qps` | 大于 0 时按 fixed/poisson 生成绝对请求到达时间；0 时一个请求完成后才发送下一个。 |
-| `max_concurrency` | 在途逻辑请求上限；QPS 时间不因排队重新起算，准入延迟单独记录。 |
+| `qps` | 大于 0 时按 fixed/poisson 生成绝对请求到达时间；0 时按 `max_concurrency` 维持闭环请求数。 |
+| `max_concurrency` | 闭环在途逻辑请求上限；正 QPS 不使用此值。 |
+| `max_inflight` | 开环客户端保护上限；0 不限，到期后等槽位的时间单独记录。 |
 | `append_initial_delay` / `update_initial_delay` | 从 start ACK 到该来源首条数据的目标延迟。 |
 | `append_chunk_interval` / `update_chunk_interval` | 第 i 条数据目标为 `initial_delay + i * interval`。同源每条均等待 ACK；ACK 慢会导致迟发，不额外累加 interval。 |
 | `source_finish_delay` | 最后一条数据 ACK 后到该来源 `source_finished` 的延迟；空来源从 initial delay 起算。 |

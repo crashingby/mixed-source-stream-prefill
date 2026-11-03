@@ -15,6 +15,7 @@ from typing import Any
 
 import httpx
 
+from .load import mark_first_response, mark_request_sent, resolve_load_mode
 from .models import SseMeasurement
 
 logger = logging.getLogger(__name__)
@@ -216,6 +217,7 @@ async def consume_sse_body(
             prefill_ready_time = time.perf_counter()
             if ttft_only:
                 # 控制通知完成 P 侧 TTFT 测量，但没有生成任何回答 token。
+                mark_first_response("prefill_ready", prefill_ready_time)
                 break
             continue
 
@@ -230,6 +232,7 @@ async def consume_sse_body(
                 if first_token_time is None:
                     first_token_time = token_arrival_time
                     first_token_origin = payload.get("token_source") or "decode"
+                    mark_first_response(first_token_origin, token_arrival_time)
                 completion_chunks += 1
                 completion_chars += len(chunk_text(choice))
                 raw_token_ids = choice.get("token_ids")
@@ -321,11 +324,20 @@ async def consume_sse_response(
 
 def create_http_client(args: argparse.Namespace) -> httpx.AsyncClient:
     """为 PD 回放创建不继承外部代理、连接数足够的客户端。"""
-    concurrency = getattr(args, "max_concurrency", 1)
+    mode = resolve_load_mode(args)
+    concurrency = (
+        getattr(args, "max_concurrency", 1)
+        if mode == "closed_loop"
+        else getattr(args, "max_inflight", 0)
+    )
     return httpx.AsyncClient(
         timeout=args.http_timeout,
         trust_env=False,
-        limits=httpx.Limits(max_connections=max(8, concurrency * 3)),
+        # 开环不在连接池内再次限流；有限在途时为每请求两来源及控制流留足连接。
+        limits=httpx.Limits(
+            max_connections=max(8, concurrency * 4) if concurrency else None,
+        ),
+        event_hooks={"request": [mark_request_sent]},
     )
 
 

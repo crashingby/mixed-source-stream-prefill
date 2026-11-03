@@ -55,7 +55,9 @@ for scenario in ${SCENARIO_DIRS}; do
         --data-dir "${DATA_DIR}" --output-dir "${OUTPUT_DIR}" \
         --proxy-url "${PROXY_URL}" --model "${MODEL}" \
         --tokenizer-model "${TOKENIZER_MODEL}" \
-        --max-requests "${WARMUP_REQUESTS}" --max-concurrency "${MAX_CONCURRENCY}" \
+        --max-requests "${WARMUP_REQUESTS}" \
+        --load-mode open_loop --max-inflight "${MAX_CONCURRENCY}" \
+        --max-concurrency "${MAX_CONCURRENCY}" \
         --qps 4 --arrival-process fixed --random-seed "${RANDOM_SEED}" \
         --seed "${RANDOM_SEED}" --max-tokens "${MAX_TOKENS}" --temperature 0 \
         --append-initial-delay "${APPEND_INITIAL_DELAY}" \

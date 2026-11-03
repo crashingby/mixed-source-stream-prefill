@@ -15,6 +15,7 @@ from typing import TypeVar
 
 from .config import parse_args, validate_args
 from .dataset import get_data_events, select_samples
+from .load import LoadRecorder, active_sample
 from .models import (
     RenderedReplayPrompt,
     ReplayMode,
@@ -43,67 +44,109 @@ async def execute_workload(
     *,
     on_result: Callable[[ResultT], None] | None = None,
     fail_fast_error: Callable[[ResultT], str | None] | None = None,
-    closed_loop: bool = False,
+    output_dir: Path | None = None,
 ) -> list[ResultT]:
-    """共享请求时钟；串行和并发均先落盘，再判断实验失败。
+    """运行统一负载：闭环维持逻辑请求数，开环按独立时钟到达。
 
     Args:
-        count: 已选样本数。
-        args: QPS、随机种子、并发及可选串行间隔。
-        execute_one: 接收索引、计划偏移毫秒和客户端准入延迟毫秒。
-        on_result: 每请求完成后的同步持久化回调。
-        fail_fast_error: 返回错误文本时取消其它在途请求。
-        closed_loop: QPS=0 时按并发上限补充请求；默认保留其他实验的串行语义。
+        count: 本轮逻辑请求数量。
+        args: load_mode、qps、max_concurrency、可选 max_inflight 等配置。
+        execute_one: 接收样本索引、计划偏移和客户端准入延迟，单位为毫秒。
+        on_result: 每条结果持久化回调，在统一负载字段写入后调用。
+        fail_fast_error: 返回错误信息时取消剩余请求，保留已完成记录。
+        output_dir: 保存 load_requests.jsonl 和 load_summary.json 的目录。
+
+    Returns:
+        按输入样本顺序排列的结果；异常或取消时释放所有本轮任务。
     """
-    qps = getattr(args, "qps", 0.0)
+    if getattr(args, "dry_run", False):
+        # 数据预览不建立负载时钟，也不为不存在的网络请求等待到达间隔。
+        previews = []
+        for index in range(count):
+            result = await execute_one(index, 0.0, 0.0)
+            if on_result is not None:
+                on_result(result)
+            previews.append(result)
+        return previews
+    recorder = LoadRecorder(args, count, output_dir)
     offsets = planned_arrival_offsets(
         count,
-        qps,
-        getattr(args, "arrival_process", "fixed"),
+        recorder.qps,
+        recorder.arrival_process,
         getattr(args, "random_seed", 0),
     )
-    semaphore = asyncio.Semaphore(getattr(args, "max_concurrency", 1))
-    epoch = time.perf_counter()
+    # 开环默认无限制；只有显式 max_inflight 才引入客户端槽位等待。
+    semaphore = asyncio.Semaphore(recorder.limit) if recorder.limit else None
+    stopping = False  # fail-fast 后不再准入尚未开始的请求。
+    if recorder.mode == "open_loop":
+        for sample, offset in zip(recorder.samples, offsets):
+            sample.planned = recorder.epoch + offset
 
     async def run_one(index: int) -> tuple[int, ResultT]:
-        target = epoch + offsets[index]
-        if qps > 0:
-            await sleep_until(target)
-        async with semaphore:
-            queue_delay = (
-                max(0.0, time.perf_counter() - target) * 1000 if qps > 0 else 0.0
+        nonlocal stopping
+        sample = recorder.samples[index]
+        acquired = False
+        token = None
+        recorded = False
+        try:
+            if recorder.mode == "open_loop":
+                assert sample.planned is not None
+                await sleep_until(sample.planned)
+                sample.released = time.perf_counter()
+            if semaphore is not None:
+                await semaphore.acquire()
+                acquired = True
+            if stopping:
+                raise asyncio.CancelledError
+            sample.admitted = time.perf_counter()
+            if recorder.mode == "closed_loop":
+                # 闭环没有外部排队时间线；槽位空闲后才创建下一次到达。
+                sample.planned = sample.released = sample.admitted
+            assert sample.planned is not None
+            token = active_sample.set(sample)
+            result = await execute_one(
+                index,
+                (sample.planned - recorder.epoch) * 1000,
+                (sample.admitted - sample.planned) * 1000,
             )
-            result = await execute_one(index, offsets[index] * 1000, queue_delay)
+            sample.completed = time.perf_counter()
+            recorder.record(sample, result)
+            recorded = True
             if on_result is not None:
                 on_result(result)
             if fail_fast_error is not None and (error := fail_fast_error(result)):
                 raise ReplayHttpError(error)
-            # 闭环模式的空闲间隔属于当前客户端槽位，不阻塞其他在途请求。
-            delay = getattr(args, "inter_request_delay", 0.0)
-            if qps == 0 and closed_loop and delay > 0:
-                await asyncio.sleep(delay)
+            if recorder.mode == "closed_loop":
+                delay = getattr(args, "inter_request_delay", 0.0)
+                if delay:
+                    await asyncio.sleep(delay)  # 思考时间占用当前闭环槽位。
             return index, result
+        except BaseException as exc:
+            stopping = True
+            if not recorded:
+                sample.completed = time.perf_counter()
+                sample.status = (
+                    "cancelled" if isinstance(exc, asyncio.CancelledError) else "error"
+                )
+                recorder.record(sample)
+            raise
+        finally:
+            if token is not None:
+                active_sample.reset(token)
+            if acquired:
+                assert semaphore is not None
+                semaphore.release()
 
-    if qps == 0 and not closed_loop:
-        results = []
-        for index in range(count):
-            _, result = await run_one(index)
-            results.append(result)
-            delay = getattr(args, "inter_request_delay", 0.0)
-            if delay > 0 and index + 1 < count:
-                await asyncio.sleep(delay)
-        return results
     tasks = [asyncio.create_task(run_one(index)) for index in range(count)]
     try:
-        # 完成顺序只影响日志；返回顺序仍按问题清单对齐。
         pairs = await asyncio.gather(*tasks)
         return [result for _, result in sorted(pairs)]
-    except BaseException:
+    finally:
         for task in tasks:
             if not task.done():
                 task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
-        raise
+        recorder.close()
 
 
 async def replay_requests(
@@ -115,6 +158,7 @@ async def replay_requests(
     replay_sample: ReplaySample,
     *,
     on_result: Callable[[RequestMetric], None] | None = None,
+    output_dir: Path | None = None,
 ) -> list[RequestMetric]:
     """为 normal/stream/merged 实验提供同一个执行时钟和 HTTP 客户端。"""
     async with create_http_client(args) as client:
@@ -147,6 +191,7 @@ async def replay_requests(
             execute,
             on_result=on_result,
             fail_fast_error=failure,
+            output_dir=output_dir,
         )
 
 
@@ -213,6 +258,7 @@ async def run(args: argparse.Namespace, replay_sample: ReplaySample) -> Path:
                 run_id,
                 replay_sample,
                 on_result=journal.record,
+                output_dir=directory,
             )
     finally:
         journal.close()

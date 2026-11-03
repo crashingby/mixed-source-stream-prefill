@@ -1,5 +1,7 @@
 # 分段流式 Prefill 回放实验
 
+所有入口的请求级 QPS、闭环逻辑并发和客户端等待统计统一使用 [负载说明](../LOAD.md)。正 QPS 默认独立发送，`max_concurrency` 只控制闭环；开环保护上限使用 `max_inflight`。
+
 当前 P/D 交接由 D 生成全部回答；P-only 使用 `prefill_ready` 控制事件测量 P 侧 TTFT。协议、兼容字段与验证命令见 [P/D 交接说明](../../server/PD-Handoff.md)。
 
 本目录提供三个相互独立的实验入口。它们读取同一批
@@ -290,7 +292,7 @@ done
 
 - 样本范围：`--query-id`、`--start-index` 和 `--max-requests`。
 - 逻辑请求负载：`--qps`、`--arrival-process`、`--random-seed` 和
-  `--max-concurrency`。
+  `--load-mode`；闭环使用相同 `--max-concurrency`，开环使用相同 `--max-inflight`。
 - 生成参数：`--model`、`--max-tokens`、`--temperature` 和 `--seed`。
 - SSE 消费策略：若只比较 TTFT，建议所有对比模式都开启 `--ttft-only`，并
   使用相同的 `--sse-timeout`。
@@ -480,9 +482,10 @@ done
 | `--proxy-url` | `http://127.0.0.1:8000` | 三种模式共同使用的 proxy 地址。 |
 | `--model` | `qwen2.5-3b` | 必须匹配服务端的 `--served-model-name`。 |
 | `--tokenizer-model` | `~/Models/Qwen2.5-3B` | 本地模型/tokenizer 目录；必须与 `--model` 对应的 P 模型使用同一 chat template。 |
-| `--qps` | `1.0` | 逻辑请求启动速率；`0` 表示闭环串行。 |
+| `--qps` | `1.0` | 逻辑请求计划到达速率；`0` 使用闭环并发。 |
 | `--arrival-process` | `fixed` | 使用固定间隔或 `poisson` 泊松到达。 |
-| `--max-concurrency` | `32` | 同时在飞的逻辑请求上限。 |
+| `--max-concurrency` | `32` | 闭环在途逻辑请求上限；正 QPS 时不生效。 |
+| `--max-inflight` | `0` | 开环客户端保护上限；0 不限。 |
 | `--max-tokens` | 不覆盖 | 覆盖数据中的最大生成 token 数。 |
 | `--temperature` | 不覆盖 | 覆盖数据中的采样温度。 |
 | `--seed` | 无 | 发送给 vLLM 的采样 seed。 |
@@ -496,8 +499,10 @@ done
 | `--dry-run` | 关闭 | 仅校验数据，不发送 HTTP。 |
 | `--fail-fast` | 关闭 | 第一个请求失败后立即停止。 |
 
-正 QPS 下，请求先按计划时间到达，再等待并发 semaphore。并发限制引入的等待
-时间记录在 `queue_delay_ms`。`--qps 0` 时，前一个请求完整结束后才开始下一个。
+正 QPS 下，请求按独立时钟到达，默认不等待客户端槽位。只有显式设置
+`--max-inflight` 才会排队，原计划时间保持不变，等待计入 `queue_delay_ms`
+及 `arrival_to_first_token_ms`。`--qps 0` 时按 `--max-concurrency` 维持闭环请求数，
+完成一个补入一个；设为 1 才是串行。
 
 ## prompt-stream 类模式专用时序参数
 

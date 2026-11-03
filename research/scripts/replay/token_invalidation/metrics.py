@@ -10,6 +10,7 @@ from dataclasses import asdict, fields
 from pathlib import Path
 from typing import Any
 
+from research.scripts.replay.common.load import LOAD_METRIC_FIELDS, read_load_summary
 from research.scripts.replay.common.metrics import EVENT_METRIC_FIELDS, percentile
 from research.scripts.replay.common.results import write_csv, write_json
 
@@ -74,12 +75,14 @@ def write_outputs(
         row = asdict(metric)
         row.pop("event_metrics")
         row.pop("response_payloads")
+        load = row.pop("load", None) or {}
+        row.update({field: load.get(field) for field in LOAD_METRIC_FIELDS})
         rows.append(row)
     names = [
         field.name
         for field in fields(InvalidationMetric)
-        if field.name not in ("event_metrics", "response_payloads")
-    ]
+        if field.name not in ("event_metrics", "response_payloads", "load")
+    ] + list(LOAD_METRIC_FIELDS)
     write_csv(directory / "request_metrics.csv", names, rows)
     write_csv(
         directory / "event_metrics.csv",
@@ -90,6 +93,7 @@ def write_outputs(
         directory / "summary.json",
         {
             "schema": "token_invalidation_summary/v1",
+            "load_summary": read_load_summary(directory),
             "primary_metric": "snapshot_invalidated_tokens",
             "definition": (
                 "服务端已计算的 Update 域中因快照替换失效的 token；"

@@ -106,6 +106,7 @@ class RequestMetric:
     planned_arrival_offset_ms: float
     queue_delay_ms: float
     request_start_wall_time: float
+    load: dict[str, Any] | None = None  # 统一负载时钟；与服务端 work/token 统计独立。
     # result_status 保持旧 CSV 兼容；以下字段拆分链路成功与统计可信度。
     transport_status: str = "pending"
     first_token_received: bool = False
